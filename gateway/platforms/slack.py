@@ -3340,13 +3340,23 @@ class SlackAdapter(BasePlatformAdapter):
 
         try:
             from gateway.session import SessionSource
+            # Match how inbound messages build the source.  Slack DMs
+            # come from channels prefixed with "D" (im/mpim).  The
+            # action body's `message` carries `thread_ts` for thread
+            # context; top-level messages set thread_ts == ts == the
+            # message's own ts in tests, so we read it directly from
+            # the action payload.
+            ch_type_hint = body.get("channel", {}).get("channel_type", "") or ""
+            is_dm = ch_type_hint in ("im", "mpim") or channel_id.startswith("D")
+            msg_meta = body.get("message", {}) or {}
+            thread_ts = msg_meta.get("thread_ts") or msg_meta.get("ts") or None
             source = SessionSource(
                 platform=Platform.SLACK,
                 chat_id=channel_id,
-                chat_type="channel",
+                chat_type="dm" if is_dm else "group",
                 user_id=user_id,
                 user_name=user_name,
-                thread_id=None,
+                thread_id=str(thread_ts) if thread_ts else None,
             )
         except Exception as exc:
             logger.debug("[Slack] could not build SessionSource for busy action: %s", exc)

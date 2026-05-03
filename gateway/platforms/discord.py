@@ -4722,9 +4722,19 @@ if DISCORD_AVAILABLE:
                 )
                 return
             await interaction.response.defer(ephemeral=True)
+            applied = False
             try:
                 toast = await self._adapter._handle_busy_session_view_tap(
                     self.session_key, primitive, interaction,
+                )
+                # The runner returns toast strings starting with "⛔" or
+                # "Couldn't" / "Unknown" / "Busy-session" when it
+                # rejected/failed.  Treat anything else as a successful
+                # apply so we only freeze the row when the action
+                # actually fired.
+                applied = bool(toast) and not (
+                    toast.startswith("⛔")
+                    or toast.lower().startswith(("couldn't", "unknown", "busy-session"))
                 )
             except Exception as exc:  # pragma: no cover - defensive
                 logger.error(
@@ -4736,13 +4746,16 @@ if DISCORD_AVAILABLE:
                 await interaction.followup.send(toast or "Done.", ephemeral=True)
             except Exception:
                 pass
-            # Disable buttons after a tap so the same row can't fire twice.
-            for child in self.children:
-                child.disabled = True
-            try:
-                await interaction.message.edit(view=self)
-            except Exception:
-                pass
+            # Only disable the shared button row after a SUCCESSFUL apply.
+            # An ownership-rejection from a non-owner clicker must not
+            # take the controls away from the legitimate session owner.
+            if applied:
+                for child in self.children:
+                    child.disabled = True
+                try:
+                    await interaction.message.edit(view=self)
+                except Exception:
+                    pass
 
         @discord.ui.button(label="Steer", style=discord.ButtonStyle.green)
         async def steer(
@@ -4950,17 +4963,34 @@ if DISCORD_AVAILABLE:
             from gateway.session import SessionSource
             user = getattr(interaction, "user", None)
             channel = getattr(interaction, "channel", None)
-            chat_id = str(getattr(channel, "id", "")) if channel else ""
             user_id = str(getattr(user, "id", "")) if user else ""
             user_name = getattr(user, "display_name", None) if user else None
+            # Match how inbound messages build the source so the runner's
+            # ownership check (build_session_key) computes the same key.
+            # Discord thread runs use chat_id == thread_id and chat_type
+            # "thread"; channel runs use chat_id == channel.id and
+            # chat_type "group"; DMs use "dm".
+            ch_type = getattr(channel, "type", None)
+            is_thread = isinstance(channel, discord.Thread) if channel is not None else False
+            if ch_type == discord.ChannelType.private:
+                chat_type = "dm"
+                chat_id = str(getattr(channel, "id", "")) if channel else ""
+                thread_id = None
+            elif is_thread:
+                chat_type = "thread"
+                chat_id = str(getattr(channel, "id", "")) if channel else ""
+                thread_id = chat_id  # thread channels report their own id as the thread id
+            else:
+                chat_type = "group"
+                chat_id = str(getattr(channel, "id", "")) if channel else ""
+                thread_id = None
             source = SessionSource(
                 platform=Platform.DISCORD,
                 chat_id=chat_id,
-                chat_type="dm" if getattr(channel, "type", None) == discord.ChannelType.private
-                          else "channel",
+                chat_type=chat_type,
                 user_id=user_id,
                 user_name=user_name,
-                thread_id=None,
+                thread_id=thread_id,
             )
         except Exception as exc:
             logger.debug("[%s] could not build SessionSource for view tap: %s", self.name, exc)
