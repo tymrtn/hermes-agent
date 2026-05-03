@@ -2458,6 +2458,29 @@ class GatewayRunner:
         if primitive not in (PRIMITIVE_STEER, PRIMITIVE_INTERRUPT, PRIMITIVE_STOP):
             return "Unknown action."
 
+        # Ownership gate: in shared channels with per-user session keys,
+        # user A's busy-session buttons are visible to user B.  An
+        # otherwise-authorized user B could otherwise tap them and
+        # control A's run.  Build the session_key the SAME way for the
+        # tapping user; if it doesn't match the target session_key,
+        # this isn't B's session — reject.  (Mirrors the isolation
+        # `/stop` enjoys by virtue of being scoped to the sender's own
+        # message handling.)
+        try:
+            from gateway.session import build_session_key as _build_sk
+            tapper_key = _build_sk(source) if source else None
+        except Exception:
+            tapper_key = None
+        if tapper_key and tapper_key != session_key:
+            logger.warning(
+                "Busy-session button cross-user tap rejected: "
+                "tapper=%s wants to control session=%s (their own session=%s)",
+                getattr(source, "user_id", "?"),
+                session_key,
+                tapper_key,
+            )
+            return "⛔ This isn't your session."
+
         adapter = self.adapters.get(source.platform) if source else None
         _pf = getattr(self, "_pending_followups", None)
         # Take a copy of the follow-ups but DO NOT pop yet — platform
