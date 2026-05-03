@@ -497,6 +497,12 @@ class DiscordAdapter(BasePlatformAdapter):
         self._ready_event = asyncio.Event()
         self._allowed_user_ids: set = set()  # For button approval authorization
         self._allowed_role_ids: set = set()  # For DISCORD_ALLOWED_ROLES filtering
+        # Busy-session view state: session_key → message_id of the
+        # message currently carrying the [Steer][Interrupt][Stop] view.
+        # Discord's BusySessionView holds session_key on the view
+        # instance directly, so callback_data length isn't a concern here.
+        self._busy_session_view_map: Dict[str, str] = {}
+        self._busy_control_bubble_ids: Dict[str, str] = {}
         self.gateway_runner = None  # Set by gateway/run.py for cross-platform delivery
         # Voice channel state (per-guild)
         self._voice_clients: Dict[int, Any] = {}  # guild_id -> VoiceClient
@@ -4673,3 +4679,285 @@ if DISCORD_AVAILABLE:
         async def on_timeout(self):
             self.resolved = True
             self.clear_items()
+
+    # ── Busy-session view + adapter overrides ─────────────────────────
+
+    class BusySessionView(discord.ui.View):
+        """Three-button view for per-message busy-session control.
+
+        Lets the user pick steer / interrupt / stop on a specific
+        follow-up message instead of changing the global
+        ``display.busy_input_mode``.  Auth mirrors the other component
+        views via :func:`_component_check_auth`.
+        """
+
+        def __init__(
+            self,
+            session_key: str,
+            adapter_self: "DiscordAdapter",
+            allowed_user_ids: set,
+            allowed_role_ids: Optional[set] = None,
+        ):
+            # No timeout: a busy-session lives as long as the agent is
+            # busy, which is bounded by the agent's own iteration cap.
+            super().__init__(timeout=None)
+            self.session_key = session_key
+            self._adapter = adapter_self
+            self.allowed_user_ids = allowed_user_ids
+            self.allowed_role_ids = allowed_role_ids or set()
+
+        def _check_auth(self, interaction: discord.Interaction) -> bool:
+            return _component_check_auth(
+                interaction, self.allowed_user_ids, self.allowed_role_ids,
+            )
+
+        async def _dispatch(
+            self,
+            interaction: discord.Interaction,
+            primitive: str,
+        ) -> None:
+            if not self._check_auth(interaction):
+                await interaction.response.send_message(
+                    "You're not authorized to control this run~", ephemeral=True,
+                )
+                return
+            await interaction.response.defer(ephemeral=True)
+            try:
+                toast = await self._adapter._handle_busy_session_view_tap(
+                    self.session_key, primitive, interaction,
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.error(
+                    "[%s] BusySessionView dispatch failed: %s",
+                    self._adapter.name, exc, exc_info=True,
+                )
+                toast = "Couldn't apply that — see logs."
+            try:
+                await interaction.followup.send(toast or "Done.", ephemeral=True)
+            except Exception:
+                pass
+            # Disable buttons after a tap so the same row can't fire twice.
+            for child in self.children:
+                child.disabled = True
+            try:
+                await interaction.message.edit(view=self)
+            except Exception:
+                pass
+
+        @discord.ui.button(label="Steer", style=discord.ButtonStyle.green)
+        async def steer(
+            self, interaction: discord.Interaction, button: discord.ui.Button
+        ):
+            from gateway.busy_session_buttons import PRIMITIVE_STEER
+            await self._dispatch(interaction, PRIMITIVE_STEER)
+
+        @discord.ui.button(label="Interrupt", style=discord.ButtonStyle.blurple)
+        async def interrupt(
+            self, interaction: discord.Interaction, button: discord.ui.Button
+        ):
+            from gateway.busy_session_buttons import PRIMITIVE_INTERRUPT
+            await self._dispatch(interaction, PRIMITIVE_INTERRUPT)
+
+        @discord.ui.button(label="Stop", style=discord.ButtonStyle.red)
+        async def stop(
+            self, interaction: discord.Interaction, button: discord.ui.Button
+        ):
+            from gateway.busy_session_buttons import PRIMITIVE_STOP
+            await self._dispatch(interaction, PRIMITIVE_STOP)
+
+    @staticmethod
+    def _busy_buttons_enabled() -> bool:
+        raw = os.getenv("HERMES_GATEWAY_BUSY_BUTTONS")
+        if raw is None:
+            return True
+        return raw.strip().lower() not in ("0", "false", "no", "off")
+
+    def _chat_id_for_session(self, session_key: str) -> Optional[str]:
+        runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
+        if runner is None:
+            return None
+        followups = getattr(runner, "_pending_followups", {}) or {}
+        for ev in reversed(followups.get(session_key) or []):
+            chat_id = getattr(getattr(ev, "source", None), "chat_id", None)
+            if chat_id:
+                return str(chat_id)
+        return None
+
+    async def attach_busy_session_buttons(
+        self,
+        session_key: str,
+        message_id: str,
+    ) -> bool:
+        if not self._busy_buttons_enabled() or not self._client:
+            return False
+        chat_id = self._chat_id_for_session(session_key)
+        if not chat_id:
+            return False
+        try:
+            channel = self._client.get_channel(int(chat_id))
+            if not channel:
+                channel = await self._client.fetch_channel(int(chat_id))
+            msg = await channel.fetch_message(int(message_id))
+            view = self.BusySessionView(
+                session_key=session_key,
+                adapter_self=self,
+                allowed_user_ids=self._allowed_user_ids,
+                allowed_role_ids=self._allowed_role_ids,
+            )
+            await msg.edit(view=view)
+            self._busy_session_view_map[session_key] = str(message_id)
+            return True
+        except Exception as exc:
+            logger.debug(
+                "[%s] attach_busy_session_buttons failed for %s on %s: %s",
+                self.name, session_key, message_id, exc,
+            )
+            return False
+
+    async def clear_busy_session_buttons(
+        self,
+        session_key: str,
+        message_id: str,
+    ) -> bool:
+        self._busy_session_view_map.pop(session_key, None)
+        if not self._client:
+            return False
+        chat_id = self._chat_id_for_session(session_key)
+        if not chat_id:
+            return False
+        try:
+            channel = self._client.get_channel(int(chat_id))
+            if not channel:
+                channel = await self._client.fetch_channel(int(chat_id))
+            msg = await channel.fetch_message(int(message_id))
+            await msg.edit(view=None)
+            return True
+        except Exception as exc:
+            logger.debug(
+                "[%s] clear_busy_session_buttons failed for %s on %s: %s",
+                self.name, session_key, message_id, exc,
+            )
+            return False
+
+    async def send_or_update_busy_control_bubble(
+        self,
+        session_key: str,
+        source: Any,
+        summary_text: str,
+    ) -> Optional[str]:
+        if not self._busy_buttons_enabled() or not self._client:
+            return None
+        chat_id_raw = getattr(source, "chat_id", None) if source else None
+        if not chat_id_raw:
+            return None
+        try:
+            channel = self._client.get_channel(int(chat_id_raw))
+            if not channel:
+                channel = await self._client.fetch_channel(int(chat_id_raw))
+        except Exception as exc:
+            logger.debug(
+                "[%s] control-bubble channel resolve failed for %s: %s",
+                self.name, session_key, exc,
+            )
+            return None
+        view = self.BusySessionView(
+            session_key=session_key,
+            adapter_self=self,
+            allowed_user_ids=self._allowed_user_ids,
+            allowed_role_ids=self._allowed_role_ids,
+        )
+        existing = self._busy_control_bubble_ids.get(session_key)
+        if existing:
+            try:
+                msg = await channel.fetch_message(int(existing))
+                await msg.edit(content=summary_text, view=view)
+                self._busy_session_view_map[session_key] = existing
+                return existing
+            except Exception:
+                self._busy_control_bubble_ids.pop(session_key, None)
+        try:
+            sent = await channel.send(content=summary_text, view=view)
+        except Exception as exc:
+            logger.debug(
+                "[%s] control-bubble send failed for %s: %s",
+                self.name, session_key, exc,
+            )
+            return None
+        msg_id = str(getattr(sent, "id", "")) or None
+        if msg_id:
+            self._busy_control_bubble_ids[session_key] = msg_id
+            self._busy_session_view_map[session_key] = msg_id
+        return msg_id
+
+    async def delete_busy_control_bubble(
+        self,
+        session_key: str,
+        message_id: str,
+    ) -> bool:
+        self._busy_control_bubble_ids.pop(session_key, None)
+        if not self._client:
+            return False
+        chat_id = self._chat_id_for_session(session_key)
+        if not chat_id:
+            return False
+        try:
+            channel = self._client.get_channel(int(chat_id))
+            if not channel:
+                channel = await self._client.fetch_channel(int(chat_id))
+            msg = await channel.fetch_message(int(message_id))
+            await msg.delete()
+            return True
+        except Exception as exc:
+            logger.debug(
+                "[%s] delete_busy_control_bubble failed for %s on %s: %s",
+                self.name, session_key, message_id, exc,
+            )
+            return False
+
+    async def set_busy_reaction(self, event: MessageEvent, emoji: str) -> bool:
+        msg = getattr(event, "raw_message", None)
+        if msg is None or not hasattr(msg, "add_reaction"):
+            return False
+        try:
+            await self._add_reaction(msg, emoji)
+            return True
+        except Exception:
+            return False
+
+    async def _handle_busy_session_view_tap(
+        self,
+        session_key: str,
+        primitive: str,
+        interaction: Any,
+    ) -> str:
+        runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
+        handler = getattr(runner, "_handle_busy_session_button_tap", None)
+        if not callable(handler):
+            return "Busy-session controls unavailable."
+        try:
+            from gateway.session import SessionSource
+            user = getattr(interaction, "user", None)
+            channel = getattr(interaction, "channel", None)
+            chat_id = str(getattr(channel, "id", "")) if channel else ""
+            user_id = str(getattr(user, "id", "")) if user else ""
+            user_name = getattr(user, "display_name", None) if user else None
+            source = SessionSource(
+                platform=Platform.DISCORD,
+                chat_id=chat_id,
+                chat_type="dm" if getattr(channel, "type", None) == discord.ChannelType.private
+                          else "channel",
+                user_id=user_id,
+                user_name=user_name,
+                thread_id=None,
+            )
+        except Exception as exc:
+            logger.debug("[%s] could not build SessionSource for view tap: %s", self.name, exc)
+            return "Couldn't apply that — try again."
+        try:
+            return await handler(session_key, primitive, source)
+        except Exception as exc:
+            logger.error(
+                "[%s] busy-session view dispatch failed: %s",
+                self.name, exc, exc_info=True,
+            )
+            return "Couldn't apply that — see logs."
