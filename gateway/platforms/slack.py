@@ -833,16 +833,40 @@ class SlackAdapter(BasePlatformAdapter):
         *,
         finalize: bool = False,
     ) -> SendResult:
-        """Edit a previously sent Slack message."""
+        """Edit a previously sent Slack message.
+
+        If ``message_id`` is currently anchoring a busy-session keyboard,
+        we re-render the message with both the new text AND the actions
+        block so the buttons survive the edit — Slack's chat_update
+        otherwise drops blocks if only ``text`` is supplied.
+        """
         if not self._app:
             return SendResult(success=False, error="Not connected")
         try:
             formatted = self.format_message(content)
-            await self._get_client(chat_id).chat_update(
-                channel=chat_id,
-                ts=message_id,
-                text=formatted,
-            )
+            update_kwargs: Dict[str, Any] = {
+                "channel": chat_id,
+                "ts": message_id,
+                "text": formatted,
+            }
+            # Re-attach busy-session action block if this message is the
+            # current anchor (value-side lookup against the small map).
+            try:
+                anchored_session = next(
+                    (
+                        sk
+                        for sk, coords in self._busy_session_button_map.items()
+                        if coords == (chat_id, message_id)
+                    ),
+                    None,
+                )
+                if anchored_session:
+                    update_kwargs["blocks"] = self._busy_session_blocks(
+                        anchored_session, formatted or " "
+                    )
+            except Exception:
+                pass
+            await self._get_client(chat_id).chat_update(**update_kwargs)
             if finalize:
                 await self.stop_typing(chat_id)
             return SendResult(success=True, message_id=message_id)
@@ -3220,17 +3244,6 @@ class SlackAdapter(BasePlatformAdapter):
         user_name = body.get("user", {}).get("name", "unknown")
         channel_id = body.get("channel", {}).get("id", "")
 
-        # Authorization: reuse SLACK_ALLOWED_USERS gate.
-        allowed_csv = os.getenv("SLACK_ALLOWED_USERS", "").strip()
-        if allowed_csv:
-            allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
-            if "*" not in allowed_ids and user_id not in allowed_ids:
-                logger.warning(
-                    "[Slack] Unauthorized busy-session click by %s (%s) — ignoring",
-                    user_name, user_id,
-                )
-                return
-
         primitive_map = {
             "hermes_busy_steer": "steer",
             "hermes_busy_interrupt": "interrupt",
@@ -3250,7 +3263,7 @@ class SlackAdapter(BasePlatformAdapter):
             source = SessionSource(
                 platform=Platform.SLACK,
                 chat_id=channel_id,
-                chat_type="dm",  # Slack platform ignores chat_type for auth in busy path
+                chat_type="channel",
                 user_id=user_id,
                 user_name=user_name,
                 thread_id=None,
@@ -3258,6 +3271,41 @@ class SlackAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.debug("[Slack] could not build SessionSource for busy action: %s", exc)
             return
+
+        # Route through the runner's full authorization stack so
+        # GATEWAY_ALLOWED_USERS / pairing / org-level rules apply,
+        # not just SLACK_ALLOWED_USERS.  Block Kit actions skip the
+        # normal message handler so without this check any workspace
+        # user could steer/interrupt/stop another user's session.
+        auth_fn = getattr(runner, "_is_user_authorized", None)
+        if callable(auth_fn):
+            try:
+                if not auth_fn(source):
+                    logger.warning(
+                        "[Slack] Unauthorized busy-session click by %s (%s) — ignoring",
+                        user_name, user_id,
+                    )
+                    return
+            except Exception:
+                logger.debug("[Slack] auth check raised — denying busy-action", exc_info=True)
+                return
+        else:
+            # No runner auth available — fall back to SLACK_ALLOWED_USERS
+            # only if it's set; if it's empty in this fallback path we
+            # FAIL CLOSED rather than allow-all.
+            allowed_csv = os.getenv("SLACK_ALLOWED_USERS", "").strip()
+            if not allowed_csv:
+                logger.warning(
+                    "[Slack] No runner auth + empty SLACK_ALLOWED_USERS — denying busy-action"
+                )
+                return
+            allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
+            if "*" not in allowed_ids and user_id not in allowed_ids:
+                logger.warning(
+                    "[Slack] Unauthorized busy-session click by %s (%s) — ignoring",
+                    user_name, user_id,
+                )
+                return
 
         try:
             await handler(session_key, primitive, source)
