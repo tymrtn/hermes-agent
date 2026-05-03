@@ -56,7 +56,13 @@ def _make_event(text="hello", chat_id="123", platform_val="telegram"):
 
 
 def _make_runner():
-    """Build a minimal GatewayRunner-like object for testing."""
+    """Build a minimal GatewayRunner-like object for testing.
+
+    Forces ``busy_ack_mode='text'`` and ``busy_input_mode='interrupt'`` so
+    these tests exercise the legacy text-ack + interrupt-default behavior.
+    The new reaction-default path is covered in
+    ``tests/gateway/test_busy_session_reactions.py``.
+    """
     from gateway.run import GatewayRunner, _AGENT_PENDING_SENTINEL
 
     runner = object.__new__(GatewayRunner)
@@ -70,6 +76,12 @@ def _make_runner():
     runner.session_store = None
     runner.hooks = MagicMock()
     runner.hooks.emit = AsyncMock()
+    # Pin the legacy behavior these tests were written against.
+    runner._busy_input_mode = "interrupt"
+    runner._busy_ack_mode = "text"
+    runner._busy_reactions_enabled = False
+    runner._status_action_gerund = lambda: "restarting"
+    runner._queue_during_drain_enabled = lambda: True
     return runner, _AGENT_PENDING_SENTINEL
 
 

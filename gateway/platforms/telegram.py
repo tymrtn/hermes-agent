@@ -251,6 +251,17 @@ class TelegramAdapter(BasePlatformAdapter):
         self._model_picker_state: Dict[str, dict] = {}
         # Approval button state: message_id → session_key
         self._approval_state: Dict[int, str] = {}
+        # Busy-session button state: tool-bubble message_id → session_key.
+        # Populated by attach_busy_session_buttons; consumed by the
+        # ``bs:`` callback handler to dispatch primitives on tap.
+        self._busy_session_button_map: Dict[int, str] = {}
+        # Standalone control-bubble fallback msg_ids per session — used
+        # when no tool bubble exists (pre-first-tool / mid-streaming).
+        self._busy_control_bubble_ids: Dict[str, int] = {}
+        # Optional back-reference to GatewayRunner so callback handlers can
+        # invoke ``runner.handle_busy_session_button_tap``. Set externally
+        # by the gateway after adapter construction.
+        self._gateway_runner: Optional[Any] = None
 
     @staticmethod
     def _is_callback_user_authorized(user_id: str) -> bool:
@@ -1129,9 +1140,24 @@ class TelegramAdapter(BasePlatformAdapter):
         *,
         finalize: bool = False,
     ) -> SendResult:
-        """Edit a previously sent Telegram message."""
+        """Edit a previously sent Telegram message.
+
+        If the message has an active busy-session inline keyboard
+        (tracked in ``_busy_session_button_map``), the keyboard is
+        re-attached on every edit. Without this, each tool-progress
+        edit would silently strip the buttons because Telegram's
+        ``edit_message_text`` defaults reply_markup to None.
+        """
         if not self._bot:
             return SendResult(success=False, error="Not connected")
+        # Preserve busy-session inline keyboard across tool-progress edits.
+        active_markup = None
+        try:
+            _mid_int = int(message_id)
+            if _mid_int in self._busy_session_button_map:
+                active_markup = self._build_busy_session_keyboard(_mid_int)
+        except (TypeError, ValueError):
+            pass
         try:
             formatted = self.format_message(content)
             try:
@@ -1140,6 +1166,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     message_id=int(message_id),
                     text=formatted,
                     parse_mode=ParseMode.MARKDOWN_V2,
+                    reply_markup=active_markup,
                 )
             except Exception as fmt_err:
                 # "Message is not modified" is a no-op, not an error
@@ -1150,6 +1177,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     chat_id=int(chat_id),
                     message_id=int(message_id),
                     text=content,
+                    reply_markup=active_markup,
                 )
             return SendResult(success=True, message_id=message_id)
         except Exception as e:
@@ -1600,6 +1628,56 @@ class TelegramAdapter(BasePlatformAdapter):
             # Catch-all (e.g. page counter button "mx:noop")
             await query.answer()
 
+    async def _handle_busy_session_callback(self, query: Any, data: str) -> None:
+        """Handle a busy-session inline-keyboard button tap.
+
+        Format: ``bs:<primitive>:<tool_bubble_message_id>`` where
+        primitive ∈ {steer, interrupt, halt}. Dispatches to the
+        gateway runner's ``handle_busy_session_button_tap`` which
+        drains all pending followups for the session and applies the
+        primitive once.
+        """
+        parts = data.split(":", 2)
+        if len(parts) != 3:
+            await query.answer(text="Invalid button data.")
+            return
+        primitive = parts[1]
+        try:
+            msg_id = int(parts[2])
+        except (TypeError, ValueError):
+            await query.answer(text="Invalid button data.")
+            return
+
+        # The banner row is a no-op info button — silent ack, no dispatch.
+        if primitive == "noop":
+            await query.answer()
+            return
+
+        # Authorization — same gate as exec-approval buttons.
+        caller_id = str(getattr(query.from_user, "id", ""))
+        if not self._is_callback_user_authorized(caller_id):
+            await query.answer(text="⛔ Not authorized.")
+            return
+
+        session_key = self._busy_session_button_map.get(msg_id)
+        if not session_key:
+            await query.answer(text="That choice is no longer available.")
+            return
+
+        runner = self._gateway_runner
+        if runner is None or not hasattr(runner, "handle_busy_session_button_tap"):
+            await query.answer(text="Gateway not available.")
+            return
+
+        # Acknowledge immediately so the button doesn't spin.
+        verb_map = {"steer": "⏩ Steering", "interrupt": "⚡ Interrupting", "halt": "🛑 Stopping"}
+        await query.answer(text=verb_map.get(primitive, "Working..."))
+
+        try:
+            await runner.handle_busy_session_button_tap(session_key, primitive, self)
+        except Exception as e:
+            logger.warning("[Telegram] busy-session button dispatch failed: %s", e)
+
     async def _handle_callback_query(
         self, update: "Update", context: "ContextTypes.DEFAULT_TYPE"
     ) -> None:
@@ -1614,6 +1692,11 @@ class TelegramAdapter(BasePlatformAdapter):
             chat_id = str(query.message.chat_id) if query.message else None
             if chat_id:
                 await self._handle_model_picker_callback(query, data, chat_id)
+            return
+
+        # --- Busy-session inline keyboard callbacks (bs:<primitive>:<msg_id>) ---
+        if data.startswith("bs:"):
+            await self._handle_busy_session_callback(query, data)
             return
 
         # --- Exec approval callbacks (ea:choice:id) ---
@@ -3064,22 +3147,42 @@ class TelegramAdapter(BasePlatformAdapter):
     # ── Message reactions (processing lifecycle) ──────────────────────────
 
     def _reactions_enabled(self) -> bool:
-        """Check if message reactions are enabled via config/env."""
+        """Check if processing-lifecycle reactions (👀/✅/❌) are enabled.
+
+        Note: this gates the existing `on_processing_start` / `on_processing_complete`
+        Telegram reactions only. Busy-session reactions (`set_busy_reaction`)
+        are gated independently by `HERMES_GATEWAY_BUSY_REACTIONS` so the
+        new feature works regardless of this toggle.
+        """
         return os.getenv("TELEGRAM_REACTIONS", "false").lower() not in ("false", "0", "no")
 
     async def _set_reaction(self, chat_id: str, message_id: str, emoji: str) -> bool:
-        """Set a single emoji reaction on a Telegram message."""
+        """Set a single emoji reaction on a Telegram message.
+
+        Wraps the emoji in ``ReactionTypeEmoji`` explicitly. Passing a bare
+        string causes python-telegram-bot to mis-serialize variation-selector
+        glyphs (e.g. ✍️ = U+270D + U+FE0F) as a ``custom_emoji`` reaction
+        rather than a standard emoji, which Telegram rejects with
+        "field custom_emoji_id must be a valid number".
+        """
         if not self._bot:
             return False
         try:
+            from telegram import ReactionTypeEmoji
+        except Exception:
+            ReactionTypeEmoji = None
+        try:
+            reaction_arg = (
+                [ReactionTypeEmoji(emoji=emoji)] if ReactionTypeEmoji is not None else emoji
+            )
             await self._bot.set_message_reaction(
                 chat_id=int(chat_id),
                 message_id=int(message_id),
-                reaction=emoji,
+                reaction=reaction_arg,
             )
             return True
         except Exception as e:
-            logger.debug("[%s] set_message_reaction failed (%s): %s", self.name, emoji, e)
+            logger.warning("[%s] set_message_reaction failed (%s): %s", self.name, emoji, e)
             return False
 
     async def on_processing_start(self, event: MessageEvent) -> None:
@@ -3107,3 +3210,230 @@ class TelegramAdapter(BasePlatformAdapter):
                 message_id,
                 "\U0001f44d" if outcome == ProcessingOutcome.SUCCESS else "\U0001f44e",
             )
+
+    async def set_busy_reaction(
+        self,
+        event: MessageEvent,
+        emoji: Optional[str],
+    ) -> bool:
+        """Set a busy-session reaction on the user's follow-up message.
+
+        Gateway-side gating (``HERMES_GATEWAY_BUSY_REACTIONS``) is the sole
+        toggle for busy reactions — independent of ``TELEGRAM_REACTIONS``
+        which gates processing-lifecycle reactions only.
+        """
+        if not emoji:
+            return False
+        chat_id = getattr(event.source, "chat_id", None)
+        message_id = getattr(event, "message_id", None)
+        if not chat_id or not message_id:
+            return False
+        return await self._set_reaction(chat_id, message_id, emoji)
+
+    # ── Busy-session inline keyboard ──────────────────────────────────────
+    # Three-button row attached to the active tool-progress bubble when a
+    # follow-up message arrives during a busy turn. callback_data shape:
+    #   bs:<primitive>:<tool_bubble_message_id>
+    # The adapter maintains a side map (msg_id → session_key) so the
+    # callback handler can find the right session to dispatch the primitive on.
+
+    def _build_busy_session_keyboard(self, tool_bubble_message_id: int) -> "InlineKeyboardMarkup":
+        """Construct the override-keyboard shown on the active tool bubble.
+
+        Single row: [⏩ /steer] [⚡ /interrupt] [🛑 /stop]
+
+        Default behavior is QUEUE — signaled INLINE in the tool bubble via
+        a "⏳ /queue'd: ..." line (with ×N count for multiple followups),
+        not via a banner button. Three buttons are explicit overrides:
+        tapping applies the primitive to ALL pending followups for the
+        session and swaps each message's reaction to the appropriate emoji.
+
+        Recreated fresh on each tool-progress edit so the buttons survive
+        message-text edits (Telegram drops reply_markup if not re-supplied).
+        """
+        return InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "⏩ /steer",
+                        callback_data=f"bs:steer:{tool_bubble_message_id}",
+                    ),
+                    InlineKeyboardButton(
+                        "⚡ /interrupt",
+                        callback_data=f"bs:interrupt:{tool_bubble_message_id}",
+                    ),
+                    InlineKeyboardButton(
+                        "🛑 /stop",
+                        callback_data=f"bs:halt:{tool_bubble_message_id}",
+                    ),
+                ],
+            ]
+        )
+
+    async def attach_busy_session_buttons(
+        self,
+        session_key: str,
+        tool_bubble_message_id: str,
+    ) -> bool:
+        if not self._bot or not tool_bubble_message_id:
+            return False
+        chat_id = self._busy_session_chat_id_for_session(session_key)
+        if not chat_id:
+            return False
+        try:
+            mid_int = int(tool_bubble_message_id)
+            # Mark active BEFORE the API call so any concurrent edit_message
+            # hits the map and includes the keyboard.
+            self._busy_session_button_map[mid_int] = session_key
+            keyboard = self._build_busy_session_keyboard(mid_int)
+            await self._bot.edit_message_reply_markup(
+                chat_id=int(chat_id),
+                message_id=mid_int,
+                reply_markup=keyboard,
+            )
+            return True
+        except Exception as e:
+            logger.debug("[Telegram] attach_busy_session_buttons failed: %s", e)
+            return False
+
+    async def clear_busy_session_buttons(
+        self,
+        session_key: str,
+        tool_bubble_message_id: str,
+    ) -> bool:
+        if not self._bot or not tool_bubble_message_id:
+            logger.info(
+                "[Telegram] clear_busy_session_buttons skip: bot=%s msg_id=%s",
+                bool(self._bot), tool_bubble_message_id,
+            )
+            return False
+        chat_id = self._busy_session_chat_id_for_session(session_key)
+        if not chat_id:
+            logger.info(
+                "[Telegram] clear_busy_session_buttons skip: no chat_id for session %s",
+                (session_key or "")[:30],
+            )
+            return False
+        try:
+            await self._bot.edit_message_reply_markup(
+                chat_id=int(chat_id),
+                message_id=int(tool_bubble_message_id),
+                reply_markup=None,
+            )
+            logger.info(
+                "[Telegram] clear_busy_session_buttons OK: chat=%s msg=%s",
+                chat_id, tool_bubble_message_id,
+            )
+        except Exception as e:
+            err = str(e).lower()
+            # "Message is not modified" is benign — keyboard already absent
+            if "not modified" in err:
+                logger.info(
+                    "[Telegram] clear_busy_session_buttons no-op (already cleared): msg=%s",
+                    tool_bubble_message_id,
+                )
+            else:
+                logger.warning(
+                    "[Telegram] clear_busy_session_buttons FAILED: msg=%s err=%s",
+                    tool_bubble_message_id, e,
+                )
+        self._busy_session_button_map.pop(int(tool_bubble_message_id), None)
+        return True
+
+    async def send_or_update_busy_control_bubble(
+        self,
+        session_key: str,
+        chat_id: str,
+        summary_text: str,
+    ) -> Optional[str]:
+        """Fallback control bubble when no tool bubble exists.
+
+        Sends a small standalone message with the same busy-session
+        keyboard so the user gets [⏩ /steer] [⚡ /interrupt] [🛑 /stop]
+        access during pre-first-tool / mid-streaming-response phases.
+
+        First call sends a new message; subsequent calls edit it (count grows).
+        Tracks msg_id in self._busy_control_bubble_ids[session_key].
+        """
+        if not self._bot or not chat_id:
+            return None
+        existing_id = self._busy_control_bubble_ids.get(session_key)
+        # Build the keyboard fresh each call. Reuses the bs:* callback
+        # prefix so the gateway runner's button-tap dispatcher handles
+        # control-bubble taps identically to tool-bubble taps.
+        try:
+            if existing_id is not None:
+                keyboard = self._build_busy_session_keyboard(int(existing_id))
+                await self._bot.edit_message_text(
+                    chat_id=int(chat_id),
+                    message_id=int(existing_id),
+                    text=summary_text,
+                    reply_markup=keyboard,
+                )
+                return str(existing_id)
+            # Send first
+            sent = await self._bot.send_message(
+                chat_id=int(chat_id),
+                text=summary_text,
+                # Keyboard built after we know the new msg_id, then re-attached.
+            )
+            new_id = sent.message_id
+            self._busy_control_bubble_ids[session_key] = new_id
+            keyboard = self._build_busy_session_keyboard(new_id)
+            try:
+                await self._bot.edit_message_reply_markup(
+                    chat_id=int(chat_id),
+                    message_id=new_id,
+                    reply_markup=keyboard,
+                )
+            except Exception as e:
+                logger.debug("[Telegram] control-bubble keyboard attach failed: %s", e)
+            self._busy_session_button_map[new_id] = session_key
+            return str(new_id)
+        except Exception as e:
+            err = str(e).lower()
+            if "not modified" in err:
+                return str(existing_id) if existing_id is not None else None
+            logger.warning("[Telegram] send_or_update_busy_control_bubble failed: %s", e)
+            return None
+
+    async def delete_busy_control_bubble(
+        self,
+        session_key: str,
+        message_id: str,
+    ) -> bool:
+        """Delete the standalone control bubble (button tap, halt, or natural turn-end)."""
+        if not self._bot or not message_id:
+            return False
+        chat_id = self._busy_session_chat_id_for_session(session_key)
+        if not chat_id:
+            return False
+        try:
+            await self._bot.delete_message(
+                chat_id=int(chat_id),
+                message_id=int(message_id),
+            )
+        except Exception as e:
+            logger.debug("[Telegram] delete_busy_control_bubble failed: %s", e)
+        # Always pop tracking even if API delete failed.
+        self._busy_session_button_map.pop(int(message_id), None)
+        if self._busy_control_bubble_ids.get(session_key) == int(message_id):
+            self._busy_control_bubble_ids.pop(session_key, None)
+        return True
+
+    def _busy_session_chat_id_for_session(self, session_key: str) -> Optional[str]:
+        """Best-effort: resolve session_key → chat_id for button-row edits.
+
+        Hermes session_key shape includes the chat_id; parse it out. If the
+        key doesn't match any expected pattern, return None so the caller
+        skips the edit silently.
+        """
+        # session_key looks like ``agent:main:telegram:dm:<chat_id>``
+        # or ``agent:main:telegram:group:<chat_id>:<user_id>``
+        try:
+            parts = (session_key or "").split(":")
+            if len(parts) >= 5 and parts[2] == "telegram":
+                return parts[4]
+        except Exception:
+            pass
+        return None

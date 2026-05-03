@@ -384,7 +384,9 @@ def load_cli_config() -> Dict[str, Any]:
             "resume_display": "full",
             "show_reasoning": False,
             "streaming": True,
-            "busy_input_mode": "interrupt",
+            "busy_input_mode": "queue",
+            "busy_reactions": True,
+            "busy_ack_mode": "reaction",
 
             "skin": "default",
         },
@@ -1843,9 +1845,17 @@ class HermesCLI:
         self.bell_on_complete = CLI_CONFIG["display"].get("bell_on_complete", False)
         # show_reasoning: display model thinking/reasoning before the response
         self.show_reasoning = CLI_CONFIG["display"].get("show_reasoning", False)
-        # busy_input_mode: "interrupt" (Enter interrupts current run) or "queue" (Enter queues for next turn)
-        _bim = CLI_CONFIG["display"].get("busy_input_mode", "interrupt")
-        self.busy_input_mode = "queue" if str(_bim).strip().lower() == "queue" else "interrupt"
+        # busy_input_mode in the CLI is binary: "queue" (Enter queues for next
+        # turn) or "interrupt" (Enter interrupts current run). The gateway
+        # supports a third "steer" mode that injects mid-stream — in the CLI
+        # context "steer" is treated as "queue" because the CLI doesn't have
+        # the async tool-injection mechanism the gateway uses.
+        _bim = str(CLI_CONFIG["display"].get("busy_input_mode", "steer")).strip().lower()
+        if _bim == "interrupt":
+            self.busy_input_mode = "interrupt"
+        else:
+            # "steer" (gateway default) and "queue" both map to CLI queue.
+            self.busy_input_mode = "queue"
 
         self.verbose = verbose if verbose is not None else (self.tool_progress_mode == "verbose")
         

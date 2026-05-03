@@ -24,7 +24,7 @@ import signal
 import tempfile
 import threading
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from contextvars import copy_context
 from pathlib import Path
 from datetime import datetime
@@ -605,7 +605,32 @@ class GatewayRunner:
     # Class-level defaults so partial construction in tests doesn't
     # blow up on attribute access.
     _running_agents_ts: Dict[str, float] = {}
-    _busy_input_mode: str = "interrupt"
+    _busy_input_mode: str = "queue"
+    _busy_reactions_enabled: bool = True
+    _busy_ack_mode: str = "reaction"
+    # Maps session_key → message_id of the active tool-progress bubble
+    # (the single message that grows as tools fire). Set when
+    # send_progress_messages assigns the first message id; cleared at
+    # turn end. Used by the busy-session button-attach flow.
+    _tool_bubble_msg_ids: Dict[str, int] = {}
+    # Per-session FIFO of busy-session follow-up events still pending a
+    # primitive (button tap or queue catch-up). Drained when the user
+    # taps a button (action applied to ALL pending events together) or
+    # when the current turn ends and the queue catches up naturally.
+    _pending_followups: Dict[str, "deque"] = {}
+    # Per-session progress queue references — set by send_progress_messages,
+    # cleared at turn end. Used by the busy-session handler to inject
+    # "⏳ /queue'd: ..." lines into the tool bubble inline (instead of a
+    # dedicated banner-button row).
+    _session_progress_queues: Dict[str, Any] = {}
+    # Standalone control-bubble msg_ids per session — used as fallback
+    # when no tool bubble exists (pre-first-tool / mid-streaming-response).
+    _busy_control_bubble_ids: Dict[str, str] = {}
+    # Busy-session inline queue summary state. Per-session count + the
+    # first message's preview text (stable across subsequent queues so
+    # the line reads "⏳ /queue'd: \"<first preview>\" ×N").
+    _busy_queue_count: Dict[str, int] = {}
+    _busy_queue_first_preview: Dict[str, str] = {}
     _restart_drain_timeout: float = DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
     _exit_code: Optional[int] = None
     _draining: bool = False
@@ -629,6 +654,8 @@ class GatewayRunner:
         self._service_tier = self._load_service_tier()
         self._show_reasoning = self._load_show_reasoning()
         self._busy_input_mode = self._load_busy_input_mode()
+        self._busy_reactions_enabled = self._load_busy_reactions_enabled()
+        self._busy_ack_mode = self._load_busy_ack_mode()
         self._restart_drain_timeout = self._load_restart_drain_timeout()
         self._provider_routing = self._load_provider_routing()
         self._fallback_model = self._load_fallback_model()
@@ -1247,7 +1274,32 @@ class GatewayRunner:
         return "restarting" if self._restart_requested else "shutting down"
 
     def _queue_during_drain_enabled(self) -> bool:
-        return self._restart_requested and self._busy_input_mode == "queue"
+        """Whether to queue follow-ups arriving during gateway drain.
+
+        Default: False — drain = drop. Drain semantically means "the
+        gateway is going offline." Dropping with a 🙈 reaction is more
+        honest than queueing across a restart (the queued message can
+        sit in pending across a long downtime; user resends after restart
+        is cleaner). Opt back in via env ``HERMES_QUEUE_DURING_DRAIN=1``
+        or ``display.queue_during_drain: true`` in config.yaml.
+        """
+        if not self._restart_requested:
+            return False
+        raw = os.getenv("HERMES_QUEUE_DURING_DRAIN", "").strip().lower()
+        if raw:
+            return raw not in ("false", "0", "no", "off", "")
+        try:
+            import yaml as _y
+            cfg_path = _hermes_home / "config.yaml"
+            if cfg_path.exists():
+                with open(cfg_path, encoding="utf-8") as _f:
+                    cfg = _y.safe_load(_f) or {}
+                val = cfg.get("display", {}).get("queue_during_drain")
+                if val is not None:
+                    return bool(val)
+        except Exception:
+            pass
+        return False  # drain = drop by default
 
     def _update_runtime_status(self, gateway_state: Optional[str] = None, exit_reason: Optional[str] = None) -> None:
         try:
@@ -1406,19 +1458,72 @@ class GatewayRunner:
 
     @staticmethod
     def _load_busy_input_mode() -> str:
-        """Load gateway drain-time busy-input behavior from config/env."""
-        mode = os.getenv("HERMES_GATEWAY_BUSY_INPUT_MODE", "").strip().lower()
-        if not mode:
+        """Load busy-session input mode from config/env.
+
+        Returns one of: ``steer`` (default), ``queue``, ``interrupt`` (legacy).
+
+        - ``steer``: text follow-ups inject into the running agent's stream
+          via running_agent.steer(); media/special cases queue.
+        - ``queue``: text follow-ups queue (no in-stream injection).
+        - ``interrupt`` (legacy): every text follow-up aborts the current tool.
+        """
+        from gateway.busy_session import normalize_busy_input_mode
+        raw = os.getenv("HERMES_GATEWAY_BUSY_INPUT_MODE", "").strip()
+        if not raw:
             try:
                 import yaml as _y
                 cfg_path = _hermes_home / "config.yaml"
                 if cfg_path.exists():
                     with open(cfg_path, encoding="utf-8") as _f:
                         cfg = _y.safe_load(_f) or {}
-                    mode = str(cfg.get("display", {}).get("busy_input_mode", "") or "").strip().lower()
+                    raw = str(cfg.get("display", {}).get("busy_input_mode", "") or "").strip()
             except Exception:
                 pass
-        return "queue" if mode == "queue" else "interrupt"
+        return normalize_busy_input_mode(raw)
+
+    @staticmethod
+    def _load_busy_reactions_enabled() -> bool:
+        """Load whether busy-session emoji reactions are emitted.
+
+        Default: True. Disable with ``HERMES_GATEWAY_BUSY_REACTIONS=false``
+        or ``display.busy_reactions: false`` in config.yaml.
+        """
+        raw = os.getenv("HERMES_GATEWAY_BUSY_REACTIONS", "").strip().lower()
+        if not raw:
+            try:
+                import yaml as _y
+                cfg_path = _hermes_home / "config.yaml"
+                if cfg_path.exists():
+                    with open(cfg_path, encoding="utf-8") as _f:
+                        cfg = _y.safe_load(_f) or {}
+                    val = cfg.get("display", {}).get("busy_reactions")
+                    if val is not None:
+                        raw = str(val).strip().lower()
+            except Exception:
+                pass
+        if not raw:
+            return True  # default on
+        return raw not in ("false", "0", "no", "off")
+
+    @staticmethod
+    def _load_busy_ack_mode() -> str:
+        """Load busy-session ack mode (text ack vs reaction vs both).
+
+        Returns one of: ``reaction`` (default), ``text``, ``both``.
+        """
+        from gateway.busy_session import normalize_busy_ack_mode
+        raw = os.getenv("HERMES_GATEWAY_BUSY_ACK_MODE", "").strip()
+        if not raw:
+            try:
+                import yaml as _y
+                cfg_path = _hermes_home / "config.yaml"
+                if cfg_path.exists():
+                    with open(cfg_path, encoding="utf-8") as _f:
+                        cfg = _y.safe_load(_f) or {}
+                    raw = str(cfg.get("display", {}).get("busy_ack_mode", "") or "").strip()
+            except Exception:
+                pass
+        return normalize_busy_ack_mode(raw)
 
     @staticmethod
     def _load_restart_drain_timeout() -> float:
@@ -1529,62 +1634,556 @@ class GatewayRunner:
             return
         merge_pending_message_event(adapter._pending_messages, session_key, event)
 
-    async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
-        # --- Draining case (gateway restarting/stopping) ---
+    def _route_busy_session_event(
+        self,
+        event: MessageEvent,
+        session_key: str,
+        running_agent: Any,
+    ) -> "BusySessionDecision":
+        """Decide what to do with a follow-up message that arrived while busy.
+
+        Returns a structured ``BusySessionDecision``. Both busy code paths
+        (the adapter callback and the inline fast-path in ``_handle_message``)
+        call this so they cannot diverge.
+
+        Decision order (first match wins):
+        1. Drain-time → queue (if drain-queueing enabled) or drop
+        2. Stop-phrase match (multilingual) → stop
+        3. Agent pre-start sentinel → queue (agent_pending)
+        4. Media follow-up → queue (media_followup)
+        5. Telegram grace window → queue (telegram_followup_grace)
+        6. Mode-based default:
+             - busy_input_mode == "interrupt" (legacy) → stop
+             - busy_input_mode == "queue" → queue
+             - busy_input_mode == "steer" (default) → steer
+        """
+        from gateway.busy_session import (
+            BusySessionDecision,
+            REACTION_DROP,
+            REACTION_QUEUE,
+            REACTION_STEER,
+            REACTION_HALT,
+            REACTION_INTERRUPT,
+            REACTION_STOP,
+        )
+        from gateway.stop_phrases import matches_stop_phrase
+
+        # Drain
         if self._draining:
-            adapter = self.adapters.get(event.source.platform)
-            if not adapter:
-                return True
-
-            thread_meta = {"thread_id": event.source.thread_id} if event.source.thread_id else None
             if self._queue_during_drain_enabled():
-                self._queue_or_replace_pending_event(session_key, event)
-                message = f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
-            else:
-                message = f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
-
-            await adapter._send_with_retry(
-                chat_id=event.source.chat_id,
-                content=message,
-                reply_to=event.message_id,
-                metadata=thread_meta,
+                return BusySessionDecision(
+                    action="queue",
+                    reason="draining",
+                    message=f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back.",
+                    reaction=REACTION_QUEUE,
+                    debounce_ack=True,
+                )
+            return BusySessionDecision(
+                action="drop",
+                reason="draining_drop",
+                message=f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now.",
+                reaction=REACTION_DROP,
+                debounce_ack=True,
             )
-            return True
 
-        # Normal busy case (agent actively running a task)
-        adapter = self.adapters.get(event.source.platform)
-        if not adapter:
-            return False  # let default path handle it
+        # Halt heuristic — multilingual conservative match — fast-path.
+        # TEXT messages only; media follow-ups never auto-halt.
+        # This fires INSTANTLY (no ⏳ wait, no buttons): the user said
+        # "stop" / "para" / "/" / empty / etc. — Esc-equivalent for
+        # messaging surfaces.
+        if event.message_type == MessageType.TEXT:
+            stop_lang = matches_stop_phrase(event.text)
+            if stop_lang is not None:
+                return BusySessionDecision(
+                    action="halt",
+                    reason=f"halt_phrase_{stop_lang}",
+                    message=None,
+                    reaction=REACTION_HALT,
+                    debounce_ack=True,
+                )
 
-        # Store the message so it's processed as the next turn after the
-        # current run finishes (or is interrupted).
+        # Agent still in pre-start sentinel state — queue, never interrupt.
+        # Reaction is None: queue is silent by default; user picks via buttons.
+        if running_agent is _AGENT_PENDING_SENTINEL:
+            return BusySessionDecision(
+                action="queue",
+                reason="agent_pending",
+                message=None,
+                reaction=None,
+                merge_text=event.message_type == MessageType.TEXT,
+                debounce_ack=True,
+            )
+
+        # Media follow-up — queue, never interrupt (preserves attachment).
+        # Silent default queue; buttons available on tool bubble.
+        if event.message_type != MessageType.TEXT:
+            return BusySessionDecision(
+                action="queue",
+                reason="media_followup",
+                message=None,
+                reaction=None,
+                debounce_ack=True,
+            )
+
+        # Telegram grace window — queue (avoid races on rapid bursts).
+        try:
+            grace = float(os.getenv("HERMES_TELEGRAM_FOLLOWUP_GRACE_SECONDS", "3.0"))
+        except (TypeError, ValueError):
+            grace = 3.0
+        started_at = self._running_agents_ts.get(session_key, 0)
+        if (
+            event.source.platform == Platform.TELEGRAM
+            and grace > 0
+            and started_at
+            and (time.time() - started_at) <= grace
+        ):
+            return BusySessionDecision(
+                action="queue",
+                reason="telegram_followup_grace",
+                message=None,
+                reaction=None,
+                merge_text=True,
+                debounce_ack=True,
+            )
+
+        # Mode-based default
+        mode = self._busy_input_mode
+        if mode == "interrupt":
+            return BusySessionDecision(
+                action="stop",
+                reason="legacy_interrupt_mode",
+                message=None,
+                reaction=REACTION_STOP,
+                debounce_ack=True,
+            )
+        if mode == "queue":
+            return BusySessionDecision(
+                action="queue",
+                reason="busy_input_mode_queue",
+                message=None,
+                reaction=None,
+                merge_text=True,
+                debounce_ack=True,
+            )
+        # default: queue. The user's message arrived during a busy tool
+        # sequence; we don't infer intent and we don't auto-emit a
+        # reaction. The default queue is signalled by the inline-keyboard
+        # "Queue (default)" row attached to the active tool bubble.
+        # Reactions only fire AFTER the user explicitly picks via button
+        # tap (or via the halt-phrase heuristic fast-path). If user does
+        # nothing, the queue catches up at end-of-turn and the bot's
+        # reply to the next-turn-equivalent is the implicit signal.
+        return BusySessionDecision(
+            action="queue",
+            reason="default_queue_pending_choice",
+            message=None,
+            reaction=None,  # no reaction by default; user picks explicitly
+            merge_text=True,
+            debounce_ack=False,
+        )
+
+    async def _apply_busy_session_decision(
+        self,
+        decision: "BusySessionDecision",
+        event: MessageEvent,
+        session_key: str,
+        adapter: Any,
+        running_agent: Any,
+    ) -> Optional[str]:
+        """Execute the busy-session decision and return optional ack text.
+
+        Side effects per action:
+        - drop: no state change. Returns the ack message (may be None for
+          silent drops).
+        - queue: appends event to per-session pending deque via
+          ``merge_pending_message_event``. Returns ack.
+        - steer: calls ``running_agent.steer(event.text)``. If steer is
+          rejected (race: agent already exited), falls through to queue.
+          Returns ack.
+        - stop: calls ``running_agent.interrupt(event.text)`` and stores
+          the event for the post-interrupt turn so the agent sees it.
+          Returns ack.
+        """
         from gateway.platforms.base import merge_pending_message_event
-        merge_pending_message_event(adapter._pending_messages, session_key, event)
 
-        is_queue_mode = self._busy_input_mode == "queue"
+        if decision.action == "drop":
+            return decision.message
 
-        # If not in queue mode, interrupt the running agent immediately.
-        # This aborts in-flight tool calls and causes the agent loop to exit
-        # at the next check point.
+        if decision.action == "queue":
+            # Standard queue: store for next-turn delivery and remember
+            # the event in our pending-followups tracking so a later
+            # button tap can find it (and ALL its sibling pending events
+            # from this same busy session) for batched dispatch.
+            if adapter:
+                merge_pending_message_event(
+                    adapter._pending_messages,
+                    session_key,
+                    event,
+                    merge_text=decision.merge_text,
+                )
+            self._pending_followups.setdefault(session_key, deque()).append(event)
+            # Inline tool-bubble summary: push a "⏳ /queue'd: ..." line
+            # into the active progress queue so the user can see what's
+            # been queued without a dedicated banner button. Subsequent
+            # queues update the same line with ×N.
+            self._push_busy_queue_summary(session_key, event)
+            return decision.message
+
+        if decision.action == "steer":
+            steered = False
+            if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
+                try:
+                    steered = bool(running_agent.steer(event.text or ""))
+                except Exception:
+                    steered = False
+            if not steered and adapter:
+                # Race: agent already exiting, or empty text — fall back to queue.
+                merge_pending_message_event(
+                    adapter._pending_messages,
+                    session_key,
+                    event,
+                    merge_text=decision.merge_text,
+                )
+                self._pending_followups.setdefault(session_key, deque()).append(event)
+            return decision.message
+
+        if decision.action == "interrupt":
+            # interrupt = halt + replay text. Distinct from halt: the
+            # follow-up text becomes the next turn's input.
+            if adapter:
+                merge_pending_message_event(
+                    adapter._pending_messages,
+                    session_key,
+                    event,
+                )
+            if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
+                try:
+                    running_agent.interrupt(event.text or "Interrupt via busy-session button")
+                except Exception:
+                    pass
+            return decision.message
+
+        if decision.action == "halt":
+            # halt = stop + idle. Do NOT queue the event for replay —
+            # user said halt, agent halts, no spurious follow-up turn.
+            if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
+                try:
+                    running_agent.interrupt()  # no message → halt-only
+                except Exception:
+                    pass
+            return decision.message
+
+        if decision.action == "stop":
+            # Backwards-compat alias for halt + the legacy-interrupt-mode
+            # carve-out (which still replays the text — preserves the old
+            # ``busy_input_mode=interrupt`` semantic).
+            if decision.reason == "legacy_interrupt_mode" and adapter:
+                merge_pending_message_event(
+                    adapter._pending_messages,
+                    session_key,
+                    event,
+                )
+            if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
+                try:
+                    running_agent.interrupt(
+                        event.text or "Stop requested via busy-session router"
+                        if decision.reason == "legacy_interrupt_mode"
+                        else None
+                    )
+                except Exception:
+                    pass
+            return decision.message
+
+        return decision.message
+
+    def _push_busy_queue_summary(self, session_key: str, event: MessageEvent) -> None:
+        """Append/update the inline ⏳ /queue'd summary line in the tool bubble.
+
+        First call for a session sets the preview to the first message's text
+        and emits a fresh line. Subsequent calls increment the count; the
+        send_progress_messages handler updates the existing line in place
+        with ×N suffix (rather than appending a new one).
+        """
+        pq = self._session_progress_queues.get(session_key)
+        if pq is None:
+            return
+        text = (event.text or "").strip()
+        if not text:
+            text = "(media)"
+        # Truncate the preview to keep the bubble line readable.
+        max_preview = 60
+        preview = text if len(text) <= max_preview else text[: max_preview - 1].rstrip() + "…"
+        # First queue for this session pins the displayed preview.
+        if session_key not in self._busy_queue_first_preview:
+            self._busy_queue_first_preview[session_key] = preview
+        first_preview = self._busy_queue_first_preview[session_key]
+        count = self._busy_queue_count.get(session_key, 0) + 1
+        self._busy_queue_count[session_key] = count
+        try:
+            pq.put_nowait(("__busy_queue__", first_preview, count))
+        except Exception:
+            pass
+
+    def _clear_busy_queue_summary_state(self, session_key: str) -> None:
+        """Clear the per-session queue-summary counters. Called at session end
+        and on button tap so the next busy session starts fresh."""
+        self._busy_queue_count.pop(session_key, None)
+        self._busy_queue_first_preview.pop(session_key, None)
+        self._session_progress_queues.pop(session_key, None)
+
+    async def handle_busy_session_button_tap(
+        self,
+        session_key: str,
+        primitive: str,
+        adapter: Any,
+    ) -> bool:
+        """Handle an inline-keyboard button tap on the active tool bubble.
+
+        Drains the entire pending-followups deque for the session, applies
+        the chosen primitive once to the combined text, and updates each
+        queued message's ⏳ reaction to the appropriate final emoji.
+
+        Args:
+            session_key: The session whose pending followups to drain.
+            primitive: One of ``steer``, ``interrupt``, ``halt``.
+            adapter: The platform adapter (for reaction swaps + tool-bubble edit).
+
+        Returns:
+            True if a primitive was applied; False if nothing was pending
+            (race: turn finished naturally before the tap landed).
+        """
+        from gateway.busy_session import (
+            BusySessionDecision,
+            REACTION_HALT,
+            REACTION_INTERRUPT,
+            REACTION_STEER,
+        )
+
+        events = self._pending_followups.pop(session_key, None)
+        logger.info(
+            "busy-session button tap: primitive=%s session=%s pending=%d",
+            primitive,
+            session_key[:30] if session_key else "?",
+            len(events) if events else 0,
+        )
+        if not events:
+            # Try to clear stale buttons from the tool bubble anyway.
+            await self._clear_busy_session_buttons(session_key, adapter)
+            return False
+
+        events_list = list(events)
+        # Concatenate all pending texts in arrival order.
+        combined_text = "\n".join(
+            (e.text or "").strip() for e in events_list if (e.text or "").strip()
+        )
+
         running_agent = self._running_agents.get(session_key)
-        if not is_queue_mode and running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
-            try:
-                running_agent.interrupt(event.text)
-            except Exception:
-                pass  # don't let interrupt failure block the ack
+        final_reaction = None
 
-        # Debounce: only send an acknowledgment once every 30 seconds per session
-        # to avoid spamming the user when they send multiple messages quickly
+        if primitive == "steer":
+            final_reaction = REACTION_STEER
+            if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
+                try:
+                    running_agent.steer(combined_text)
+                except Exception as e:
+                    logger.debug("button-steer failed: %s", e)
+            # CRITICAL: drop the queued event from adapter._pending_messages
+            # so the post-run drain doesn't replay the same text as a fresh
+            # turn. Without this we'd double-deliver: steered mid-run AND
+            # processed as next turn.
+            if adapter and hasattr(adapter, "_pending_messages"):
+                adapter._pending_messages.pop(session_key, None)
+        elif primitive == "interrupt":
+            final_reaction = REACTION_INTERRUPT
+            if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
+                try:
+                    running_agent.interrupt(combined_text or "Interrupt via button")
+                except Exception as e:
+                    logger.debug("button-interrupt failed: %s", e)
+        elif primitive == "halt":
+            final_reaction = REACTION_HALT
+            if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
+                try:
+                    running_agent.interrupt()
+                except Exception as e:
+                    logger.debug("button-halt failed: %s", e)
+            # halt does NOT replay events — clear any pending state on adapter
+            if adapter and hasattr(adapter, "_pending_messages"):
+                adapter._pending_messages.pop(session_key, None)
+        else:
+            logger.warning("unknown busy-session primitive: %r", primitive)
+            return False
+
+        # Swap → final reaction on every queued message.
+        if adapter and final_reaction:
+            for ev in events_list:
+                _mid = getattr(ev, "message_id", None)
+                _cid = getattr(getattr(ev, "source", None), "chat_id", None)
+                try:
+                    ok = await adapter.set_busy_reaction(ev, final_reaction)
+                    logger.info(
+                        "busy-session reaction swap: emoji=%s msg_id=%s chat=%s ok=%s",
+                        final_reaction, _mid, _cid, ok,
+                    )
+                except Exception as e:
+                    logger.warning("reaction swap on tap failed (msg=%s): %s", _mid, e)
+
+        # Clear the now-redundant button row from the tool bubble.
+        await self._clear_busy_session_buttons(session_key, adapter)
+        # And delete the standalone control bubble (if one was used as the
+        # button host instead of the tool bubble).
+        await self._delete_control_bubble_if_any(session_key, adapter)
+        return True
+
+    async def _attach_busy_session_buttons(
+        self,
+        session_key: str,
+        adapter: Any,
+    ) -> None:
+        """Attach the [Steer] [Interrupt] [Halt] inline keyboard to the
+        active tool bubble for the given session, if the adapter supports it.
+        """
+        if not adapter or not getattr(self, "_busy_reactions_enabled", True):
+            return
+        msg_id = self._tool_bubble_msg_ids.get(session_key)
+        if not msg_id:
+            return
+        try:
+            await adapter.attach_busy_session_buttons(session_key, msg_id)
+        except Exception as e:
+            logger.debug("attach busy-session buttons failed: %s", e)
+
+    async def _send_or_update_control_bubble(
+        self,
+        session_key: str,
+        event: MessageEvent,
+        adapter: Any,
+    ) -> None:
+        """Send/update the standalone control bubble (no-tool-bubble fallback).
+
+        Builds the same "⏳ /queue'd: \"<preview>\" ×N" summary as the inline
+        version and asks the adapter to send-or-edit a dedicated message
+        carrying the [⏩ /steer] [⚡ /interrupt] [🛑 /stop] keyboard.
+        """
+        if not adapter:
+            return
+        chat_id = getattr(getattr(event, "source", None), "chat_id", None)
+        if not chat_id:
+            return
+        first_preview = self._busy_queue_first_preview.get(session_key)
+        if first_preview is None:
+            text = (event.text or "").strip() or "(media)"
+            preview = text if len(text) <= 60 else text[:59].rstrip() + "…"
+            first_preview = preview
+        count = self._busy_queue_count.get(session_key, 0) or 1
+        suffix = f" ×{count}" if count > 1 else ""
+        summary = f'⏳ /queue\'d: "{first_preview}"{suffix}'
+        try:
+            new_id = await adapter.send_or_update_busy_control_bubble(
+                session_key, chat_id, summary
+            )
+            if new_id:
+                self._busy_control_bubble_ids[session_key] = str(new_id)
+        except Exception as e:
+            logger.debug("control-bubble send/update failed: %s", e)
+
+    async def _delete_control_bubble_if_any(
+        self,
+        session_key: str,
+        adapter: Any,
+    ) -> None:
+        """Delete the standalone control bubble if one exists for the session.
+
+        Called on action commit (button tap) and at turn end so the bubble
+        doesn't linger as chat noise.
+        """
+        if not adapter:
+            return
+        msg_id = self._busy_control_bubble_ids.pop(session_key, None)
+        if not msg_id:
+            return
+        try:
+            await adapter.delete_busy_control_bubble(session_key, msg_id)
+        except Exception as e:
+            logger.debug("delete_busy_control_bubble failed: %s", e)
+
+    async def _clear_busy_session_buttons(
+        self,
+        session_key: str,
+        adapter: Any,
+    ) -> None:
+        """Remove the inline keyboard from the active tool bubble. No-op if
+        there's no recorded tool-bubble message id."""
+        if not adapter:
+            return
+        msg_id = self._tool_bubble_msg_ids.get(session_key)
+        if not msg_id:
+            return
+        try:
+            await adapter.clear_busy_session_buttons(session_key, msg_id)
+        except Exception as e:
+            logger.debug("clear busy-session buttons failed: %s", e)
+
+    async def _emit_busy_session_signals(
+        self,
+        decision: "BusySessionDecision",
+        event: MessageEvent,
+        session_key: str,
+        adapter: Any,
+        running_agent: Any,
+    ) -> None:
+        """Emit reaction (always when enabled) and text ack (per ack mode).
+
+        Reactions are best-effort and never raise. Text acks honor a
+        per-session debounce (default 30s) to avoid spam under rapid bursts.
+        """
+        # Reaction first — fast, language-neutral, replaces noisy text on
+        # platforms that support it. Gated by both the master enable and
+        # the ack-mode (reaction/both both emit, text-only suppresses).
+        emit_reaction = (
+            decision.reaction
+            and self._busy_reactions_enabled
+            and adapter
+            and self._busy_ack_mode in ("reaction", "both")
+        )
+        if emit_reaction:
+            try:
+                await adapter.set_busy_reaction(event, decision.reaction)
+            except Exception as e:
+                logger.debug("busy-reaction emit failed: %s", e)
+
+        # When the action is queue (the new default for ambiguous text
+        # follow-ups), give the user button access. Two paths:
+        #   A. Tool bubble exists → attach inline keyboard to it (same
+        #      message that already has the "⏳ /queue'd: …" line pinned
+        #      to its bottom).
+        #   B. No tool bubble (pre-first-tool / mid-streaming) → send a
+        #      standalone control bubble with the same keyboard. Subsequent
+        #      queues edit it in place; deleted on action commit or turn end.
+        if decision.action == "queue":
+            tool_bubble_id = self._tool_bubble_msg_ids.get(session_key)
+            if tool_bubble_id:
+                await self._attach_busy_session_buttons(session_key, adapter)
+            else:
+                await self._send_or_update_control_bubble(
+                    session_key, event, adapter
+                )
+
+        # Text ack — only if mode wants it and we have an adapter.
+        if not adapter or self._busy_ack_mode not in ("text", "both"):
+            return
+
+        # Debounce
         _BUSY_ACK_COOLDOWN = 30
         now = time.time()
-        last_ack = self._busy_ack_ts.get(session_key, 0)
-        if now - last_ack < _BUSY_ACK_COOLDOWN:
-            return True  # interrupt sent (if not queue), ack already delivered recently
+        if decision.debounce_ack:
+            last_ack = self._busy_ack_ts.get(session_key, 0)
+            if now - last_ack < _BUSY_ACK_COOLDOWN:
+                return
+            self._busy_ack_ts[session_key] = now
 
-        self._busy_ack_ts[session_key] = now
-
-        # Build a status-rich acknowledgment
-        status_parts = []
+        # Build status-rich detail for text acks (preserves prior UX richness).
+        status_parts: List[str] = []
         if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
             try:
                 summary = running_agent.get_activity_summary()
@@ -1602,18 +2201,38 @@ class GatewayRunner:
                     status_parts.append(f"running: {current_tool}")
             except Exception:
                 pass
-
         status_detail = f" ({', '.join(status_parts)})" if status_parts else ""
-        if is_queue_mode:
-            message = (
-                f"⏳ Queued for the next turn{status_detail}. "
-                f"I'll respond once the current task finishes."
-            )
-        else:
-            message = (
-                f"⚡ Interrupting current task{status_detail}. "
-                f"I'll respond to your message shortly."
-            )
+
+        # Build canonical text ack from action + reason. ``decision.message``
+        # takes precedence (used by drain reasons that set explicit text).
+        message = decision.message
+        if not message:
+            if decision.action == "stop":
+                if decision.reason == "stop_phrase_universal":
+                    message = f"🛑 Stopped{status_detail}."
+                elif decision.reason.startswith("stop_phrase_"):
+                    message = f"🛑 Stopped{status_detail}."
+                else:
+                    message = (
+                        f"⚡ Interrupting current task{status_detail}. "
+                        f"I'll respond to your message shortly."
+                    )
+            elif decision.action == "queue":
+                message = (
+                    f"⏳ Queued for the next turn{status_detail}. "
+                    f"I'll respond once the current task finishes."
+                )
+            elif decision.action == "steer":
+                message = (
+                    f"👌 Added that as mid-run steer{status_detail}. "
+                    f"It will land after the next tool call."
+                )
+            elif decision.action == "drop":
+                # Drop default has no text by design; only drain reasons set explicit text.
+                return
+
+        if not message:
+            return
 
         thread_meta = {"thread_id": event.source.thread_id} if event.source.thread_id else None
         try:
@@ -1626,6 +2245,23 @@ class GatewayRunner:
         except Exception as e:
             logger.debug("Failed to send busy-ack: %s", e)
 
+    async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
+        """Handle a follow-up message that arrived while a session is busy.
+
+        Routes via the shared ``_route_busy_session_event`` decision function,
+        applies the action, and emits reaction + optional text ack.
+        """
+        adapter = self.adapters.get(event.source.platform)
+        if adapter is None and not self._draining:
+            return False  # let default path handle it
+        running_agent = self._running_agents.get(session_key)
+        decision = self._route_busy_session_event(event, session_key, running_agent)
+        await self._apply_busy_session_decision(
+            decision, event, session_key, adapter, running_agent
+        )
+        await self._emit_busy_session_signals(
+            decision, event, session_key, adapter, running_agent
+        )
         return True
 
     async def _drain_active_agents(self, timeout: float) -> tuple[Dict[str, Any], bool]:
@@ -2084,7 +2720,14 @@ class GatewayRunner:
             adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
             adapter.set_session_store(self.session_store)
             adapter.set_busy_session_handler(self._handle_active_session_busy_message)
-            
+            # Back-reference so platform-side callback handlers (e.g. the
+            # Telegram inline-keyboard callback for the busy-session
+            # buttons) can dispatch into the gateway runner.
+            try:
+                adapter._gateway_runner = self
+            except Exception:
+                pass
+
             # Try to connect
             logger.info("Connecting to %s...", platform.value)
             self._update_platform_runtime_status(
@@ -3453,72 +4096,36 @@ class GatewayRunner:
                     f"mid-turn. Wait for the current response or `/stop` first."
                 )
 
-            if event.message_type == MessageType.PHOTO:
-                logger.debug("PRIORITY photo follow-up for session %s — queueing without interrupt", _quick_key[:20])
-                adapter = self.adapters.get(source.platform)
-                if adapter:
-                    merge_pending_message_event(adapter._pending_messages, _quick_key, event)
-                return None
-
-            _telegram_followup_grace = float(
-                os.getenv("HERMES_TELEGRAM_FOLLOWUP_GRACE_SECONDS", "3.0")
-            )
-            _started_at = self._running_agents_ts.get(_quick_key, 0)
-            if (
-                source.platform == Platform.TELEGRAM
-                and event.message_type == MessageType.TEXT
-                and _telegram_followup_grace > 0
-                and _started_at
-                and (time.time() - _started_at) <= _telegram_followup_grace
-            ):
-                logger.debug(
-                    "Telegram follow-up arrived %.2fs after run start for %s — queueing without interrupt",
-                    time.time() - _started_at,
-                    _quick_key[:20],
-                )
-                adapter = self.adapters.get(source.platform)
-                if adapter:
-                    merge_pending_message_event(
-                        adapter._pending_messages,
-                        _quick_key,
-                        event,
-                        merge_text=True,
-                    )
-                return None
-
+            # Special case: agent in pre-start sentinel + explicit /stop
+            # command — clear the sentinel and return the canonical
+            # force-stopped message. Handled here because it has unique
+            # session-state side effects beyond what the shared router does.
             running_agent = self._running_agents.get(_quick_key)
-            if running_agent is _AGENT_PENDING_SENTINEL:
-                # Agent is being set up but not ready yet.
-                if event.get_command() == "stop":
-                    # Force-clean the sentinel so the session is unlocked.
-                    self._release_running_agent_state(_quick_key)
-                    logger.info("HARD STOP (pending) for session %s — sentinel cleared", _quick_key[:20])
-                    return "⚡ Force-stopped. The agent was still starting — session unlocked."
-                # Queue the message so it will be picked up after the
-                # agent starts.
-                adapter = self.adapters.get(source.platform)
-                if adapter:
-                    merge_pending_message_event(
-                        adapter._pending_messages,
-                        _quick_key,
-                        event,
-                        merge_text=True,
-                    )
-                return None
-            if self._draining:
-                if self._queue_during_drain_enabled():
-                    self._queue_or_replace_pending_event(_quick_key, event)
-                return (
-                    f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
-                    if self._queue_during_drain_enabled()
-                    else f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
-                )
-            logger.debug("PRIORITY interrupt for session %s", _quick_key[:20])
-            running_agent.interrupt(event.text)
-            if _quick_key in self._pending_messages:
-                self._pending_messages[_quick_key] += "\n" + event.text
-            else:
-                self._pending_messages[_quick_key] = event.text
+            if running_agent is _AGENT_PENDING_SENTINEL and event.get_command() == "stop":
+                self._release_running_agent_state(_quick_key)
+                logger.info("HARD STOP (pending) for session %s — sentinel cleared", _quick_key[:20])
+                if self._busy_reactions_enabled:
+                    _ad = self.adapters.get(source.platform)
+                    if _ad is not None:
+                        try:
+                            from gateway.busy_session import REACTION_STOP as _RS
+                            await _ad.set_busy_reaction(event, _RS)
+                        except Exception as e:
+                            logger.debug("inline force-stop reaction failed: %s", e)
+                return "⚡ Force-stopped. The agent was still starting — session unlocked."
+
+            # All other busy-session decisions go through the shared router
+            # so the inline fast-path and the adapter callback path cannot
+            # diverge. The router decides; the applier executes; the
+            # signaler emits reaction + optional text ack via _send_with_retry.
+            adapter = self.adapters.get(source.platform)
+            decision = self._route_busy_session_event(event, _quick_key, running_agent)
+            await self._apply_busy_session_decision(
+                decision, event, _quick_key, adapter, running_agent
+            )
+            await self._emit_busy_session_signals(
+                decision, event, _quick_key, adapter, running_agent
+            )
             return None
 
         # Check for commands
@@ -8741,6 +9348,20 @@ class GatewayRunner:
         self._running_agents_ts.pop(session_key, None)
         if hasattr(self, "_busy_ack_ts"):
             self._busy_ack_ts.pop(session_key, None)
+        # Round 2 busy-session state — clear so stale buttons / pending
+        # followups can't leak across a new turn for the same session.
+        if hasattr(self, "_pending_followups"):
+            self._pending_followups.pop(session_key, None)
+        if hasattr(self, "_tool_bubble_msg_ids"):
+            self._tool_bubble_msg_ids.pop(session_key, None)
+        if hasattr(self, "_busy_queue_count"):
+            self._busy_queue_count.pop(session_key, None)
+        if hasattr(self, "_busy_queue_first_preview"):
+            self._busy_queue_first_preview.pop(session_key, None)
+        if hasattr(self, "_session_progress_queues"):
+            self._session_progress_queues.pop(session_key, None)
+        if hasattr(self, "_busy_control_bubble_ids"):
+            self._busy_control_bubble_ids.pop(session_key, None)
         return True
 
     def _clear_session_boundary_security_state(self, session_key: str) -> None:
@@ -9386,6 +10007,10 @@ class GatewayRunner:
         
         # Queue for progress messages (thread-safe)
         progress_queue = queue.Queue() if tool_progress_enabled else None
+        # Expose the queue so the busy-session handler can inject inline
+        # "⏳ /queue'd: ..." summary lines into the tool bubble.
+        if progress_queue is not None and session_key:
+            self._session_progress_queues[session_key] = progress_queue
         last_tool = [None]  # Mutable container for tracking in closure
         last_progress_msg = [None]  # Track last message for dedup
         repeat_count = [0]  # How many times the same message repeated
@@ -9488,10 +10113,45 @@ class GatewayRunner:
                 return
 
             progress_lines = []      # Accumulated tool lines
+            queue_summary_line = None  # Busy-session summary, pinned to bottom
             progress_msg_id = None   # ID of the progress message to edit
             can_edit = True          # False once an edit fails (platform doesn't support it)
             _last_edit_ts = 0.0      # Throttle edits to avoid Telegram flood control
             _PROGRESS_EDIT_INTERVAL = 1.5  # Minimum seconds between edits
+
+            def _render_bubble_text() -> str:
+                """Compose the tool-bubble text: tool lines first, then the
+                pinned queue summary (if any) on its own paragraph. Keeps
+                the ⏳ /queue'd: ... line fixed to the bottom regardless of
+                how many tools have fired since."""
+                parts = ["\n".join(progress_lines)] if progress_lines else []
+                if queue_summary_line:
+                    parts.append(queue_summary_line)
+                return "\n\n".join(parts)
+
+            async def _finalize_busy_session_state() -> None:
+                """Clear busy-session button row + pending followups deque
+                whenever the progress task ends. Called from every return
+                path so stale buttons can't outlive a turn."""
+                if not session_key:
+                    return
+                _stale_msg_id = self._tool_bubble_msg_ids.pop(session_key, None)
+                if _stale_msg_id and adapter:
+                    try:
+                        await adapter.clear_busy_session_buttons(
+                            session_key, _stale_msg_id
+                        )
+                    except Exception:
+                        pass
+                # Standalone control bubble (no-tool fallback) — delete entirely.
+                _ctrl_id = self._busy_control_bubble_ids.pop(session_key, None)
+                if _ctrl_id and adapter:
+                    try:
+                        await adapter.delete_busy_control_bubble(session_key, _ctrl_id)
+                    except Exception:
+                        pass
+                if hasattr(self, "_pending_followups"):
+                    self._pending_followups.pop(session_key, None)
 
             while True:
                 try:
@@ -9501,6 +10161,7 @@ class GatewayRunner:
                                 progress_queue.get_nowait()
                             except Exception:
                                 break
+                        await _finalize_busy_session_state()
                         return
 
                     raw = progress_queue.get_nowait()
@@ -9511,6 +10172,15 @@ class GatewayRunner:
                         if progress_lines:
                             progress_lines[-1] = f"{base_msg} (×{count + 1})"
                         msg = progress_lines[-1] if progress_lines else base_msg
+                    elif isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__busy_queue__":
+                        # Busy-session summary line — pinned to the bottom
+                        # of the tool bubble (separate from progress_lines)
+                        # with a blank line above. Updates in place as more
+                        # follow-ups queue (×N count).
+                        _, preview, count = raw
+                        suffix = f" ×{count}" if count > 1 else ""
+                        queue_summary_line = f'⏳ /queue\'d: "{preview}"{suffix}'
+                        msg = queue_summary_line
                     else:
                         msg = raw
                         progress_lines.append(msg)
@@ -9529,11 +10199,12 @@ class GatewayRunner:
                         continue
 
                     if not _run_still_current():
+                        await _finalize_busy_session_state()
                         return
 
                     if can_edit and progress_msg_id is not None:
                         # Try to edit the existing progress message
-                        full_text = "\n".join(progress_lines)
+                        full_text = _render_bubble_text()
                         result = await adapter.edit_message(
                             chat_id=source.chat_id,
                             message_id=progress_msg_id,
@@ -9554,13 +10225,19 @@ class GatewayRunner:
                     else:
                         if can_edit:
                             # First tool: send all accumulated text as new message
-                            full_text = "\n".join(progress_lines)
+                            full_text = _render_bubble_text()
                             result = await adapter.send(chat_id=source.chat_id, content=full_text, metadata=_progress_metadata)
                         else:
                             # Editing unsupported: send just this line
                             result = await adapter.send(chat_id=source.chat_id, content=msg, metadata=_progress_metadata)
                         if result.success and result.message_id:
                             progress_msg_id = result.message_id
+                            # Track the active tool-bubble message_id for
+                            # this session so the busy-session button flow
+                            # can attach an inline keyboard to the right
+                            # message when a follow-up arrives.
+                            if session_key:
+                                self._tool_bubble_msg_ids[session_key] = progress_msg_id
 
                     _last_edit_ts = time.monotonic()
 
@@ -9585,8 +10262,8 @@ class GatewayRunner:
                         except Exception:
                             break
                     # Final edit with all remaining tools (only if editing works)
-                    if can_edit and progress_lines and progress_msg_id:
-                        full_text = "\n".join(progress_lines)
+                    if can_edit and (progress_lines or queue_summary_line) and progress_msg_id:
+                        full_text = _render_bubble_text()
                         try:
                             await adapter.edit_message(
                                 chat_id=source.chat_id,
@@ -9595,6 +10272,8 @@ class GatewayRunner:
                             )
                         except Exception:
                             pass
+                    # Tool bubble retired — final cleanup via shared helper.
+                    await _finalize_busy_session_state()
                     return
                 except Exception as e:
                     logger.error("Progress message error: %s", e)
@@ -10825,6 +11504,27 @@ class GatewayRunner:
             
             # Clean up tracking
             tracking_task.cancel()
+            # Safety-net: explicitly clear the busy-session inline keyboard
+            # from the active tool bubble AND delete any standalone control
+            # bubble. The send_progress_messages handler already does this,
+            # but if that handler races or the task was already done, the
+            # buttons / control bubble can persist visually after the bot's
+            # final reply lands. Idempotent — no-op if already cleared.
+            if session_key and adapter:
+                _bubble_msg_id = self._tool_bubble_msg_ids.get(session_key)
+                if _bubble_msg_id:
+                    try:
+                        await adapter.clear_busy_session_buttons(
+                            session_key, _bubble_msg_id
+                        )
+                    except Exception as e:
+                        logger.debug("safety-net clear_busy_session_buttons failed: %s", e)
+                _ctrl_msg_id = self._busy_control_bubble_ids.pop(session_key, None)
+                if _ctrl_msg_id:
+                    try:
+                        await adapter.delete_busy_control_bubble(session_key, _ctrl_msg_id)
+                    except Exception as e:
+                        logger.debug("safety-net delete_busy_control_bubble failed: %s", e)
             if session_key:
                 # Only release the slot if this run's generation still owns
                 # it.  A /stop or /new that bumped the generation while we

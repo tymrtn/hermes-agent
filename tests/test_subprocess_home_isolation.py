@@ -116,6 +116,22 @@ class TestMakeRunEnvHomeInjection:
 
         assert result["HOME"] == "/home/user"
 
+    def test_prepends_real_user_local_bin_before_profile_home_injection(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "home").mkdir()
+        real_home = tmp_path / "real-user"
+        real_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("HOME", str(real_home))
+        monkeypatch.setenv("PATH", "/venv/bin:/usr/bin:/bin")
+
+        from tools.environments.local import _make_run_env
+        result = _make_run_env({})
+
+        assert result["HOME"] == str(hermes_home / "home")
+        assert result["PATH"].split(":")[:2] == [str(real_home / ".local" / "bin"), "/venv/bin"]
+
 
 # ---------------------------------------------------------------------------
 # _sanitize_subprocess_env() injection

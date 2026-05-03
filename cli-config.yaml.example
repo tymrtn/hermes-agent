@@ -823,11 +823,36 @@ display:
   # messages. This is independent of tool_progress and gateway streaming.
   interim_assistant_messages: true
 
-  # What Enter does when Hermes is already busy in the CLI.
-  #   interrupt: Interrupt the current run and redirect Hermes (default)
-  #   queue:     Queue your message for the next turn
-  # Ctrl+C always interrupts regardless of this setting.
-  busy_input_mode: interrupt
+  # What happens when a follow-up message arrives while Hermes is busy.
+  #
+  # Gateway (Telegram/Discord/Slack/etc., follow-ups during an active turn):
+  #   steer:     Inject the message mid-stream so the agent sees it after
+  #              its current tool call finishes (default — closest to
+  #              Claude Code's "noted, will weave it in" model).
+  #   queue:     Queue the message for the next turn (no in-stream injection).
+  #   interrupt: Abort the current tool call on every follow-up (legacy).
+  #
+  # CLI (Enter while busy): the CLI is binary — `interrupt` interrupts,
+  # anything else queues. `steer` in the CLI is treated as `queue` because
+  # the CLI does not currently have the async injection mechanism the
+  # gateway uses.
+  #
+  # Ctrl+C in the CLI always interrupts regardless of this setting. In
+  # messaging surfaces, sending "stop"/"wait"/"halt"/"cancel"/"abort" (or
+  # the equivalent in 15 other languages, or "/stop", or an empty message)
+  # always halts the running agent, regardless of busy_input_mode.
+  busy_input_mode: queue
+
+  # Emit emoji reactions on busy-session follow-up messages indicating
+  # which decision the gateway took: ⏳ queue, 👌 steer, 🛑 stop, 🙈 drop.
+  # Best-effort per platform — platforms without reaction APIs no-op.
+  busy_reactions: true
+
+  # How busy-session feedback is delivered.
+  #   reaction: emoji reaction only (default — quietest UX)
+  #   text:     text ack only ("⏳ Queued for the next turn..." etc.)
+  #   both:     reaction plus text ack
+  busy_ack_mode: reaction
 
   # Background process notifications (gateway/messaging only).
   # Controls how chatty the process watcher is when you use

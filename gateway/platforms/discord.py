@@ -1054,6 +1054,23 @@ class DiscordAdapter(BasePlatformAdapter):
             elif outcome == ProcessingOutcome.FAILURE:
                 await self._add_reaction(message, "❌")
 
+    async def set_busy_reaction(
+        self,
+        event: MessageEvent,
+        emoji: Optional[str],
+    ) -> bool:
+        """Set a busy-session reaction on the user's follow-up message.
+
+        Gateway-side ``HERMES_GATEWAY_BUSY_REACTIONS`` is the sole gate;
+        independent of ``DISCORD_REACTIONS``.
+        """
+        if not emoji:
+            return False
+        message = event.raw_message
+        if not hasattr(message, "add_reaction"):
+            return False
+        return await self._add_reaction(message, emoji)
+
     async def send(
         self,
         chat_id: str,

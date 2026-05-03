@@ -199,8 +199,22 @@ def _make_run_env(env: dict) -> dict:
         elif k not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(k):
             run_env[k] = v
     existing_path = run_env.get("PATH", "")
-    if "/usr/bin" not in existing_path.split(":"):
-        run_env["PATH"] = f"{existing_path}:{_SANE_PATH}" if existing_path else _SANE_PATH
+    path_parts = [p for p in existing_path.split(":") if p]
+
+    # Keep user-installed CLIs at one canonical path even when a Hermes profile
+    # later overrides HOME. This prevents profile/venv bin directories from
+    # becoming shadow install locations for tools such as Envelope.
+    real_home = os.environ.get("HOME") or run_env.get("HOME")
+    if real_home:
+        user_local_bin = os.path.join(real_home, ".local", "bin")
+        if user_local_bin not in path_parts:
+            path_parts.insert(0, user_local_bin)
+
+    if "/usr/bin" not in path_parts:
+        for p in _SANE_PATH.split(":"):
+            if p and p not in path_parts:
+                path_parts.append(p)
+    run_env["PATH"] = ":".join(path_parts)
 
     # Per-profile HOME isolation: redirect system tool configs (git, ssh, gh,
     # npm …) into {HERMES_HOME}/home/ when that directory exists.  Only the

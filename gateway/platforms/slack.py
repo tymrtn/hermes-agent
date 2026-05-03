@@ -639,6 +639,36 @@ class SlackAdapter(BasePlatformAdapter):
         elif outcome == ProcessingOutcome.FAILURE:
             await self._add_reaction(channel_id, ts, "x")
 
+    # Map glyph → Slack reaction name for busy-session reactions.
+    _BUSY_REACTION_NAMES: dict[str, str] = {
+        "⏳": "hourglass_flowing_sand",
+        "👌": "ok_hand",
+        "🛑": "octagonal_sign",
+        "🙈": "see_no_evil",
+    }
+
+    async def set_busy_reaction(
+        self,
+        event: MessageEvent,
+        emoji: Optional[str],
+    ) -> bool:
+        """Set a busy-session reaction on the user's follow-up message.
+
+        Gateway-side ``HERMES_GATEWAY_BUSY_REACTIONS`` is the sole gate;
+        independent of ``SLACK_REACTIONS``.
+        """
+        if not emoji:
+            return False
+        name = self._BUSY_REACTION_NAMES.get(emoji)
+        if not name:
+            logger.debug("[Slack] no name mapping for busy reaction %r", emoji)
+            return False
+        ts = getattr(event, "message_id", None)
+        channel_id = getattr(event.source, "chat_id", None)
+        if not ts or not channel_id:
+            return False
+        return await self._add_reaction(channel_id, ts, name)
+
     # ----- User identity resolution -----
 
     async def _resolve_user_name(self, user_id: str, chat_id: str = "") -> str:

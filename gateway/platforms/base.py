@@ -1558,6 +1558,115 @@ class BasePlatformAdapter(ABC):
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """Hook called when background processing completes."""
 
+    async def set_busy_reaction(
+        self,
+        event: MessageEvent,
+        emoji: Optional[str],
+    ) -> bool:
+        """Set a reaction on a busy-session inbound message.
+
+        Distinct from on_processing_start/complete: those target the
+        turn-initiating message; this targets a follow-up that arrived
+        while the agent was already busy. The reaction signals which
+        decision the busy-session router took (queue/steer/halt/interrupt/drop).
+
+        Default no-op. Platforms with reaction APIs override.
+        Returns True on success, False otherwise. Failures are logged
+        at DEBUG and never raised.
+        """
+        return False
+
+    async def attach_busy_session_buttons(
+        self,
+        session_key: str,
+        tool_bubble_message_id: str,
+    ) -> bool:
+        """Attach the [Steer] [Interrupt] [Halt] inline keyboard to the
+        currently-active tool-progress message bubble for a session.
+
+        Called by the gateway when a follow-up message arrives during a
+        busy session and lands as a queue (default). Lets the user
+        explicitly choose how to handle their pending message(s) without
+        having to remember slash-command syntax.
+
+        Default no-op. Platforms with button support (Telegram inline
+        keyboards, Discord views, Slack block actions) override.
+        Returns True on success.
+        """
+        return False
+
+    async def clear_busy_session_buttons(
+        self,
+        session_key: str,
+        tool_bubble_message_id: str,
+    ) -> bool:
+        """Remove the busy-session inline keyboard from the tool bubble.
+
+        Called when the pending followups are drained (button tap or
+        natural queue catch-up at end-of-turn).
+
+        Default no-op. Platforms override.
+        Returns True on success.
+        """
+        return False
+
+    async def clear_all_busy_session_buttons_for_session(
+        self,
+        session_key: str,
+    ) -> int:
+        """Clear inline keyboards from EVERY message_id this adapter has
+        previously decorated with busy-session buttons for ``session_key``.
+
+        The single-msg ``clear_busy_session_buttons`` clears only the
+        currently-tracked tool bubble. Across a turn the bubble msg_id can
+        in principle change (e.g. message-too-long fallback creates a new
+        bubble); historical msg_ids may also have buttons that were
+        re-applied through ``edit_message`` overrides. This method is the
+        authoritative "scrub everything" cleanup used by the gateway's
+        post-run finally.
+
+        Default no-op. Platforms with per-msg tracking (Telegram) override.
+        Returns the number of messages cleared.
+        """
+        return 0
+
+    async def send_or_update_busy_control_bubble(
+        self,
+        session_key: str,
+        chat_id: str,
+        summary_text: str,
+    ) -> Optional[str]:
+        """Create or edit a standalone "control bubble" for a busy session.
+
+        Used as a FALLBACK when the agent has no active tool-progress
+        bubble (pre-first-tool, mid-streaming-response phases). The
+        control bubble carries the same ⏩ /steer / ⚡ /interrupt /
+        🛑 /stop inline keyboard as the tool-bubble path, so the user
+        always has button access regardless of agent phase.
+
+        On first call for a session: sends a new message with the buttons.
+        Subsequent calls: edit the existing message's text (count grows).
+
+        Default no-op (returns None). Platforms with inline-keyboard
+        support override. Returns the message id on success.
+        """
+        return None
+
+    async def delete_busy_control_bubble(
+        self,
+        session_key: str,
+        message_id: str,
+    ) -> bool:
+        """Delete the standalone control bubble.
+
+        Called on action commit (button tap, halt, natural turn-end queue
+        catch-up). Removes the control bubble entirely so chat history
+        stays clean.
+
+        Default no-op. Platforms override.
+        """
+        return False
+
     async def _run_processing_hook(self, hook_name: str, *args: Any, **kwargs: Any) -> None:
         """Run a lifecycle hook without letting failures break message flow."""
         hook = getattr(self, hook_name, None)
