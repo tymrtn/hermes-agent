@@ -3045,6 +3045,55 @@ class SlackAdapter(BasePlatformAdapter):
                 return str(chat_id)
         return None
 
+    async def _fetch_slack_message_text(
+        self,
+        channel_id: str,
+        message_id: str,
+        thread_ts: Optional[str] = None,
+    ) -> str:
+        """Best-effort fetch of an existing Slack message's text.
+
+        ``conversations_history`` only returns top-level channel messages
+        — thread replies are NOT addressable by ts.  When the message is
+        a thread reply, fall back to ``conversations_replies`` and locate
+        the target ts in the reply list.  Returns "" if the message
+        can't be found, so callers fall back gracefully.
+        """
+        if not self._app:
+            return ""
+        client = self._get_client(channel_id)
+        # Top-level: history works.
+        try:
+            hist = await client.conversations_history(
+                channel=channel_id, latest=message_id,
+                inclusive=True, limit=1,
+            )
+            msgs = hist.get("messages") if hasattr(hist, "get") else None
+            if msgs:
+                got = msgs[0]
+                if got.get("ts") == message_id:
+                    return got.get("text") or ""
+        except Exception:
+            pass
+        # Thread reply: look it up via replies.  We don't always know the
+        # parent thread_ts; try the explicit one first, then probe with
+        # the message ts as the parent (single-reply threads).
+        candidates: List[str] = []
+        if thread_ts:
+            candidates.append(thread_ts)
+        candidates.append(message_id)
+        for parent_ts in candidates:
+            try:
+                replies = await client.conversations_replies(
+                    channel=channel_id, ts=parent_ts, limit=200,
+                )
+                for m in replies.get("messages", []) if hasattr(replies, "get") else []:
+                    if m.get("ts") == message_id:
+                        return m.get("text") or ""
+            except Exception:
+                continue
+        return ""
+
     async def attach_busy_session_buttons(
         self,
         session_key: str,
@@ -3068,28 +3117,27 @@ class SlackAdapter(BasePlatformAdapter):
             return True
         try:
             client = self._get_client(channel_id)
-            # Read the current message body so chat_update preserves it.
-            # We only ADD the actions block — the runner is the source of
-            # truth for the body text on the tool-progress bubble path.
-            current_text = ""
-            try:
-                history = await client.conversations_history(
-                    channel=channel_id, latest=message_id,
-                    inclusive=True, limit=1,
-                )
-                msgs = history.get("messages") if hasattr(history, "get") else None
-                if msgs:
-                    current_text = msgs[0].get("text") or ""
-            except Exception as exc:
+            # Resolve thread_ts from runner state for the most recent
+            # follow-up so the threaded-message text lookup uses the
+            # correct API.
+            thread_ts = self._resolve_busy_thread_ts(session_key)
+            current_text = await self._fetch_slack_message_text(
+                channel_id, message_id, thread_ts=thread_ts,
+            )
+            # If we still couldn't fetch the body, abort the chat_update
+            # rather than blanking the message with "Working…".  The
+            # buttons attach on the next progress edit instead.
+            if not current_text:
                 logger.debug(
-                    "[%s] busy-button: history fetch failed for %s, attaching with empty body: %s",
-                    self.name, message_id, exc,
+                    "[%s] busy-button attach skipped for %s on %s: body fetch returned empty",
+                    self.name, session_key, message_id,
                 )
-            blocks = self._busy_session_blocks(session_key, current_text or "_Working…_")
+                return False
+            blocks = self._busy_session_blocks(session_key, current_text)
             await client.chat_update(
                 channel=channel_id,
                 ts=message_id,
-                text=current_text or "Working…",
+                text=current_text,
                 blocks=blocks,
             )
             self._busy_session_button_map[session_key] = (channel_id, message_id)
@@ -3100,6 +3148,17 @@ class SlackAdapter(BasePlatformAdapter):
                 self.name, session_key, message_id, exc,
             )
             return False
+
+    def _resolve_busy_thread_ts(self, session_key: str) -> Optional[str]:
+        runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
+        if runner is None:
+            return None
+        followups = getattr(runner, "_pending_followups", {}) or {}
+        for ev in reversed(followups.get(session_key) or []):
+            thread_id = getattr(getattr(ev, "source", None), "thread_id", None)
+            if thread_id:
+                return str(thread_id)
+        return None
 
     async def clear_busy_session_buttons(
         self,
@@ -3131,27 +3190,30 @@ class SlackAdapter(BasePlatformAdapter):
             self._busy_session_button_map.pop(session_key, None)
         try:
             client = self._get_client(channel_id)
-            current_text = ""
-            try:
-                history = await client.conversations_history(
-                    channel=channel_id, latest=message_id,
-                    inclusive=True, limit=1,
+            thread_ts = self._resolve_busy_thread_ts(session_key)
+            current_text = await self._fetch_slack_message_text(
+                channel_id, message_id, thread_ts=thread_ts,
+            )
+            # If we couldn't recover the body, skip the destructive
+            # chat_update — leaving the keyboard attached is much less
+            # bad than overwriting an unrelated message.  The keyboard
+            # will eventually clear when the cached message ages out.
+            if not current_text:
+                logger.debug(
+                    "[%s] busy-button clear skipped for %s on %s: body fetch returned empty",
+                    self.name, session_key, message_id,
                 )
-                msgs = history.get("messages") if hasattr(history, "get") else None
-                if msgs:
-                    current_text = msgs[0].get("text") or ""
-            except Exception:
-                pass
+                return False
             section_text = self._truncate_for_block(current_text)
             await client.chat_update(
                 channel=channel_id,
                 ts=message_id,
                 # Preserve the body text; keyboard goes away by sending
                 # an empty blocks list (top-level text remains).
-                text=current_text or " ",
+                text=current_text,
                 blocks=[
                     {"type": "section", "text": {"type": "mrkdwn", "text": section_text or " "}}
-                ] if current_text else [],
+                ],
             )
             return True
         except Exception as exc:

@@ -302,6 +302,38 @@ class TestButtonTap:
 
         assert "Unknown" in toast
 
+    @pytest.mark.asyncio
+    async def test_cross_user_tap_in_shared_chat_is_rejected(self):
+        """Per-user session keys: another authorized user in the chat
+        must not be able to control someone else's run via a visible
+        button.  Reject if the tapping user's session_key doesn't match
+        the target session_key."""
+        runner, _ = _make_runner()
+        adapter = _make_adapter()
+        event = _make_event(text="x")
+        sk_owner = build_session_key(event.source)
+        runner.adapters[event.source.platform] = adapter
+        runner._running_agents[sk_owner] = MagicMock()
+        runner._pending_followups[sk_owner] = [event]
+
+        # A different authorized user clicks the button.  Their source
+        # has a different user_id and therefore a different session_key.
+        from gateway.platforms.base import SessionSource as _SS
+        other = _SS(
+            platform=event.source.platform,
+            chat_id="123",
+            chat_type="private",
+            user_id="user2",  # different from event.source.user_id == "user1"
+        )
+
+        toast = await runner._handle_busy_session_button_tap(
+            sk_owner, PRIMITIVE_INTERRUPT, other
+        )
+
+        assert "isn't your session" in toast.lower() or "not your session" in toast.lower()
+        # And the agent was not interrupted on behalf of the wrong user.
+        runner._running_agents[sk_owner].interrupt.assert_not_called()
+
 
 class TestMultipleFollowUps:
     @pytest.mark.asyncio
