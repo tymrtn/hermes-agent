@@ -4965,6 +4965,27 @@ if DISCORD_AVAILABLE:
         except Exception as exc:
             logger.debug("[%s] could not build SessionSource for view tap: %s", self.name, exc)
             return "Couldn't apply that — try again."
+        # Run the runner-side authorization check too — the BusySessionView
+        # already gates on _component_check_auth, but that allowlist is
+        # empty in deployments that authorize via GATEWAY_ALLOWED_USERS or
+        # pairing.  Without this second gate, any user who can see the
+        # buttons in a shared channel could steer/interrupt/stop another
+        # user's active session.  Mirrors the Slack handler's belt-and-
+        # suspenders gating.
+        auth_fn = getattr(runner, "_is_user_authorized", None)
+        if callable(auth_fn):
+            try:
+                if not auth_fn(source):
+                    logger.warning(
+                        "[%s] Unauthorized busy-session view tap by %s (%s) — ignoring",
+                        self.name, user_name or "?", user_id,
+                    )
+                    return "⛔ You are not authorized to control this run."
+            except Exception:
+                logger.debug(
+                    "[%s] auth check raised — denying busy-action", self.name, exc_info=True,
+                )
+                return "Couldn't apply that — try again."
         try:
             return await handler(session_key, primitive, source)
         except Exception as exc:
