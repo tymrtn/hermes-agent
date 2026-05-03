@@ -328,8 +328,12 @@ class TelegramAdapter(BasePlatformAdapter):
                 normalized_chat_type = str(chat_type or "dm").strip().lower() or "dm"
                 if normalized_chat_type == "private":
                     normalized_chat_type = "dm"
-                elif normalized_chat_type == "supergroup":
-                    normalized_chat_type = "forum" if thread_id is not None else "group"
+                elif normalized_chat_type in ("supergroup", "group"):
+                    # Telegram inbound messages key both group and supergroup
+                    # (incl. forum topics) as chat_type="group" plus thread_id.
+                    # Match that here so the runner's session_key reconstruction
+                    # produces the SAME key as the original inbound message.
+                    normalized_chat_type = "group"
 
                 source = SessionSource(
                     platform=Platform.TELEGRAM,

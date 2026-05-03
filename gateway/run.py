@@ -2449,14 +2449,12 @@ class GatewayRunner:
         # Ownership gate: in shared channels with per-user session keys,
         # user A's busy-session buttons are visible to user B.  An
         # otherwise-authorized user B could otherwise tap them and
-        # control A's run.  Build the session_key the SAME way for the
-        # tapping user; if it doesn't match the target session_key,
-        # this isn't B's session — reject.  (Mirrors the isolation
-        # `/stop` enjoys by virtue of being scoped to the sender's own
-        # message handling.)
+        # control A's run.  Resolve the session_key for the tapping user
+        # the SAME way inbound messages do (via the runner-configured
+        # resolver that honors `group_sessions_per_user` / `thread_sessions_per_user`
+        # from the session store) and compare against the target key.
         try:
-            from gateway.session import build_session_key as _build_sk
-            tapper_key = _build_sk(source) if source else None
+            tapper_key = self._session_key_for_source(source) if source else None
         except Exception:
             tapper_key = None
         if tapper_key and tapper_key != session_key:
