@@ -4765,14 +4765,22 @@ if DISCORD_AVAILABLE:
             from gateway.busy_session_buttons import PRIMITIVE_STOP
             await self._dispatch(interaction, PRIMITIVE_STOP)
 
+    # ── Adapter-level busy-session methods ───────────────────────────
+    #
+    # These functions are defined inside the ``if DISCORD_AVAILABLE:``
+    # block (so the BusySessionView reference resolves), then bound onto
+    # ``DiscordAdapter`` at the bottom of the block.  Without this
+    # binding step Discord instances would inherit the no-op base
+    # implementations and the buttons would never render.
+
     @staticmethod
-    def _busy_buttons_enabled() -> bool:
+    def _ds_busy_buttons_enabled() -> bool:
         raw = os.getenv("HERMES_GATEWAY_BUSY_BUTTONS")
         if raw is None:
             return True
         return raw.strip().lower() not in ("0", "false", "no", "off")
 
-    def _chat_id_for_session(self, session_key: str) -> Optional[str]:
+    def _ds_chat_id_for_session(self, session_key: str) -> Optional[str]:
         runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
         if runner is None:
             return None
@@ -4783,7 +4791,7 @@ if DISCORD_AVAILABLE:
                 return str(chat_id)
         return None
 
-    async def attach_busy_session_buttons(
+    async def _ds_attach_busy_session_buttons(
         self,
         session_key: str,
         message_id: str,
@@ -4798,7 +4806,7 @@ if DISCORD_AVAILABLE:
             if not channel:
                 channel = await self._client.fetch_channel(int(chat_id))
             msg = await channel.fetch_message(int(message_id))
-            view = self.BusySessionView(
+            view = BusySessionView(
                 session_key=session_key,
                 adapter_self=self,
                 allowed_user_ids=self._allowed_user_ids,
@@ -4814,12 +4822,16 @@ if DISCORD_AVAILABLE:
             )
             return False
 
-    async def clear_busy_session_buttons(
+    async def _ds_clear_busy_session_buttons(
         self,
         session_key: str,
         message_id: str,
     ) -> bool:
-        self._busy_session_view_map.pop(session_key, None)
+        # Only forget the tracked anchor if the caller is clearing the
+        # one currently mapped — otherwise multiple anchors can't be
+        # cleared independently.
+        if self._busy_session_view_map.get(session_key) == str(message_id):
+            self._busy_session_view_map.pop(session_key, None)
         if not self._client:
             return False
         chat_id = self._chat_id_for_session(session_key)
@@ -4839,7 +4851,7 @@ if DISCORD_AVAILABLE:
             )
             return False
 
-    async def send_or_update_busy_control_bubble(
+    async def _ds_send_or_update_busy_control_bubble(
         self,
         session_key: str,
         source: Any,
@@ -4860,7 +4872,7 @@ if DISCORD_AVAILABLE:
                 self.name, session_key, exc,
             )
             return None
-        view = self.BusySessionView(
+        view = BusySessionView(
             session_key=session_key,
             adapter_self=self,
             allowed_user_ids=self._allowed_user_ids,
@@ -4889,7 +4901,7 @@ if DISCORD_AVAILABLE:
             self._busy_session_view_map[session_key] = msg_id
         return msg_id
 
-    async def delete_busy_control_bubble(
+    async def _ds_delete_busy_control_bubble(
         self,
         session_key: str,
         message_id: str,
@@ -4914,7 +4926,7 @@ if DISCORD_AVAILABLE:
             )
             return False
 
-    async def set_busy_reaction(self, event: MessageEvent, emoji: str) -> bool:
+    async def _ds_set_busy_reaction(self, event: MessageEvent, emoji: str) -> bool:
         msg = getattr(event, "raw_message", None)
         if msg is None or not hasattr(msg, "add_reaction"):
             return False
@@ -4924,7 +4936,7 @@ if DISCORD_AVAILABLE:
         except Exception:
             return False
 
-    async def _handle_busy_session_view_tap(
+    async def _ds_handle_busy_session_view_tap(
         self,
         session_key: str,
         primitive: str,
@@ -4961,3 +4973,15 @@ if DISCORD_AVAILABLE:
                 self.name, exc, exc_info=True,
             )
             return "Couldn't apply that — see logs."
+
+    # Bind the busy-session helpers onto DiscordAdapter so they OVERRIDE
+    # the base class no-ops.  Without this step they remain free
+    # functions and Discord falls back to BasePlatformAdapter.
+    DiscordAdapter._busy_buttons_enabled = staticmethod(_ds_busy_buttons_enabled)
+    DiscordAdapter._chat_id_for_session = _ds_chat_id_for_session
+    DiscordAdapter.attach_busy_session_buttons = _ds_attach_busy_session_buttons
+    DiscordAdapter.clear_busy_session_buttons = _ds_clear_busy_session_buttons
+    DiscordAdapter.send_or_update_busy_control_bubble = _ds_send_or_update_busy_control_bubble
+    DiscordAdapter.delete_busy_control_bubble = _ds_delete_busy_control_bubble
+    DiscordAdapter.set_busy_reaction = _ds_set_busy_reaction
+    DiscordAdapter._handle_busy_session_view_tap = _ds_handle_busy_session_view_tap

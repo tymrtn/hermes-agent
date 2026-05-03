@@ -3065,27 +3065,57 @@ class SlackAdapter(BasePlatformAdapter):
         session_key: str,
         message_id: str,
     ) -> bool:
-        """Drop the busy-session block from ``message_id``.
+        """Drop the busy-session actions block from ``message_id``.
 
-        Implemented by re-rendering the bubble with a no-actions block list.
-        Best-effort.
+        Operates on the SPECIFIC ``message_id`` requested (not just the
+        stored mapping) so that clearing the latest anchor doesn't
+        leave older anchors with live keyboards.  Re-renders the
+        message with its existing body but no actions block — the chat
+        history stays intact, only the buttons go away.
         """
-        coords = self._busy_session_button_map.pop(session_key, None)
-        if not coords or not self._app:
+        if not self._app:
             return False
-        channel_id, ts = coords
+        channel_id = self._resolve_busy_channel_id(session_key)
+        if not channel_id:
+            # Fallback to the stored mapping if we still have it.
+            coords = self._busy_session_button_map.get(session_key)
+            channel_id = coords[0] if coords else None
+        if not channel_id or not message_id:
+            self._busy_session_button_map.pop(session_key, None)
+            return False
+        # Pop the mapping ONLY when clearing the currently-tracked anchor,
+        # so callers iterating multiple anchors don't break each other.
+        tracked = self._busy_session_button_map.get(session_key)
+        if tracked == (channel_id, message_id):
+            self._busy_session_button_map.pop(session_key, None)
         try:
-            await self._get_client(channel_id).chat_update(
+            client = self._get_client(channel_id)
+            current_text = ""
+            try:
+                history = await client.conversations_history(
+                    channel=channel_id, latest=message_id,
+                    inclusive=True, limit=1,
+                )
+                msgs = history.get("messages") if hasattr(history, "get") else None
+                if msgs:
+                    current_text = msgs[0].get("text") or ""
+            except Exception:
+                pass
+            await client.chat_update(
                 channel=channel_id,
-                ts=ts,
-                blocks=[],
-                text="",
+                ts=message_id,
+                # Preserve the body text; keyboard goes away by sending
+                # an empty blocks list (top-level text remains).
+                text=current_text or " ",
+                blocks=[
+                    {"type": "section", "text": {"type": "mrkdwn", "text": current_text or " "}}
+                ] if current_text else [],
             )
             return True
         except Exception as exc:
             logger.debug(
-                "[%s] clear_busy_session_buttons failed for %s: %s",
-                self.name, session_key, exc,
+                "[%s] clear_busy_session_buttons failed for %s on %s: %s",
+                self.name, session_key, message_id, exc,
             )
             return False
 

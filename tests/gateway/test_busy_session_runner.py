@@ -139,7 +139,10 @@ class TestHaltPhrasePreflight:
         result = await GatewayRunner._handle_active_session_busy_message(runner, event, sk)
 
         assert result is True
-        agent.interrupt.assert_called_once_with(None)  # halt without replay
+        # Halt phrase routes through the full _interrupt_and_clear_session
+        # path so the chat unlocks even when the agent is wedged inside a
+        # tool — same behavior as /stop and the [Stop] button.
+        agent.interrupt.assert_called_once_with("Stop requested")
         adapter.set_busy_reaction.assert_awaited_with(event, REACTION_STOP)
         # Pending slot cleared — halt does NOT replay text as next turn.
         assert sk not in adapter._pending_messages

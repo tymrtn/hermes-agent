@@ -2315,33 +2315,45 @@ class GatewayRunner:
         running_agent = self._running_agents.get(session_key)
         adapter = self.adapters.get(event.source.platform) if event.source else None
 
-        # Halt without replay: pass no message to interrupt() so the
-        # event is NOT promoted as a next-turn prompt.
-        try:
-            if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
-                running_agent.interrupt(None)
-        except Exception as exc:
-            logger.debug("Halt-phrase interrupt failed for %s: %s", session_key, exc)
-
-        # Acknowledge with the stop reaction directly on the user's message.
+        # Acknowledge with the stop reaction directly on the user's
+        # message before tearing things down — emoji on the user's
+        # original message is the only feedback they get if the rest
+        # of the cleanup races their next action.
         if adapter is not None and hasattr(adapter, "set_busy_reaction"):
             try:
                 await adapter.set_busy_reaction(event, REACTION_STOP)
             except Exception as exc:
                 logger.debug("Halt-phrase reaction failed for %s: %s", session_key, exc)
 
-        # Tear down any control surfaces that may have been attached
-        # before the halt intent arrived.  ORDER MATTERS — Telegram and
-        # Discord resolve chat_id from `_pending_followups[session_key]`
-        # to issue clear_busy_session_buttons; popping the follow-ups
-        # first would leave stale keyboards in chat.
-        await self._clear_busy_session_controls(session_key, event.source)
-
-        # Now drop the queued follow-ups; the user signalled stop, not redirect.
+        # Make sure the halt event is visible to platform-side
+        # ``_chat_id_for_session`` lookups during cleanup — without
+        # this, a halt phrase that fires before any other follow-up
+        # has been registered leaves no chat_id source for
+        # ``clear_busy_session_buttons`` to use.
         if hasattr(self, "_pending_followups"):
-            self._pending_followups.pop(session_key, None)
-        if adapter is not None and hasattr(adapter, "_pending_messages"):
-            adapter._pending_messages.pop(session_key, None)
+            self._pending_followups.setdefault(session_key, []).append(event)
+
+        # Run the FULL stop path so the chat unlocks even when the
+        # agent is wedged inside a tool or still represented by the
+        # pending sentinel: invalidates the run generation, calls
+        # interrupt_session_activity, drops queued events, and frees
+        # the running-state slot.  Mirrors `/stop` and the [Stop]
+        # button so all three paths converge behaviorally.
+        try:
+            await self._interrupt_and_clear_session(
+                session_key,
+                event.source,
+                interrupt_reason=_INTERRUPT_REASON_STOP,
+                invalidation_reason=f"halt-phrase: {lang}",
+            )
+        except Exception as exc:
+            logger.debug("Halt-phrase clear-session failed for %s: %s", session_key, exc)
+            # Best-effort fallback so the agent at least stops.
+            try:
+                if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
+                    running_agent.interrupt(None)
+            except Exception:
+                pass
 
         logger.info(
             "Busy-session halt-phrase matched (lang=%s) for session %s",
@@ -2472,10 +2484,23 @@ class GatewayRunner:
                     except Exception as exc:
                         logger.debug("Button-tap steer failed for %s: %s", session_key, exc)
                 if steered:
-                    # The text landed inside the run; remove the queued copy
-                    # so it isn't ALSO replayed as the next-turn prompt.
+                    # The text landed inside the run.  Normally we then
+                    # pop the queued copy so it isn't ALSO replayed as
+                    # the next-turn prompt.  Exception: if the queued
+                    # event carries media (steer is text-only and can't
+                    # ferry an image/document), KEEP the event queued so
+                    # the next turn still gets the attachment — only
+                    # null the text portion that already landed via steer.
                     if adapter is not None and hasattr(adapter, "_pending_messages"):
-                        adapter._pending_messages.pop(session_key, None)
+                        pending = adapter._pending_messages.get(session_key)
+                        has_media = bool(getattr(pending, "media_urls", None))
+                        if has_media:
+                            try:
+                                pending.text = ""  # text already steered in
+                            except Exception:
+                                pass
+                        else:
+                            adapter._pending_messages.pop(session_key, None)
                 else:
                     ok = False
 
@@ -13950,6 +13975,17 @@ class GatewayRunner:
                         )
                     except Exception:
                         pass
+
+                # The previous turn is fully drained; clear the busy-session
+                # tracking now so a button tap during the queued follow-up
+                # turn doesn't pick up the prior turn's already-consumed
+                # follow-ups (they would otherwise be re-injected into a
+                # steer/interrupt prompt).  The outer ``finally`` will run
+                # again after the queued turn returns.
+                try:
+                    await self._clear_busy_session_controls(session_key, source)
+                except Exception:
+                    pass
 
                 return await self._run_agent(
                     message=next_message,
