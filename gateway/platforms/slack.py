@@ -2971,16 +2971,33 @@ class SlackAdapter(BasePlatformAdapter):
             return True
         return raw.strip().lower() not in ("0", "false", "no", "off")
 
+    # Slack's section-text mrkdwn field has a hard 3000-char cap.  Long
+    # tool-progress bubbles can exceed it; rendering them inside a section
+    # block triggers `invalid_blocks` from chat_update.  We truncate here
+    # so the buttons can attach without breaking the underlying message.
+    # The fallback `text` field on chat_update preserves the full body for
+    # legacy clients.
+    _BUSY_SECTION_TEXT_CAP = 2900  # leave headroom under Slack's 3000 limit
+
+    @classmethod
+    def _truncate_for_block(cls, text: str) -> str:
+        if not text:
+            return ""
+        if len(text) <= cls._BUSY_SECTION_TEXT_CAP:
+            return text
+        return text[: cls._BUSY_SECTION_TEXT_CAP - 1] + "…"
+
     def _busy_session_blocks(
         self,
         session_key: str,
         summary_text: str,
     ) -> List[Dict[str, Any]]:
         """Build the Block Kit blocks carrying [Steer][Interrupt][Stop]."""
+        section_text = self._truncate_for_block(summary_text) or "_Working…_"
         return [
             {
                 "type": "section",
-                "text": {"type": "mrkdwn", "text": summary_text or "_Working…_"},
+                "text": {"type": "mrkdwn", "text": section_text},
             },
             {
                 "type": "actions",
@@ -3125,6 +3142,7 @@ class SlackAdapter(BasePlatformAdapter):
                     current_text = msgs[0].get("text") or ""
             except Exception:
                 pass
+            section_text = self._truncate_for_block(current_text)
             await client.chat_update(
                 channel=channel_id,
                 ts=message_id,
@@ -3132,7 +3150,7 @@ class SlackAdapter(BasePlatformAdapter):
                 # an empty blocks list (top-level text remains).
                 text=current_text or " ",
                 blocks=[
-                    {"type": "section", "text": {"type": "mrkdwn", "text": current_text or " "}}
+                    {"type": "section", "text": {"type": "mrkdwn", "text": section_text or " "}}
                 ] if current_text else [],
             )
             return True
