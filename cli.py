@@ -333,7 +333,7 @@ def load_cli_config() -> Dict[str, Any]:
             "resume_display": "full",
             "show_reasoning": False,
             "streaming": True,
-            "busy_input_mode": "interrupt",
+            "busy_input_mode": "queue",  # queue (default) | steer | interrupt
 
             "skin": "default",
         },
@@ -2038,13 +2038,16 @@ class HermesCLI:
         # busy_input_mode: "interrupt" (Enter interrupts current run),
         # "queue" (Enter queues for next turn), or "steer" (Enter injects
         # mid-run via /steer, arriving after the next tool call).
-        _bim = str(CLI_CONFIG["display"].get("busy_input_mode", "interrupt")).strip().lower()
-        if _bim == "queue":
-            self.busy_input_mode = "queue"
+        # Default flipped from "interrupt" → "queue": follow-ups buffered
+        # for next turn instead of destroying partial work.  Per-message
+        # override on gateway platforms via the inline-keyboard buttons.
+        _bim = str(CLI_CONFIG["display"].get("busy_input_mode", "queue")).strip().lower()
+        if _bim == "interrupt":
+            self.busy_input_mode = "interrupt"
         elif _bim == "steer":
             self.busy_input_mode = "steer"
         else:
-            self.busy_input_mode = "interrupt"
+            self.busy_input_mode = "queue"
 
         self.verbose = verbose if verbose is not None else (self.tool_progress_mode == "verbose")
         
