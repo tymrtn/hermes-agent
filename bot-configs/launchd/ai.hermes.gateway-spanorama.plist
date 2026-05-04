@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>ai.hermes.gateway-spanorama</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/wondermonkey/.hermes/hermes-agent/venv/bin/python</string>
+        <string>-m</string>
+        <string>hermes_cli.main</string>
+        <string>--profile</string>
+        <string>spanorama</string>
+        <string>gateway</string>
+        <string>run</string>
+        <string>--replace</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/wondermonkey/.hermes/hermes-agent</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/wondermonkey/.hermes/profiles/spanorama/bin:/Users/wondermonkey/.hermes/hermes-agent/venv/bin:/Users/wondermonkey/.hermes/hermes-agent/node_modules/.bin:/Users/wondermonkey/bin:/Users/wondermonkey/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/Users/wondermonkey/.cargo/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>VIRTUAL_ENV</key>
+        <string>/Users/wondermonkey/.hermes/hermes-agent/venv</string>
+        <key>HERMES_HOME</key>
+        <string>/Users/wondermonkey/.hermes/profiles/spanorama</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/wondermonkey/.hermes/profiles/spanorama/logs/gateway.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/wondermonkey/.hermes/profiles/spanorama/logs/gateway.error.log</string>
+</dict>
+</plist>

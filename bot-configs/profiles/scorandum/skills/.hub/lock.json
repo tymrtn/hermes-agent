@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "installed": {
+    "kalshi-trade": {
+      "source": "clawhub",
+      "identifier": "kalshi-trade",
+      "trust_level": "community",
+      "scan_verdict": "safe",
+      "content_hash": "sha256:fc3e0174a3620f08",
+      "install_path": "kalshi-trade",
+      "files": [
+        "scripts/kalshi_openapi_reader.mjs",
+        "SKILL.md",
+        "tests/kalshi_openapi_reader.test.mjs",
+        "_meta.json"
+      ],
+      "metadata": {},
+      "installed_at": "2026-05-01T15:28:01.226753+00:00",
+      "updated_at": "2026-05-01T15:28:01.226757+00:00"
+    }
+  }
+}

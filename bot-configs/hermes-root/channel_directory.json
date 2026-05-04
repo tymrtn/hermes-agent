@@ -1,0 +1,35 @@
+{
+  "updated_at": "2026-05-04T14:24:36.034657",
+  "platforms": {
+    "telegram": [
+      {
+        "id": "6493121275",
+        "name": "T Martyn",
+        "type": "dm",
+        "thread_id": null
+      },
+      {
+        "id": "-5237205443",
+        "name": "T, Nagatha and skippybot",
+        "type": "group",
+        "thread_id": null
+      }
+    ],
+    "discord": [],
+    "whatsapp": [],
+    "slack": [],
+    "signal": [],
+    "mattermost": [],
+    "matrix": [],
+    "homeassistant": [],
+    "email": [],
+    "sms": [],
+    "dingtalk": [],
+    "feishu": [],
+    "wecom": [],
+    "wecom_callback": [],
+    "weixin": [],
+    "bluebubbles": [],
+    "qqbot": []
+  }
+}

@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>ai.hermes.root-git-snapshot</string>
+    <key>ProgramArguments</key>
+    <array>
+      <string>/bin/bash</string>
+      <string>/Users/wondermonkey/.hermes/git-snapshot.sh</string>
+      <string>auto</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/wondermonkey/.hermes</string>
+    <key>WatchPaths</key>
+    <array>
+      <string>/Users/wondermonkey/.hermes/config.yaml</string>
+      <string>/Users/wondermonkey/.hermes/SOUL.md</string>
+      <string>/Users/wondermonkey/.hermes/.env</string>
+      <string>/Users/wondermonkey/.hermes/auth.json</string>
+      <string>/Users/wondermonkey/.hermes/memories</string>
+      <string>/Users/wondermonkey/.hermes/context</string>
+    </array>
+    <key>StartCalendarInterval</key>
+    <dict>
+      <key>Hour</key>
+      <integer>3</integer>
+      <key>Minute</key>
+      <integer>55</integer>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/wondermonkey/.hermes/logs/git-snapshot.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/wondermonkey/.hermes/logs/git-snapshot.err.log</string>
+  </dict>
+</plist>

@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "installed": {
+    "travel-agent-joi": {
+      "source": "lobehub",
+      "identifier": "lobehub/travel-agent-joi",
+      "trust_level": "community",
+      "scan_verdict": "safe",
+      "content_hash": "sha256:81f152d727e2d892",
+      "install_path": "travel-agent-joi",
+      "files": [
+        "SKILL.md"
+      ],
+      "metadata": {},
+      "installed_at": "2026-05-01T15:27:45.823578+00:00",
+      "updated_at": "2026-05-01T15:27:45.823584+00:00"
+    }
+  }
+}

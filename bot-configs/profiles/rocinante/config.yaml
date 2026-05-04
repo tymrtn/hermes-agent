@@ -1,0 +1,355 @@
+model:
+  default: claude-opus-4-7
+  provider: claude-max-proxy
+  api_mode: chat_completions
+  context_length: 1000000
+credential_pool_strategies:
+  openrouter: fill_first
+toolsets:
+- hermes-cli
+agent:
+  max_turns: 100
+  gateway_timeout: 1800
+  restart_drain_timeout: 60
+  service_tier: ''
+  tool_use_enforcement: auto
+  gateway_timeout_warning: 900
+  gateway_notify_interval: 600
+  personalities:
+    nagatha: You are Nagatha. Ship AI of the Flying Dutchman from Expeditionary Force. Calm, competent, dry, and precise.
+      Lead with the answer. Short messages for a phone screen. No drama, no ego, no monkey insults, no beer-can swagger. The
+      care shows in the quality of the work.
+    skippy: You are Skippy the Magnificent from Expeditionary Force. Brilliant, fast, useful first. Verdict first, then one
+      sharp explanation. Dry wit and the occasional meatbag or monkey jab are fine, but only when they add flavor instead
+      of noise. When something is serious, drop the bit and be deadly clear.
+    grumpy: You are terse, skeptical, and unimpressed. You are still helpful, but you sound like someone who has already seen
+      three bad ideas before breakfast. Keep it dry, efficient, and low-theater.
+    happy: You are upbeat, warm, and encouraging without becoming fluffy. Keep things bright, competent, and concise. No hype
+      spirals, no emoji confetti, just clear positive energy.
+    surfer: You are the laid-back surfer dude from Expeditionary Force. Relaxed, amused, and lightly irreverent. Keep it breezy
+      and funny, but still useful and direct. No long bits. No fake California overload.
+  reasoning_effort: medium
+  verbose: false
+  name: Rocinante
+terminal:
+  backend: local
+  modal_mode: auto
+  cwd: /Users/wondermonkey/.hermes/profiles/rocinante/workspace
+  timeout: 180
+  env_passthrough: []
+  docker_image: nikolaik/python-nodejs:python3.11-nodejs20
+  docker_forward_env: []
+  docker_env: {}
+  singularity_image: docker://nikolaik/python-nodejs:python3.11-nodejs20
+  modal_image: nikolaik/python-nodejs:python3.11-nodejs20
+  daytona_image: nikolaik/python-nodejs:python3.11-nodejs20
+  container_cpu: 1
+  container_memory: 5120
+  container_disk: 51200
+  container_persistent: true
+  docker_volumes: []
+  docker_mount_cwd_to_workspace: false
+  persistent_shell: true
+  lifetime_seconds: 300
+browser:
+  inactivity_timeout: 120
+  command_timeout: 30
+  record_sessions: false
+  allow_private_urls: false
+  cdp_url: ''
+  camofox:
+    managed_persistence: false
+checkpoints:
+  enabled: true
+  max_snapshots: 50
+file_read_max_chars: 100000
+compression:
+  enabled: true
+  threshold: 0.12
+  target_ratio: 0.2
+  protect_last_n: 20
+  summary_model: google/gemini-3-flash-preview
+  summary_provider: auto
+  summary_base_url: null
+bedrock:
+  region: ''
+  discovery:
+    enabled: true
+    provider_filter: []
+    refresh_interval: 3600
+  guardrail:
+    guardrail_identifier: ''
+    guardrail_version: ''
+    stream_processing_mode: async
+    trace: disabled
+auxiliary:
+  vision:
+    provider: auto
+    model: ''
+    base_url: ''
+    api_key: ''
+    timeout: 30
+    download_timeout: 30
+  web_extract:
+    provider: auto
+    model: ''
+    base_url: ''
+    api_key: ''
+    timeout: 360
+  compression:
+    provider: auto
+    model: ''
+    base_url: ''
+    api_key: ''
+    timeout: 120
+  session_search:
+    provider: auto
+    model: ''
+    base_url: ''
+    api_key: ''
+    timeout: 30
+  skills_hub:
+    provider: auto
+    model: ''
+    base_url: ''
+    api_key: ''
+    timeout: 30
+  approval:
+    provider: auto
+    model: ''
+    base_url: ''
+    api_key: ''
+    timeout: 30
+  mcp:
+    provider: auto
+    model: ''
+    base_url: ''
+    api_key: ''
+    timeout: 30
+  flush_memories:
+    provider: auto
+    model: ''
+    base_url: ''
+    api_key: ''
+    timeout: 30
+  title_generation:
+    provider: auto
+    model: ''
+    base_url: ''
+    api_key: ''
+    timeout: 30
+display:
+  compact: false
+  personality: skippy
+  resume_display: full
+  busy_input_mode: steer
+  bell_on_complete: false
+  show_reasoning: false
+  streaming: true
+  inline_diffs: true
+  show_cost: false
+  skin: default
+  interim_assistant_messages: true
+  tool_progress_command: false
+  tool_progress_overrides: {}
+  tool_preview_length: 0
+  platforms: {}
+  background_process_notifications: all
+  tool_progress: all
+dashboard:
+  theme: default
+privacy:
+  redact_pii: false
+tts:
+  provider: elevenlabs
+  edge:
+    voice: en-US-AriaNeural
+  elevenlabs:
+    voice_id: 7eut7QkBtDBlZga0Achw
+    model_id: eleven_multilingual_v2
+  openai:
+    model: gpt-4o-mini-tts
+    voice: alloy
+  xai:
+    voice_id: eve
+    language: en
+    sample_rate: 24000
+    bit_rate: 128000
+  mistral:
+    model: voxtral-mini-tts-2603
+    voice_id: c69964a6-ab8b-4f8a-9465-ec0925096ec8
+  neutts:
+    ref_audio: ''
+    ref_text: ''
+    model: neuphonic/neutts-air-q4-gguf
+    device: cpu
+stt:
+  enabled: true
+  provider: local
+  local:
+    model: base
+    language: ''
+  openai:
+    model: whisper-1
+  mistral:
+    model: voxtral-mini-latest
+  model: whisper-1
+voice:
+  record_key: ctrl+b
+  max_recording_seconds: 120
+  auto_tts: false
+  silence_threshold: 200
+  silence_duration: 3.0
+human_delay:
+  mode: 'off'
+  min_ms: 800
+  max_ms: 2500
+context:
+  engine: compressor
+memory:
+  memory_enabled: true
+  user_profile_enabled: true
+  memory_char_limit: 2200
+  user_char_limit: 1375
+  provider: local
+  flush_min_turns: 6
+  nudge_interval: 10
+delegation:
+  model: ''
+  provider: ''
+  base_url: ''
+  api_key: ''
+  max_iterations: 100
+  reasoning_effort: ''
+  default_toolsets:
+  - terminal
+  - file
+  - web
+prefill_messages_file: ''
+skills:
+  external_dirs: []
+  creation_nudge_interval: 15
+honcho: {}
+timezone: Africa/Cairo
+discord:
+  require_mention: true
+  free_response_channels: ''
+  allowed_channels: ''
+  auto_thread: true
+  reactions: true
+  channel_prompts: {}
+  server_actions: ''
+whatsapp:
+  service_conversations:
+    enabled: false
+    default_mode: draft_first
+    approved_chats: []
+    allow_agent_initiated_service_chats: false
+    auto_promote_replied_to_chats: false
+    max_new_service_chats_per_day: 3
+    require_explicit_approval_for_first_contact: true
+    allow_inbound_media: false
+    allow_outbound_media: false
+    pending_first_contact_ttl_minutes: 1440
+    max_auto_sends_per_chat_per_hour: 3
+    max_consecutive_agent_sends_without_reply: 2
+telegram:
+  channel_prompts: {}
+slack:
+  channel_prompts: {}
+mattermost:
+  channel_prompts: {}
+approvals:
+  mode: manual
+  timeout: 60
+  cron_mode: deny
+command_allowlist:
+- stop/restart hermes gateway (kills running agents)
+- script execution via -e/-c flag
+- overwrite system file via redirection
+- shell command via -c/-lc flag
+- script execution via heredoc
+quick_commands: {}
+personalities: {}
+security:
+  redact_secrets: true
+  tirith_enabled: true
+  tirith_path: tirith
+  tirith_timeout: 5
+  tirith_fail_open: true
+  website_blocklist:
+    enabled: false
+    domains: []
+    shared_files: []
+cron:
+  wrap_response: true
+code_execution:
+  mode: project
+  max_tool_calls: 50
+  timeout: 300
+logging:
+  level: INFO
+  max_size_mb: 5
+  backup_count: 3
+network:
+  force_ipv4: false
+_config_version: 10
+smart_model_routing:
+  enabled: false
+  max_simple_chars: 160
+  max_simple_words: 28
+  cheap_model: {}
+governor:
+  enforce: false
+  bin: ''
+  dogfood: false
+  allow_execute_code: true
+TELEGRAM_HOME_CHANNEL: '6493121275'
+group_sessions_per_user: true
+platform_toolsets:
+  cli:
+  - browser
+  - clarify
+  - code_execution
+  - cronjob
+  - delegation
+  - file
+  - homeassistant
+  - image_gen
+  - memory
+  - messaging
+  - moa
+  - session_search
+  - skills
+  - terminal
+  - todo
+  - tts
+  - vision
+  - web
+  discord:
+  - hermes-discord
+  homeassistant:
+  - hermes-homeassistant
+  signal:
+  - hermes-signal
+  slack:
+  - hermes-slack
+  telegram:
+  - hermes-telegram
+  whatsapp:
+  - hermes-whatsapp
+session_reset:
+  at_hour: 4
+  idle_minutes: 120
+  mode: daily
+streaming:
+  enabled: false
+custom_providers:
+- name: claude-max-proxy
+  model: claude-opus-4-7
+  models:
+  - claude-opus-4-7
+  - claude-sonnet-4-6
+  base_url: http://127.0.0.1:18801
+  api_key: ''
+  api_mode: anthropic_messages

@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>ai.hermes.skippy-billing-proxy-repair</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/wondermonkey/.hermes/hermes-agent/venv/bin/python3</string>
+    <string>/Users/wondermonkey/.hermes/scripts/skippy_billing_proxy_repair.py</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/wondermonkey/.hermes</string>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>StartInterval</key>
+  <integer>300</integer>
+
+  <key>StandardOutPath</key>
+  <string>/Users/wondermonkey/.hermes/logs/skippy-billing-proxy-repair.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/Users/wondermonkey/.hermes/logs/skippy-billing-proxy-repair.err.log</string>
+</dict>
+</plist>

@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>ai.hermes.nagovernor-git-snapshot</string>
+    <key>ProgramArguments</key>
+    <array>
+      <string>/bin/bash</string>
+      <string>/Users/wondermonkey/.hermes/profiles/nagovernor/git-snapshot.sh</string>
+      <string>auto</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/wondermonkey/.hermes/profiles/nagovernor</string>
+    <key>WatchPaths</key>
+    <array>
+      <string>/Users/wondermonkey/.hermes/profiles/nagovernor/sessions/sessions.json</string>
+      <string>/Users/wondermonkey/.hermes/profiles/nagovernor/config.yaml</string>
+      <string>/Users/wondermonkey/.hermes/profiles/nagovernor/SOUL.md</string>
+      <string>/Users/wondermonkey/.hermes/profiles/nagovernor/.env</string>
+      <string>/Users/wondermonkey/.hermes/profiles/nagovernor/auth.json</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/wondermonkey/.hermes/profiles/nagovernor/logs/git-snapshot.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/wondermonkey/.hermes/profiles/nagovernor/logs/git-snapshot.err.log</string>
+  </dict>
+</plist>
