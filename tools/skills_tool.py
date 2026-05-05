@@ -92,6 +92,10 @@ SKILLS_DIR = HERMES_HOME / "skills"
 MAX_NAME_LENGTH = 64
 MAX_DESCRIPTION_LENGTH = 1024
 
+# Maximum size (in characters) for skill file content loaded via skill_view.
+# Files exceeding this are truncated with an informational note.
+MAX_SKILL_FILE_SIZE = 51200  # 50 KB
+
 # Platform identifiers for the 'platforms' frontmatter field.
 # Maps user-friendly names to sys.platform prefixes.
 _PLATFORM_MAP = {
@@ -846,6 +850,26 @@ def _serve_plugin_skill(
     )
 
 
+def _truncate_skill_content(content: str, max_size: int = MAX_SKILL_FILE_SIZE) -> str:
+    """Truncate skill file content if it exceeds *max_size* characters.
+
+    When truncated, an informational note is appended telling the agent the
+    original size and how to access the full content.
+    """
+    if len(content) <= max_size:
+        return content
+    original_kb = round(len(content) / 1024, 1)
+    logger.warning(
+        "Skill file content truncated: %d chars -> %d chars (%.1f KB original)",
+        len(content), max_size, original_kb,
+    )
+    return (
+        content[:max_size]
+        + f"\n\n[Truncated: original file was {original_kb}KB. "
+        "Use offset/limit parameters to read specific sections.]"
+    )
+
+
 def skill_view(
     name: str,
     file_path: str = None,
@@ -1159,6 +1183,9 @@ def skill_view(
                     ensure_ascii=False,
                 )
 
+            # Apply size guard to loaded file content
+            content = _truncate_skill_content(content)
+
             return json.dumps(
                 {
                     "success": True,
@@ -1315,6 +1342,8 @@ def skill_view(
                     exc_info=True,
                 )
 
+        # Apply size guard to main skill content before optional preprocessing.
+        content = _truncate_skill_content(content)
         rendered_content = content
         if preprocess:
             try:
