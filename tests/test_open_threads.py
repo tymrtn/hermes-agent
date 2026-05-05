@@ -273,6 +273,7 @@ def test_script_emits_prompt_when_eligible_thread_and_idle(tmp_path, monkeypatch
     assert "research the regex" in proc.stdout
     # Hard rules are present.
     assert "do exactly one thread" in proc.stdout.lower()
+    assert "exactly [SILENT]" in proc.stdout
     assert "publish" in proc.stdout  # listed as a blocked action
     # Attempt counter must have been bumped on disk.
     persisted = open_threads.list_threads(status=None, hermes_home=tmp_path)
