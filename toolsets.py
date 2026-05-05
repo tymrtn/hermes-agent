@@ -187,6 +187,15 @@ TOOLSETS = {
         "tools": ["session_search"],
         "includes": []
     },
+
+    "open_threads": {
+        "description": "AFK open-thread ledger tools for safe follow-up work",
+        "tools": [
+            "open_thread_add", "open_thread_list",
+            "open_thread_update", "open_thread_abandon",
+        ],
+        "includes": []
+    },
     
     "clarify": {
         "description": "Ask the user clarifying questions (multiple-choice or open-ended)",

@@ -362,7 +362,7 @@ def test_script_max_attempts_skips_at_cap_thread_and_picks_next(tmp_path, monkey
 
 def test_open_thread_tools_in_core_toolset():
     """Tool names are wired into the default Hermes core toolset."""
-    from toolsets import _HERMES_CORE_TOOLS
+    from toolsets import _HERMES_CORE_TOOLS, resolve_toolset, validate_toolset
     for name in (
         "open_thread_add",
         "open_thread_list",
@@ -370,3 +370,5 @@ def test_open_thread_tools_in_core_toolset():
         "open_thread_abandon",
     ):
         assert name in _HERMES_CORE_TOOLS, f"{name} missing from _HERMES_CORE_TOOLS"
+        assert name in resolve_toolset("open_threads")
+    assert validate_toolset("open_threads") is True
