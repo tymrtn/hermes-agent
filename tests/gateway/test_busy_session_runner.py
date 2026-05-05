@@ -88,6 +88,7 @@ def _make_runner():
     runner._tool_bubble_msg_ids = {}
     runner._busy_control_bubble_ids = {}
     runner._pending_followups = {}
+    runner._busy_seen_message_ids = {}
     runner._session_run_generation = {}
 
     # _interrupt_and_clear_session needs these.
@@ -182,6 +183,34 @@ class TestHaltPhrasePreflight:
 
         # Mode is "queue" — agent is NOT interrupted.
         agent.interrupt.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Busy-message dedupe
+# ---------------------------------------------------------------------------
+
+
+class TestBusyMessageDedupe:
+    @pytest.mark.asyncio
+    async def test_duplicate_message_id_does_not_send_duplicate_ack_or_followup(self):
+        from gateway.run import GatewayRunner
+
+        runner, _ = _make_runner()
+        adapter = _make_adapter()
+        adapter._send_with_retry.return_value = MagicMock(success=True, message_id="ack1")
+        event = _make_event(text="?", message_id="same-msg")
+        sk = build_session_key(event.source)
+        runner.adapters[event.source.platform] = adapter
+        runner._running_agents[sk] = MagicMock()
+
+        first = await GatewayRunner._handle_active_session_busy_message(runner, event, sk)
+        second = await GatewayRunner._handle_active_session_busy_message(runner, event, sk)
+
+        assert first is True
+        assert second is True
+        adapter._send_with_retry.assert_awaited_once()
+        assert runner._pending_followups[sk] == [event]
+        assert adapter._pending_messages[sk] is event
 
 
 # ---------------------------------------------------------------------------

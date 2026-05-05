@@ -1052,6 +1052,7 @@ class GatewayRunner:
         # emitted on each event's message_id so every follow-up gets an
         # acknowledgement.
         self._pending_followups: Dict[str, List[MessageEvent]] = {}
+        self._busy_seen_message_ids: Dict[str, set[str]] = {}
 
         # Cache AIAgent instances per session to preserve prompt caching.
         # Without this, a new AIAgent is created per message, rebuilding the
@@ -2218,6 +2219,24 @@ class GatewayRunner:
 
         running_agent = self._running_agents.get(session_key)
 
+        # Telegram can redeliver the same update around reconnect/retry edges.
+        # Treat duplicate busy follow-ups as already handled so we don't send
+        # duplicate queue acknowledgements or append the same follow-up twice.
+        msg_id = str(getattr(event, "message_id", "") or "")
+        if msg_id:
+            seen_by_session = getattr(self, "_busy_seen_message_ids", None)
+            if seen_by_session is None:
+                seen_by_session = {}
+                self._busy_seen_message_ids = seen_by_session
+            seen = seen_by_session.setdefault(session_key, set())
+            if msg_id in seen:
+                return True
+            seen.add(msg_id)
+            if len(seen) > 100:
+                # Bound memory for very long busy sessions. Set ordering is
+                # irrelevant; this is a best-effort duplicate guard.
+                seen.pop()
+
         # Steer mode: inject mid-run via running_agent.steer() instead of
         # queueing + interrupting.  If the agent isn't running yet
         # (sentinel) or lacks steer(), or the payload is empty, fall back
@@ -2774,6 +2793,7 @@ class GatewayRunner:
         tool_bubbles = getattr(self, "_tool_bubble_msg_ids", None)
         control_bubbles = getattr(self, "_busy_control_bubble_ids", None)
         followups = getattr(self, "_pending_followups", None)
+        seen_busy_messages = getattr(self, "_busy_seen_message_ids", None)
 
         adapter = None
         if source is not None:
@@ -2814,6 +2834,8 @@ class GatewayRunner:
 
         if followups is not None:
             followups.pop(session_key, None)
+        if seen_busy_messages is not None:
+            seen_busy_messages.pop(session_key, None)
 
     async def _drain_active_agents(self, timeout: float) -> tuple[Dict[str, Any], bool]:
         snapshot = self._snapshot_running_agents()
