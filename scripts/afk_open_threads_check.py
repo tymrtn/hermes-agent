@@ -83,6 +83,28 @@ def _last_user_activity_age(hermes_home: Path) -> "float | None":
     return None
 
 
+def _pick_one_under_extra_cap(extra_cap: "int | None") -> "open_threads.OpenThread | None":
+    """Pick one eligible thread, respecting an optional script-level cap.
+
+    ``open_threads.pick_one()`` intentionally knows only the per-thread
+    ``max_attempts``. The cron script can impose a stricter cap; when it
+    does, filter before bumping so an at-cap thread is never mutated just
+    because another eligible thread exists later in the ledger.
+    """
+    if extra_cap is None:
+        return open_threads.pick_one()
+
+    eligible = [
+        t for t in open_threads.eligible_threads()
+        if t.attempt_count < extra_cap
+    ]
+    if not eligible:
+        return None
+    eligible.sort(key=lambda t: (t.last_attempted_at or "", t.created_at))
+    chosen = eligible[0]
+    return open_threads.update(chosen.id, bump_attempt=True)
+
+
 def _build_prompt(thread: open_threads.OpenThread) -> str:
     """Compose the self-contained cron-agent prompt for one thread."""
     allowed = sorted(open_threads.ALLOWED_SIDE_EFFECTS)
@@ -224,21 +246,8 @@ def main(argv: "list[str] | None" = None) -> int:
         )
         return 0
 
-    if extra_cap is not None:
-        # Short-circuit if no thread is under the script-level cap, to avoid
-        # bumping a thread that we're going to ignore anyway.
-        if not [
-            t for t in open_threads.eligible_threads()
-            if t.attempt_count < extra_cap
-        ]:
-            return 0
-
-    thread = open_threads.pick_one()
+    thread = _pick_one_under_extra_cap(extra_cap)
     if thread is None:
-        return 0
-    if extra_cap is not None and thread.attempt_count > extra_cap:
-        # pick_one bumped attempt_count by 1; pre-bump it was attempt_count-1.
-        # If post-bump > cap, even the pre-bump value was at-cap → skip.
         return 0
 
     sys.stdout.write(_build_prompt(thread))

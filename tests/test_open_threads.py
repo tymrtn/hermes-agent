@@ -333,6 +333,32 @@ def test_script_max_attempts_caps_pickup(tmp_path, monkeypatch):
     assert persisted[0].attempt_count == 1
 
 
+def test_script_max_attempts_skips_at_cap_thread_and_picks_next(tmp_path, monkeypatch):
+    """The script-level cap must filter before bumping, not after pick_one()."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    at_cap = open_threads.add(title="already tried", side_effects=["research"], hermes_home=tmp_path)
+    open_threads.update(at_cap.id, bump_attempt=True, hermes_home=tmp_path)
+    fresh = open_threads.add(title="fresh research", side_effects=["research"], hermes_home=tmp_path)
+
+    proc = _run_script(
+        [
+            "--enabled",
+            "--no-require-idle",
+            "--idle-seconds",
+            "0",
+            "--max-attempts",
+            "1",
+        ],
+        tmp_path,
+    )
+
+    assert proc.returncode == 0
+    assert "fresh research" in proc.stdout
+    persisted = {t.id: t for t in open_threads.list_threads(status=None, hermes_home=tmp_path)}
+    assert persisted[at_cap.id].attempt_count == 1
+    assert persisted[fresh.id].attempt_count == 1
+
+
 def test_open_thread_tools_in_core_toolset():
     """Tool names are wired into the default Hermes core toolset."""
     from toolsets import _HERMES_CORE_TOOLS
