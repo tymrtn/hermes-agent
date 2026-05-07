@@ -56,8 +56,6 @@ _HERMES_CORE_TOOLS = [
     "execute_code", "delegate_task",
     # Cronjob management
     "cronjob",
-    # AFK open-thread ledger (record/list/update follow-ups for cron pickup)
-    "open_thread_add", "open_thread_list", "open_thread_update", "open_thread_abandon",
     # Cross-platform messaging (gated on gateway running via check_fn)
     "send_message",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
@@ -188,15 +186,6 @@ TOOLSETS = {
         "includes": []
     },
 
-    "open_threads": {
-        "description": "AFK open-thread ledger tools for safe follow-up work",
-        "tools": [
-            "open_thread_add", "open_thread_list",
-            "open_thread_update", "open_thread_abandon",
-        ],
-        "includes": []
-    },
-    
     "clarify": {
         "description": "Ask the user clarifying questions (multiple-choice or open-ended)",
         "tools": ["clarify"],
