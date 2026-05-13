@@ -88,6 +88,7 @@ def _make_runner():
     runner._tool_bubble_msg_ids = {}
     runner._busy_control_bubble_ids = {}
     runner._pending_followups = {}
+    runner._queued_events = {}
     runner._session_run_generation = {}
 
     # _interrupt_and_clear_session needs these.
@@ -553,3 +554,32 @@ class TestCleanup:
         assert sk not in runner._tool_bubble_msg_ids
         assert sk not in runner._busy_control_bubble_ids
         assert sk not in runner._pending_followups
+
+    @pytest.mark.asyncio
+    async def test_final_cleanup_discards_stale_pending_queue_when_controls_expire(self):
+        """Once the run has answered, removed controls must not leave stale queued text.
+
+        Button-tap and queued-followup handoff paths call cleanup without this flag
+        so interrupt/steer semantics are preserved. Final end-of-run teardown uses
+        discard_pending_queue=True because the controls are no longer actionable.
+        """
+        runner, _ = _make_runner()
+        adapter = _make_adapter()
+        event = _make_event(text="stale follow-up")
+        sk = build_session_key(event.source)
+        runner.adapters[event.source.platform] = adapter
+        runner._pending_followups[sk] = [event]
+        runner._pending_messages[sk] = "runner stale"
+        runner._queued_events[sk] = [event]
+        adapter._pending_messages[sk] = event
+
+        await runner._clear_busy_session_controls(
+            sk,
+            event.source,
+            discard_pending_queue=True,
+        )
+
+        assert sk not in runner._pending_followups
+        assert sk not in runner._pending_messages
+        assert sk not in runner._queued_events
+        assert sk not in adapter._pending_messages
