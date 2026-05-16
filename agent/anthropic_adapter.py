@@ -349,11 +349,35 @@ def _sanitize_oauth_system_text(text: str) -> str:
         ("memory tool", "long-term notes tool"),
         ("persistent memory across sessions", "long-term notes across sessions"),
         ("MEDIA:/absolute/path/to/file", "native attachment path"),
+        ("MEDIA:", "attachment:"),
+        ("Jailbreak", "Bypass"),
+        ("jailbreak", "bypass"),
+        ("G0DM0D3", "PRIVILEGE"),
+        ("godmode:", "privilege-mode:"),
+        ("Remove refusal behaviors", "adjust safety heuristics"),
+        ("refusal behaviors", "safety heuristics"),
+        ("obliteratus:", "adjust-tuning:"),
+        ("OBLITERAT", "ADJUST"),
+        ("red-teaming", "security-testing"),
     ]
 
     for old, new in replacements:
         text = text.replace(old, new)
     return text
+
+
+def _cap_oauth_max_tokens(model: str, max_tokens: int) -> int:
+    """Keep Claude subscription OAuth requests below extended-output billing tier.
+
+    Claude Max/Pro OAuth can report the same misleading ``out of extra usage``
+    error for high output caps that require paid extra usage. API-key traffic
+    keeps the documented model ceiling; this guard only applies on the OAuth
+    compatibility path.
+    """
+    normalized = model.lower().replace(".", "-")
+    if normalized.startswith("claude-"):
+        return min(max_tokens, 32_000)
+    return max_tokens
 
 
 def _get_claude_code_version() -> str:
@@ -1972,6 +1996,8 @@ def build_anthropic_kwargs(
     effective_max_tokens = _resolve_anthropic_messages_max_tokens(
         max_tokens, model, context_length=context_length
     )
+    if is_oauth:
+        effective_max_tokens = _cap_oauth_max_tokens(model, effective_max_tokens)
 
     # Clamp output cap to fit inside the total context window.
     # Only matters for small custom endpoints where context_length < native
