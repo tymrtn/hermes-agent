@@ -1562,7 +1562,13 @@ def _normalize_empty_agent_response(
     if api_calls > 0 and not agent_result.get("interrupted"):
         if agent_result.get("partial"):
             err = agent_result.get("error", "processing incomplete")
-            return f"⚠️ Processing stopped: {str(err)[:200]}. Try again."
+            err_text = str(err)
+            if "truncat" in err_text.lower() and "length" in err_text.lower():
+                return (
+                    "⚠️ The response hit the model output limit before it finished. "
+                    "Send `continue` to resume, or ask for a shorter answer/attached file."
+                )
+            return f"⚠️ Processing stopped: {err_text[:200]}. Try again."
         return (
             "⚠️ Processing completed but no response was generated. "
             "This may be a transient error — try sending your message again."
