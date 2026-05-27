@@ -3389,6 +3389,7 @@ def _notification_poller_loop(
     """
     from tools.process_registry import process_registry, format_process_notification
 
+    _emitted = set()  # dedup re-queued events so same completion isn't emitted 50 times while session is busy
     while not stop_event.is_set() and not session.get("_finalized"):
         try:
             evt = process_registry.completion_queue.get(timeout=0.5)
@@ -3403,7 +3404,12 @@ def _notification_poller_loop(
         if not text:
             continue
 
-        _emit("status.update", sid, {"kind": "process", "text": text})
+        # Only emit to TUI once per notification — re-queued completions
+        # get re-emitted every 0.5s otherwise when session is busy.
+        _dedup_key = f"{_evt_sid}:{evt.get('type', '')}"
+        if _dedup_key not in _emitted:
+            _emit("status.update", sid, {"kind": "process", "text": text})
+            _emitted.add(_dedup_key)
 
         with session["history_lock"]:
             if session.get("running"):
@@ -3438,7 +3444,10 @@ def _notification_poller_loop(
         if not text:
             continue
 
-        _emit("status.update", sid, {"kind": "process", "text": text})
+        _dedup_key = f"{_evt_sid}:{evt.get('type', '')}"
+        if _dedup_key not in _emitted:
+            _emit("status.update", sid, {"kind": "process", "text": text})
+            _emitted.add(_dedup_key)
 
         with session["history_lock"]:
             if session.get("running"):
