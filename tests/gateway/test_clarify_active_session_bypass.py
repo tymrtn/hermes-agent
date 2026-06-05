@@ -32,10 +32,10 @@ class _ClarifyBypassAdapter(BasePlatformAdapter):
         return {"id": chat_id, "type": "private"}
 
 
-def _event(text="custom answer"):
+def _event(text="custom answer", message_type=MessageType.TEXT):
     return MessageEvent(
         text=text,
-        message_type=MessageType.TEXT,
+        message_type=message_type,
         source=SessionSource(
             platform=Platform.TELEGRAM,
             chat_id="12345",
@@ -79,6 +79,31 @@ async def test_active_session_routes_typed_choice_clarify_reply_to_runner_not_bu
     )
     adapter._active_sessions[session_key] = asyncio.Event()
     cm.register("clarify-1", session_key, "Pick one", ["A", "B"])
+
+    await adapter.handle_message(event)
+
+    adapter._message_handler.assert_awaited_once_with(event)
+    adapter._busy_session_handler.assert_not_awaited()
+    assert adapter._pending_messages == {}
+
+
+@pytest.mark.asyncio
+async def test_active_session_routes_voice_clarify_reply_to_runner_not_busy_queue():
+    """Transcribed voice replies must resolve clarify instead of pausing behind busy handling."""
+    _clear_clarify_state()
+    from tools import clarify_gateway as cm
+
+    adapter = _ClarifyBypassAdapter()
+    adapter._message_handler = AsyncMock(return_value="")
+    adapter._busy_session_handler = AsyncMock(return_value=True)
+    event = _event("Use the second option", MessageType.VOICE)
+    session_key = build_session_key(
+        event.source,
+        group_sessions_per_user=adapter.config.extra.get("group_sessions_per_user", True),
+        thread_sessions_per_user=adapter.config.extra.get("thread_sessions_per_user", False),
+    )
+    adapter._active_sessions[session_key] = asyncio.Event()
+    cm.register("clarify-voice", session_key, "Pick one", ["A", "B"])
 
     await adapter.handle_message(event)
 

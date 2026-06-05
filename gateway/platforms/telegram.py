@@ -2854,9 +2854,12 @@ class TelegramAdapter(BasePlatformAdapter):
                     )
                 ])
 
-            busy_row = self._busy_session_button_row(session_key)
-            if busy_row:
-                rows.append(busy_row)
+            # Clarify is itself the active user-input surface. Do not append
+            # the generic busy-session controls here: they visually imply the
+            # bot has paused normal input handling, and they can steal taps
+            # from the clarify-specific choices. Slash commands such as
+            # /stop still bypass the active-session guard, and typed/voice
+            # replies are routed to the clarify resolver before busy handling.
             if rows:
                 kwargs["reply_markup"] = InlineKeyboardMarkup(rows)
 

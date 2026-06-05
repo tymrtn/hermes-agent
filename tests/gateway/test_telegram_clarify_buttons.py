@@ -129,8 +129,8 @@ class TestTelegramSendClarify:
         assert adapter._clarify_state["cid1"] == "sk1"
 
     @pytest.mark.asyncio
-    async def test_multi_choice_includes_busy_session_controls(self, monkeypatch):
-        """Clarify prompts must keep the fork's Steer/Interrupt/Stop controls."""
+    async def test_multi_choice_does_not_include_busy_session_controls(self, monkeypatch):
+        """Clarify prompts are their own input surface, not a busy-control surface."""
         _patch_keyboard(monkeypatch)
         adapter = _make_adapter({"busy_buttons": True})
         mock_msg = MagicMock()
@@ -148,13 +148,17 @@ class TestTelegramSendClarify:
         assert result.success is True
         rows = adapter._bot.send_message.call_args[1]["reply_markup"].inline_keyboard
         labels = [[button.text for button in row] for row in rows]
-        assert labels[-1] == ["/steer", "/interrupt", "/stop"]
-        callbacks = [button.callback_data for button in rows[-1]]
-        assert all(callback.startswith("bs:") for callback in callbacks)
+        assert labels == [
+            ["1. alpha"],
+            ["2. beta"],
+            ["✏️ Other (type answer)"],
+        ]
+        callbacks = [button.callback_data for row in rows for button in row]
+        assert not any(callback.startswith("bs:") for callback in callbacks)
 
     @pytest.mark.asyncio
-    async def test_open_ended_includes_busy_session_controls(self, monkeypatch):
-        """Open-ended clarify prompts still need an interruptable control row."""
+    async def test_open_ended_does_not_include_busy_session_controls(self, monkeypatch):
+        """Open-ended clarify prompts should accept chat replies without extra buttons."""
         _patch_keyboard(monkeypatch)
         adapter = _make_adapter({"busy_buttons": True})
         mock_msg = MagicMock()
@@ -172,8 +176,7 @@ class TestTelegramSendClarify:
         assert result.success is True
         kwargs = adapter._bot.send_message.call_args[1]
         assert "What is your name?" in kwargs["text"]
-        rows = kwargs["reply_markup"].inline_keyboard
-        assert [[button.text for button in row] for row in rows] == [["/steer", "/interrupt", "/stop"]]
+        assert "reply_markup" not in kwargs
         assert adapter._clarify_state["cid2"] == "telegram:12345:dm"
 
     @pytest.mark.asyncio
