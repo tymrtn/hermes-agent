@@ -132,6 +132,49 @@ def _fake_runner(thread_meta):
 
 
 @pytest.mark.asyncio
+async def test_queued_followup_fallback_delivers_media_tags_as_documents(tmp_path, monkeypatch):
+    event = _event(thread_id="topic-1")
+    media_file = _allowed_media_path(tmp_path, monkeypatch, "report.md")
+    adapter = SimpleNamespace(
+        name="test",
+        extract_media=BasePlatformAdapter.extract_media,
+        extract_images=BasePlatformAdapter.extract_images,
+        extract_local_files=BasePlatformAdapter.extract_local_files,
+        send=AsyncMock(return_value=SendResult(success=True, message_id="text")),
+        send_voice=AsyncMock(return_value=SendResult(success=True, message_id="voice")),
+        send_document=AsyncMock(return_value=SendResult(success=True, message_id="doc")),
+        send_image_file=AsyncMock(return_value=SendResult(success=True, message_id="image")),
+        send_video=AsyncMock(return_value=SendResult(success=True, message_id="video")),
+    )
+    runner = _fake_runner({"thread_id": "topic-1"})
+
+    async def _deliver(response, event, adapter):
+        await GatewayRunner._deliver_media_from_response(runner, response, event, adapter)
+
+    runner._deliver_media_from_response = _deliver
+
+    await GatewayRunner._send_first_response_before_queued_followup(
+        runner,
+        adapter=adapter,
+        source=event.source,
+        event=event,
+        response=f"Done.\n\nMEDIA:{media_file}",
+        metadata={"thread_id": "topic-1"},
+    )
+
+    adapter.send.assert_awaited_once_with(
+        "chat-1",
+        f"Done.\n\nMEDIA:{media_file}",
+        metadata={"thread_id": "topic-1"},
+    )
+    adapter.send_document.assert_awaited_once_with(
+        chat_id="chat-1",
+        file_path=str(media_file),
+        metadata={"thread_id": "topic-1"},
+    )
+
+
+@pytest.mark.asyncio
 async def test_streaming_delivery_routes_telegram_flac_media_tag_to_document_sender(tmp_path, monkeypatch):
     event = _event(thread_id="topic-1")
     media_file = _allowed_media_path(tmp_path, monkeypatch, "speech.flac")

@@ -13001,11 +13001,40 @@ class GatewayRunner:
                 except OSError:
                     pass
 
+    async def _send_first_response_before_queued_followup(
+        self,
+        *,
+        adapter,
+        source,
+        event,
+        response: str,
+        metadata: Optional[Dict[str, Any]],
+    ) -> None:
+        """Send a queued-turn first response and still deliver MEDIA artifacts.
+
+        The normal final-response path strips/delivers MEDIA tags after the text
+        send. The queued-follow-up fallback sends the first response directly
+        before recursing into the queued message, so it must explicitly run the
+        same media delivery step or document artifacts (.md/.pdf/etc.) remain as
+        plain text only.
+        """
+        await adapter.send(
+            source.chat_id,
+            response,
+            metadata=metadata,
+        )
+        if response:
+            await self._deliver_media_from_response(
+                response,
+                event,
+                adapter,
+            )
+
     async def _deliver_media_from_response(
         self,
         response: str,
         event: MessageEvent,
-        adapter,
+        adapter: BasePlatformAdapter,
     ) -> None:
         """Extract MEDIA: tags and local file paths from a response and deliver them.
 
@@ -19678,9 +19707,11 @@ class GatewayRunner:
                                 "Queued follow-up for session %s: final stream delivery not confirmed; sending first response before continuing.",
                                 session_key or "?",
                             )
-                            await adapter.send(
-                                source.chat_id,
-                                first_response,
+                            await self._send_first_response_before_queued_followup(
+                                adapter=adapter,
+                                source=source,
+                                event=event,
+                                response=first_response,
                                 metadata=_status_thread_metadata,
                             )
                         except Exception as e:
