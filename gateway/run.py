@@ -9417,6 +9417,18 @@ class GatewayRunner:
             except Exception as exc:
                 logger.debug("@ context reference expansion failed: %s", exc)
 
+        # Render normalized context refs (forwarded-message provenance, etc.)
+        # as a compact block before the body so the agent sees a forward's
+        # origin rather than treating it as plain pasted text. This happens
+        # AFTER @ context-reference preprocessing so untrusted forwarded
+        # metadata (display names, channel titles, author signatures) cannot be
+        # interpreted as user-authored @file/@url context requests.
+        context_refs = getattr(event, "context_refs", None)
+        if context_refs:
+            rendered_refs = [r for r in (ref.render() for ref in context_refs if ref is not None) if r]
+            if rendered_refs:
+                message_text = "\n\n".join(rendered_refs) + "\n\n" + message_text
+
         return message_text
 
     def _consume_pending_native_image_paths(self, session_key: str) -> List[str]:
