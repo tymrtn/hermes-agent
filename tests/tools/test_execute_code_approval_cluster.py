@@ -111,6 +111,7 @@ def gw_session(monkeypatch):
     monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
     monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
     monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
+    monkeypatch.delenv("HERMES_PROFILE", raising=False)
     # Force manual mode regardless of host config.
     monkeypatch.setattr(A, "_get_approval_mode", lambda: "manual")
 
@@ -199,6 +200,74 @@ def test_guard_gateway_missing_notify_is_pending(gw_session):
     res = A.check_execute_code_guard("import os", "local")
     assert res["approved"] is False
     assert res["status"] == "pending_approval"
+
+
+def test_guard_trusted_profile_auto_approves_without_prompt(gw_session, monkeypatch):
+    """Trusted operator profiles skip only the redundant whole-script prompt."""
+    monkeypatch.setattr(A, "_get_active_profile_name_for_approval", lambda: "nagatha")
+    monkeypatch.setattr(
+        A,
+        "_get_approval_config",
+        lambda: {"mode": "manual", "execute_code_trusted_profiles": ["nagatha"]},
+    )
+
+    res = A.check_execute_code_guard("import os", "local")
+
+    assert res["approved"] is True
+    assert res.get("trusted_profile") == "nagatha"
+    with A._lock:
+        assert gw_session not in A._gateway_queues
+
+
+def test_guard_untrusted_profile_still_prompts(gw_session, monkeypatch):
+    monkeypatch.setattr(A, "_get_active_profile_name_for_approval", lambda: "scorandum")
+    monkeypatch.setattr(
+        A,
+        "_get_approval_config",
+        lambda: {"mode": "manual", "execute_code_trusted_profiles": ["nagatha"]},
+    )
+
+    res = A.check_execute_code_guard("import os", "local")
+
+    assert res["approved"] is False
+    assert res["status"] == "pending_approval"
+
+
+def test_guard_trusted_profile_does_not_override_cron_deny(monkeypatch):
+    monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+    monkeypatch.delenv("HERMES_PROFILE", raising=False)
+    monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+    monkeypatch.setattr(A, "_get_active_profile_name_for_approval", lambda: "nagatha")
+    monkeypatch.setattr(A, "_get_approval_mode", lambda: "manual")
+    monkeypatch.setattr(A, "_get_cron_approval_mode", lambda: "deny")
+    monkeypatch.setattr(
+        A,
+        "_get_approval_config",
+        lambda: {"mode": "manual", "execute_code_trusted_profiles": ["nagatha"]},
+    )
+
+    res = A.check_execute_code_guard("import os", "local")
+
+    assert res["approved"] is False
+    assert res["outcome"] == "blocked"
+
+
+def test_trusted_profile_list_accepts_comma_string(monkeypatch):
+    monkeypatch.setattr(
+        A,
+        "_get_approval_config",
+        lambda: {"execute_code_trusted_profiles": "nagatha, skippy"},
+    )
+    assert A._get_execute_code_trusted_profiles() == {"nagatha", "skippy"}
+
+
+def test_active_profile_trust_ignores_stale_hermes_profile_env(monkeypatch):
+    monkeypatch.setenv("HERMES_PROFILE", "nagatha")
+    monkeypatch.setattr(
+        "hermes_cli.profiles.get_active_profile_name",
+        lambda: "scorandum",
+    )
+    assert A._get_active_profile_name_for_approval() == "scorandum"
 
 
 def test_guard_smart_mode(gw_session, monkeypatch):

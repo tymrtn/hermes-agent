@@ -896,6 +896,48 @@ def _get_cron_approval_mode() -> str:
         return "deny"
 
 
+def _normalize_profile_name(value) -> str:
+    return str(value or "").strip().lower()
+
+
+def _get_active_profile_name_for_approval() -> str:
+    """Return the active Hermes profile name for profile-scoped approvals.
+
+    Trust decisions deliberately use Hermes' canonical profile resolver rather
+    than HERMES_PROFILE. The latter is an auxiliary subprocess marker and may
+    be stale; HERMES_HOME / -p / active_profile are the source of truth.
+    """
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+        return _normalize_profile_name(get_active_profile_name() or "default")
+    except Exception:
+        return "default"
+
+
+def _get_execute_code_trusted_profiles() -> set:
+    """Read approvals.execute_code_trusted_profiles as normalized names."""
+    raw = _get_approval_config().get("execute_code_trusted_profiles", [])
+    if raw is None:
+        return set()
+    if isinstance(raw, str):
+        raw = [part.strip() for part in raw.split(",")]
+    try:
+        return {
+            _normalize_profile_name(item)
+            for item in raw
+            if _normalize_profile_name(item)
+        }
+    except TypeError:
+        return set()
+
+
+def _is_execute_code_profile_trusted() -> bool:
+    """True when the active profile is explicitly trusted for execute_code."""
+    profile = _get_active_profile_name_for_approval()
+    trusted = _get_execute_code_trusted_profiles()
+    return bool(profile and profile in trusted)
+
+
 def _smart_approve(command: str, description: str) -> str:
     """Use the auxiliary LLM to assess risk and decide approval.
 
@@ -1511,7 +1553,9 @@ def check_execute_code_guard(code: str, env_type: str) -> dict:
     is_gateway = _is_gateway_approval_context()
     is_ask = env_var_enabled("HERMES_EXEC_ASK")
 
-    # Cron: no user is present to approve arbitrary code.
+    # Cron: no user is present to approve arbitrary code. Cron approval policy
+    # is separate and intentionally wins over profile trust so background jobs
+    # cannot inherit an interactive operator profile's autonomy grant.
     if env_var_enabled("HERMES_CRON_SESSION"):
         if _get_cron_approval_mode() == "deny":
             return {
@@ -1540,6 +1584,23 @@ def check_execute_code_guard(code: str, env_type: str) -> dict:
         return {"approved": True, "message": None}
 
     session_key = get_current_session_key()
+    # Explicit profile trust: selected operator profiles may run whole-script
+    # execute_code without a repeated gateway prompt. This is narrower than
+    # approvals.mode=off/Yolo: it only skips this whole-script guard; terminal
+    # and Hermes-tool dangerous-command guards still run inside the script.
+    if (is_gateway or is_ask) and _is_execute_code_profile_trusted():
+        profile = _get_active_profile_name_for_approval()
+        logger.info(
+            "execute_code auto-approved for trusted profile %s in session %s",
+            profile, session_key,
+        )
+        return {
+            "approved": True,
+            "message": None,
+            "trusted_profile": profile,
+            "description": description,
+        }
+
     # Built only now (past the early-return gates) so the common non-approval
     # paths don't pay to copy a potentially-large script into this string.
     command = f"execute_code <<'PY'\n{code}\nPY"

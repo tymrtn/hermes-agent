@@ -1776,6 +1776,14 @@ DEFAULT_CONFIG = {
         "mode": "manual",
         "timeout": 60,
         "cron_mode": "deny",
+        # Explicit profile allowlist for whole-script execute_code approval.
+        # Default is empty: gateway/manual sessions still prompt before
+        # arbitrary local Python runs. Add trusted operator profiles here
+        # (for example ["nagatha", "skippy"]) only when those profiles are
+        # intentionally allowed to run generated Python without a per-script
+        # approval prompt. This is narrower than approvals.mode=off: normal
+        # terminal/tool dangerous-command guards still apply inside scripts.
+        "execute_code_trusted_profiles": [],
         # When true, /reload-mcp asks the user to confirm before rebuilding
         # the MCP tool set for the active session.  Reloading invalidates
         # the provider prompt cache (tool schemas are baked into the system
