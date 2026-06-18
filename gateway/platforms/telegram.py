@@ -345,6 +345,9 @@ class TelegramAdapter(BasePlatformAdapter):
 
     # Telegram message limits
     MAX_MESSAGE_LENGTH = 4096
+    # Bot API 10.1 rich messages allow substantially larger structured text.
+    # Keep a small safety margin under the documented 32k ceiling.
+    MAX_RICH_MESSAGE_LENGTH = 32000
     # Threshold for detecting Telegram client-side message splits.
     # When a chunk is near this limit, a continuation is almost certain.
     _SPLIT_THRESHOLD = 4000
@@ -410,6 +413,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self._mention_patterns = self._compile_mention_patterns()
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
         self._disable_link_previews: bool = self._coerce_bool_extra("disable_link_previews", False)
+        self._rich_messages_mode: str = self._rich_messages_mode_from_config()
         # Buffer rapid/album photo updates so Telegram image bursts are handled
         # as a single MessageEvent instead of self-interrupting multiple turns.
         self._media_batch_delay_seconds = float(os.getenv("HERMES_TELEGRAM_MEDIA_BATCH_DELAY_SECONDS", "0.8"))
@@ -507,6 +511,100 @@ class TelegramAdapter(BasePlatformAdapter):
         # Tracked separately from the tool-progress bubble so the runner can
         # delete the control bubble at turn end without touching the tool log.
         self._busy_control_bubble_ids: Dict[str, str] = {}
+
+    def _rich_messages_mode_from_config(self) -> str:
+        """Return Telegram rich-message mode: off, auto, or always.
+
+        ``auto`` is the safe fast path: use Bot API 10.1 ``sendRichMessage``
+        only when it materially improves the output (native tables or content
+        longer than classic ``sendMessage`` allows). Any API/parse failure
+        falls back to the existing MarkdownV2 send path.
+        """
+        raw = os.getenv("HERMES_TELEGRAM_RICH_MESSAGES")
+        if raw is None:
+            raw = self.config.extra.get("rich_messages") if getattr(self.config, "extra", None) else None
+        value = str(raw if raw is not None else "auto").strip().lower()
+        if value in {"1", "true", "yes", "on", "always"}:
+            return "always"
+        if value in {"0", "false", "no", "off", "never"}:
+            return "off"
+        return "auto"
+
+    @staticmethod
+    def _has_markdown_table(content: str) -> bool:
+        if "|" not in content or "-" not in content:
+            return False
+        lines = content.split("\n")
+        in_fence = False
+        for i, line in enumerate(lines[:-1]):
+            stripped = line.lstrip()
+            if stripped.startswith("```"):
+                in_fence = not in_fence
+                continue
+            if in_fence:
+                continue
+            if "|" in line and _TABLE_SEPARATOR_RE.match(lines[i + 1]):
+                return True
+        return False
+
+    def _should_send_rich_message(self, content: str) -> bool:
+        mode = getattr(self, "_rich_messages_mode", "auto")
+        if mode == "off":
+            return False
+        if not content or utf16_len(content) > self.MAX_RICH_MESSAGE_LENGTH:
+            return False
+        if mode == "always":
+            return True
+        return self._has_markdown_table(content) or utf16_len(content) > self.MAX_MESSAGE_LENGTH
+
+    @staticmethod
+    def _raw_reply_parameters(reply_to_id: Optional[int]) -> Dict[str, Any]:
+        if reply_to_id is None:
+            return {}
+        return {"reply_parameters": {"message_id": reply_to_id}}
+
+    @staticmethod
+    def _raw_rich_message_response_id(response: Any) -> Optional[str]:
+        if response is None:
+            return None
+        message_id = getattr(response, "message_id", None)
+        if message_id is not None:
+            return str(message_id)
+        if isinstance(response, dict):
+            raw_id = response.get("message_id")
+            if raw_id is not None:
+                return str(raw_id)
+        return None
+
+    async def _send_rich_message_raw(
+        self,
+        *,
+        chat_id: str,
+        content: str,
+        reply_to_id: Optional[int],
+        thread_kwargs: Dict[str, Any],
+        metadata: Optional[Dict[str, Any]],
+    ) -> Optional[str]:
+        """Send via Bot API 10.1 ``sendRichMessage`` using PTB's transport.
+
+        PTB 22.6 does not expose this method yet. Calling the private ``_post``
+        keeps Hermes on the configured PTB request stack (timeouts, proxy,
+        base URL, connection pool) while upstream support is pending.
+        """
+        post = getattr(self._bot, "_post", None) if self._bot is not None else None
+        if post is None:
+            return None
+        data: Dict[str, Any] = {
+            "chat_id": int(chat_id),
+            "rich_message": {"markdown": content},
+        }
+        for key, value in (thread_kwargs or {}).items():
+            if value is not None:
+                data[key] = value
+        data.update(self._raw_reply_parameters(reply_to_id))
+        data.update(self._notification_kwargs(metadata))
+        response = await post("sendRichMessage", data=data)
+        return self._raw_rich_message_response_id(response)
 
     def _notification_kwargs(
         self, metadata: Optional[Dict[str, Any]]
@@ -1914,6 +2012,7 @@ class TelegramAdapter(BasePlatformAdapter):
             except (ImportError, AttributeError):
                 _TimedOut = None  # type: ignore[assignment,misc]
 
+            rich_message_unavailable = False
             for i, chunk in enumerate(chunks):
                 retried_thread_not_found = False
                 metadata_reply_to = self._metadata_reply_to_message_id(metadata)
@@ -1956,6 +2055,29 @@ class TelegramAdapter(BasePlatformAdapter):
                     thread_kwargs = dict(thread_kwargs)
                     thread_kwargs["message_thread_id"] = None
                 effective_thread_id = thread_kwargs.get("message_thread_id")
+
+                if (
+                    not rich_message_unavailable
+                    and self._should_send_rich_message(content)
+                ):
+                    try:
+                        rich_id = await self._send_rich_message_raw(
+                            chat_id=chat_id,
+                            content=content,
+                            reply_to_id=reply_to_id,
+                            thread_kwargs=thread_kwargs,
+                            metadata=metadata,
+                        )
+                        if rich_id is not None:
+                            message_ids.append(rich_id)
+                            break
+                    except Exception as rich_error:
+                        rich_message_unavailable = True
+                        logger.info(
+                            "[%s] sendRichMessage failed; falling back to sendMessage: %s",
+                            self.name,
+                            rich_error,
+                        )
 
                 msg = None
                 for _send_attempt in range(3):
