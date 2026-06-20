@@ -57,7 +57,36 @@ class CronPromptInjectionBlocked(Exception):
     """
 
 
-def _resolve_cron_disabled_toolsets(cfg: dict) -> list[str]:
+_CRON_MEMORY_MODES = frozenset({"off", "read_only", "full"})
+
+
+def _resolve_cron_memory_mode(job: dict, cfg: dict) -> str:
+    """Resolve how much persistent memory a cron-spawned agent may use.
+
+    ``off`` preserves the historical cron behaviour: no MEMORY.md / USER.md
+    injection and no memory providers.  ``read_only`` loads the memory snapshot
+    into the system prompt but keeps the memory tool disabled so unattended jobs
+    cannot mutate durable user representations.  ``full`` loads memory and
+    leaves memory tools available subject to normal toolset policy.
+
+    Per-job ``memory_mode`` wins over ``cron.memory_mode`` so continuity jobs can
+    opt in without changing the global safety default.
+    """
+    raw = (job or {}).get("memory_mode")
+    source = "job"
+    if raw is None:
+        raw = ((cfg or {}).get("cron") or {}).get("memory_mode", "off")
+        source = "config"
+    mode = str(raw or "off").strip().lower().replace("-", "_")
+    if mode not in _CRON_MEMORY_MODES:
+        logger.warning(
+            "Invalid cron memory_mode %r from %s; using 'off'", raw, source
+        )
+        return "off"
+    return mode
+
+
+def _resolve_cron_disabled_toolsets(cfg: dict, memory_mode: str = "off") -> list[str]:
     """Toolsets a cron-spawned agent must never receive.
 
     Three protected toolsets are always disabled in cron context:
@@ -65,12 +94,18 @@ def _resolve_cron_disabled_toolsets(cfg: dict) -> list[str]:
       - ``messaging`` — interactive, needs a live gateway session
       - ``clarify`` — interactive, blocks waiting for user input
 
+    ``memory`` is also disabled unless ``memory_mode='full'``.  In
+    ``read_only`` mode the memory snapshot is injected by AIAgent, but writes
+    stay unavailable to unattended cron jobs.
+
     User-level ``agent.disabled_toolsets`` from config.yaml is layered on top
     so per-job ``enabled_toolsets`` cannot bypass policy that applies to
     ordinary agent runs (#25752 — LLM-supplied enabled_toolsets was widening
     past config.yaml's denylist).
     """
     disabled = ["cronjob", "messaging", "clarify"]
+    if str(memory_mode or "off").strip().lower() != "full":
+        disabled.append("memory")
     agent_cfg = (cfg or {}).get("agent") or {}
     user_disabled = agent_cfg.get("disabled_toolsets") or []
     for name in user_disabled:
@@ -826,8 +861,25 @@ _DEFAULT_SCRIPT_TIMEOUT = 120  # seconds
 _SCRIPT_TIMEOUT = _DEFAULT_SCRIPT_TIMEOUT
 
 
-def _get_script_timeout() -> int:
-    """Resolve cron pre-run script timeout from module/env/config with a safe default."""
+def _get_script_timeout(override: object = None) -> int:
+    """Resolve cron pre-run script timeout from job/module/env/config with a safe default.
+
+    ``override`` is the per-job ``script_timeout_seconds`` value (highest
+    precedence) — long-running no-agent scripts (e.g. a Claude Code audit)
+    can declare their own budget without raising the global default for
+    every job.
+    """
+    if override is not None:
+        try:
+            timeout = int(float(override))
+            if timeout > 0:
+                return timeout
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid per-job script_timeout_seconds=%r; using module/env/config/default",
+                override,
+            )
+
     if _SCRIPT_TIMEOUT != _DEFAULT_SCRIPT_TIMEOUT:
         try:
             timeout = int(float(_SCRIPT_TIMEOUT))
@@ -859,7 +911,7 @@ def _get_script_timeout() -> int:
     return _DEFAULT_SCRIPT_TIMEOUT
 
 
-def _run_job_script(script_path: str) -> tuple[bool, str]:
+def _run_job_script(script_path: str, *, timeout_seconds: object = None) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
     Scripts must reside within HERMES_HOME/scripts/.  Both relative and
@@ -881,6 +933,9 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
         script_path: Path to the script.  Relative paths are resolved
             against HERMES_HOME/scripts/.  Absolute and ~-prefixed paths
             are also validated to ensure they stay within the scripts dir.
+        timeout_seconds: Optional per-job timeout override (the job's
+            ``script_timeout_seconds`` field).  Falls back to the
+            module/env/config resolution chain when unset or invalid.
 
     Returns:
         (success, output) — on failure *output* contains the error message so the
@@ -911,7 +966,7 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
     if not path.is_file():
         return False, f"Script path is not a file: {path}"
 
-    script_timeout = _get_script_timeout()
+    script_timeout = _get_script_timeout(timeout_seconds)
 
     # Pick an interpreter by extension.  Bash for .sh/.bash, Python for
     # everything else.  We deliberately do NOT honour the file's own
@@ -1032,7 +1087,9 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
         if prerun_script is not None:
             success, script_output = prerun_script
         else:
-            success, script_output = _run_job_script(script_path)
+            success, script_output = _run_job_script(
+                script_path, timeout_seconds=job.get("script_timeout_seconds")
+            )
         if success:
             if script_output:
                 prompt = (
@@ -1267,7 +1324,9 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 _prior_cwd = None
 
         try:
-            ok, output = _run_job_script(script_path)
+            ok, output = _run_job_script(
+                script_path, timeout_seconds=job.get("script_timeout_seconds")
+            )
         finally:
             if _prior_cwd is not None:
                 try:
@@ -1356,7 +1415,9 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
     prerun_script = None
     script_path = job.get("script")
     if script_path:
-        prerun_script = _run_job_script(script_path)
+        prerun_script = _run_job_script(
+            script_path, timeout_seconds=job.get("script_timeout_seconds")
+        )
         _ran_ok, _script_output = prerun_script
         if _ran_ok and not _parse_wake_gate(_script_output):
             logger.info(
@@ -1550,6 +1611,7 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
 
         # Provider routing
         pr = _cfg.get("provider_routing", {})
+        _cron_memory_mode = _resolve_cron_memory_mode(job, _cfg)
 
         from hermes_cli.runtime_provider import (
             resolve_runtime_provider,
@@ -1652,7 +1714,7 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
             provider_sort=pr.get("sort"),
             openrouter_min_coding_score=(_cfg.get("openrouter") or {}).get("min_coding_score"),
             enabled_toolsets=_resolve_cron_enabled_toolsets(job, _cfg),
-            disabled_toolsets=_resolve_cron_disabled_toolsets(_cfg),
+            disabled_toolsets=_resolve_cron_disabled_toolsets(_cfg, _cron_memory_mode),
             quiet_mode=True,
             # Cron jobs should always inherit the user's SOUL.md identity from
             # HERMES_HOME. When a workdir is configured, also inject project
@@ -1660,7 +1722,7 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
             # Without a workdir, keep cwd context discovery disabled.
             skip_context_files=not bool(_job_workdir),
             load_soul_identity=True,
-            skip_memory=True,  # Cron system prompts would corrupt user representations
+            skip_memory=(_cron_memory_mode == "off"),
             platform="cron",
             session_id=_cron_session_id,
             session_db=_session_db,

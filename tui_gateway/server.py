@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -2677,6 +2678,23 @@ def _start_inflight_turn(session: dict, text: Any) -> None:
     }
 
 
+def _redact_secure_markers_for_local(text: Any) -> Any:
+    """Redact [[secure]]...[[/secure]] blocks for local/TUI display/history.
+
+    Messaging adapters can use platform controls plus TTL redaction. The local
+    TUI has no remote message to edit later, so it never displays/persists the
+    marked secret body in the first place.
+    """
+    if not isinstance(text, str) or "[[secure]]" not in text:
+        return text
+    return re.sub(
+        r"\[\[secure\]\].*?(?:\[\[/secure\]\]|$)",
+        "[redacted — secure message omitted from local transcript]",
+        text,
+        flags=re.DOTALL,
+    )
+
+
 def _append_inflight_delta(session: dict, delta: Any) -> None:
     text = "" if delta is None else str(delta)
     if not text:
@@ -4104,10 +4122,18 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             status_note = None
             if isinstance(result, dict):
                 if isinstance(result.get("messages"), list):
+                    redacted_messages = []
+                    for _msg in result["messages"]:
+                        if isinstance(_msg, dict) and _msg.get("role") == "assistant":
+                            _copy = dict(_msg)
+                            _copy["content"] = _redact_secure_markers_for_local(_copy.get("content"))
+                            redacted_messages.append(_copy)
+                        else:
+                            redacted_messages.append(_msg)
                     with session["history_lock"]:
                         current_version = int(session.get("history_version", 0))
                         if current_version == history_version:
-                            session["history"] = result["messages"]
+                            session["history"] = redacted_messages
                             session["history_version"] = history_version + 1
                         else:
                             # History mutated externally during the turn
@@ -4139,7 +4165,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                     sid, session, clear_pending_title=False, restart_slash_worker=True,
                 )
 
-                raw = result.get("final_response", "")
+                raw = _redact_secure_markers_for_local(result.get("final_response", ""))
                 status = (
                     "interrupted"
                     if result.get("interrupted")

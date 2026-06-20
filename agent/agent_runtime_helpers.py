@@ -1657,6 +1657,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             target=target,
             content=function_args.get("content"),
             old_text=function_args.get("old_text"),
+            tier=function_args.get("tier", "hot"),
             store=agent._memory_store,
         )
         # Bridge: notify external memory provider of built-in memory writes

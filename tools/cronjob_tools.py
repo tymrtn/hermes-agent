@@ -413,6 +413,8 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         result["workdir"] = job["workdir"]
     if job.get("profile"):
         result["profile"] = job["profile"]
+    if job.get("memory_mode"):
+        result["memory_mode"] = job["memory_mode"]
     return result
 
 
@@ -436,6 +438,7 @@ def cronjob(
     enabled_toolsets: Optional[List[str]] = None,
     workdir: Optional[str] = None,
     profile: Optional[str] = None,
+    memory_mode: Optional[str] = None,
     no_agent: Optional[bool] = None,
     task_id: str = None,
 ) -> str:
@@ -503,6 +506,7 @@ def cronjob(
                 enabled_toolsets=enabled_toolsets or None,
                 workdir=_normalize_optional_job_value(workdir),
                 profile=_normalize_optional_job_value(profile),
+                memory_mode=_normalize_optional_job_value(memory_mode),
                 no_agent=_no_agent,
             )
             return json.dumps(
@@ -641,6 +645,9 @@ def cronjob(
                 # Empty string clears the field (restores old behaviour);
                 # otherwise pass raw — update_job() validates / normalizes.
                 updates["profile"] = _normalize_optional_job_value(profile) or None
+            if memory_mode is not None:
+                # Empty string clears the per-job override (inherits cron.memory_mode).
+                updates["memory_mode"] = _normalize_optional_job_value(memory_mode)
             if no_agent is not None:
                 # Toggling no_agent on/off at update time. If flipping to True,
                 # we need a script to already exist on the job (or be part of
@@ -798,6 +805,11 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
                 "type": "string",
                 "description": "Optional Hermes profile name to run the job under. When set, the scheduler resolves that profile, applies a context-local Hermes home override, loads that profile's config/.env for the run, and bridges HERMES_HOME into subprocesses. Any temporary process-environment changes from profile .env loading are restored after the job exits. Use 'default' for the root Hermes profile. Named profiles must already exist. When unset (default), preserves the scheduler's existing profile. On update, pass an empty string to clear. Jobs with profile run sequentially (not parallel) to keep profile-scoped runtime state isolated."
             },
+            "memory_mode": {
+                "type": "string",
+                "enum": ["off", "read_only", "full"],
+                "description": "Optional per-job persistent memory policy for LLM-driven cron runs. 'off' preserves historical cron behavior with no MEMORY/USER injection. 'read_only' injects memory for continuity but disables memory writes. 'full' injects memory and allows memory tools subject to toolset policy. When unset, inherits cron.memory_mode from config (default off). On update, pass an empty string to clear the per-job override."
+            },
         },
         "required": ["action"]
     }
@@ -853,6 +865,7 @@ registry.register(
         enabled_toolsets=args.get("enabled_toolsets"),
         workdir=args.get("workdir"),
         profile=args.get("profile"),
+        memory_mode=args.get("memory_mode"),
         no_agent=args.get("no_agent"),
         task_id=kw.get("task_id"),
     ))(),

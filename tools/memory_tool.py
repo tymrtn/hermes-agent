@@ -121,12 +121,25 @@ class MemoryStore:
         Tool responses always reflect this live state.
     """
 
-    def __init__(self, memory_char_limit: int = 2200, user_char_limit: int = 1375):
+    def __init__(
+        self,
+        memory_char_limit: int = 2200,
+        user_char_limit: int = 1375,
+        warm_memory_enabled: bool = True,
+        warm_memory_char_limit: int = 50000,
+        warm_user_char_limit: int = 25000,
+    ):
         self.memory_entries: List[str] = []
         self.user_entries: List[str] = []
+        self.warm_memory_entries: List[str] = []
+        self.warm_user_entries: List[str] = []
         self.memory_char_limit = memory_char_limit
         self.user_char_limit = user_char_limit
+        self.warm_memory_enabled = warm_memory_enabled
+        self.warm_memory_char_limit = warm_memory_char_limit
+        self.warm_user_char_limit = warm_user_char_limit
         # Frozen snapshot for system prompt -- set once at load_from_disk()
+        # Warm entries are retrievable but never injected here.
         self._system_prompt_snapshot: Dict[str, str] = {"memory": "", "user": ""}
 
     def load_from_disk(self):
@@ -152,10 +165,14 @@ class MemoryStore:
 
         self.memory_entries = self._read_file(mem_dir / "MEMORY.md")
         self.user_entries = self._read_file(mem_dir / "USER.md")
+        self.warm_memory_entries = self._read_file(mem_dir / "WARM_MEMORY.md")
+        self.warm_user_entries = self._read_file(mem_dir / "WARM_USER.md")
 
         # Deduplicate entries (preserves order, keeps first occurrence)
         self.memory_entries = list(dict.fromkeys(self.memory_entries))
         self.user_entries = list(dict.fromkeys(self.user_entries))
+        self.warm_memory_entries = list(dict.fromkeys(self.warm_memory_entries))
+        self.warm_user_entries = list(dict.fromkeys(self.warm_user_entries))
 
         # Sanitize entries for the system-prompt snapshot only.  Live state
         # (memory_entries / user_entries) keeps the raw text so the user
@@ -243,13 +260,17 @@ class MemoryStore:
             fd.close()
 
     @staticmethod
-    def _path_for(target: str) -> Path:
+    def _path_for(target: str, tier: str = "hot") -> Path:
         mem_dir = get_memory_dir()
+        if tier == "warm":
+            if target == "user":
+                return mem_dir / "WARM_USER.md"
+            return mem_dir / "WARM_MEMORY.md"
         if target == "user":
             return mem_dir / "USER.md"
         return mem_dir / "MEMORY.md"
 
-    def _reload_target(self, target: str) -> Optional[str]:
+    def _reload_target(self, target: str, tier: str = "hot") -> Optional[str]:
         """Re-read entries from disk into in-memory state.
 
         Called under file lock to get the latest state before mutating.
@@ -260,91 +281,141 @@ class MemoryStore:
         flushing would discard the un-roundtrippable content.
         Returns None on clean reload.
         """
-        path = self._path_for(target)
-        bak = self._detect_external_drift(target)
+        path = self._path_for(target, tier)
+        bak = self._detect_external_drift(target, tier=tier)
         fresh = self._read_file(path)
         fresh = list(dict.fromkeys(fresh))  # deduplicate
-        self._set_entries(target, fresh)
+        self._set_entries(target, fresh, tier=tier)
         return bak
 
-    def save_to_disk(self, target: str):
+    def save_to_disk(self, target: str, tier: str = "hot"):
         """Persist entries to the appropriate file. Called after every mutation."""
         get_memory_dir().mkdir(parents=True, exist_ok=True)
-        self._write_file(self._path_for(target), self._entries_for(target))
+        self._write_file(self._path_for(target, tier), self._entries_for(target, tier=tier))
 
-    def _entries_for(self, target: str) -> List[str]:
+    def _entries_for(self, target: str, tier: str = "hot") -> List[str]:
+        if tier == "warm":
+            if target == "user":
+                return self.warm_user_entries
+            return self.warm_memory_entries
         if target == "user":
             return self.user_entries
         return self.memory_entries
 
-    def _set_entries(self, target: str, entries: List[str]):
+    def _set_entries(self, target: str, entries: List[str], tier: str = "hot"):
+        if tier == "warm":
+            if target == "user":
+                self.warm_user_entries = entries
+            else:
+                self.warm_memory_entries = entries
+            return
         if target == "user":
             self.user_entries = entries
         else:
             self.memory_entries = entries
 
-    def _char_count(self, target: str) -> int:
-        entries = self._entries_for(target)
+    def _char_count(self, target: str, tier: str = "hot") -> int:
+        entries = self._entries_for(target, tier=tier)
         if not entries:
             return 0
         return len(ENTRY_DELIMITER.join(entries))
 
-    def _char_limit(self, target: str) -> int:
+    def _char_limit(self, target: str, tier: str = "hot") -> int:
+        if tier == "warm":
+            if target == "user":
+                return self.warm_user_char_limit
+            return self.warm_memory_char_limit
         if target == "user":
             return self.user_char_limit
         return self.memory_char_limit
 
-    def add(self, target: str, content: str) -> Dict[str, Any]:
-        """Append a new entry. Returns error if it would exceed the char limit."""
+    def _replacement_candidates(self, target: str, content_len: int, *, max_items: int = 3) -> List[Dict[str, Any]]:
+        """Return compact hot-memory prune/replace candidates for full-memory UX."""
+        entries = self._entries_for(target)
+        current = self._char_count(target)
+        limit = self._char_limit(target)
+        needed = max(0, current + (len(ENTRY_DELIMITER) if entries else 0) + content_len - limit)
+        ranked = sorted(entries, key=len, reverse=True)[:max_items]
+        candidates: List[Dict[str, Any]] = []
+        for entry in ranked:
+            preview = entry[:120] + ("..." if len(entry) > 120 else "")
+            old_text = entry[:80] + ("..." if len(entry) > 80 else "")
+            candidates.append({
+                "old_text": old_text,
+                "preview": preview,
+                "chars": len(entry),
+                "would_free_enough": len(entry) >= needed,
+            })
+        return candidates
+
+    def add(self, target: str, content: str, tier: str = "hot") -> Dict[str, Any]:
+        """Append a new entry. Hot overflow falls back to warm retrieval-only memory."""
         content = content.strip()
         if not content:
             return {"success": False, "error": "Content cannot be empty."}
+        if tier not in {"hot", "warm"}:
+            return {"success": False, "error": "tier must be 'hot' or 'warm'."}
 
         # Scan for injection/exfiltration before accepting
         scan_error = _scan_memory_content(content)
         if scan_error:
             return {"success": False, "error": scan_error}
 
-        with self._file_lock(self._path_for(target)):
+        with self._file_lock(self._path_for(target, tier)):
             # Re-read from disk under lock to pick up writes from other sessions.
             # If external drift was detected, the file was backed up to .bak.<ts>
             # — refuse the mutation so we don't clobber the un-roundtrippable
             # content the patch tool / shell append / sister session wrote.
-            bak = self._reload_target(target)
+            bak = self._reload_target(target, tier=tier)
             if bak:
-                return _drift_error(self._path_for(target), bak)
+                return _drift_error(self._path_for(target, tier), bak)
 
-            entries = self._entries_for(target)
-            limit = self._char_limit(target)
+            entries = self._entries_for(target, tier=tier)
+            limit = self._char_limit(target, tier=tier)
 
             # Reject exact duplicates
             if content in entries:
-                return self._success_response(target, "Entry already exists (no duplicate added).")
+                return self._success_response(target, "Entry already exists (no duplicate added).", tier=tier)
 
             # Calculate what the new total would be
             new_entries = entries + [content]
             new_total = len(ENTRY_DELIMITER.join(new_entries))
 
             if new_total > limit:
-                current = self._char_count(target)
+                current = self._char_count(target, tier=tier)
+                if tier == "hot" and self.warm_memory_enabled:
+                    warm_result = self.add(target, content, tier="warm")
+                    if warm_result.get("success"):
+                        warm_result.update({
+                            "message": (
+                                "Hot memory is full; entry was saved to warm memory instead. "
+                                "Warm memory is durable and retrievable with memory(action=read), "
+                                "but is not injected into the system prompt."
+                            ),
+                            "hot_full": True,
+                            "hot_usage": f"{current:,}/{limit:,}",
+                            "replacement_candidates": self._replacement_candidates(target, len(content)),
+                        })
+                        return warm_result
                 return {
                     "success": False,
                     "error": (
                         f"Memory at {current:,}/{limit:,} chars. "
                         f"Adding this entry ({len(content)} chars) would exceed the limit. "
-                        f"Replace or remove existing entries first."
+                        f"Replace or remove existing entries first, or add with tier='warm'."
                     ),
                     "current_entries": entries,
                     "usage": f"{current:,}/{limit:,}",
+                    "replacement_candidates": self._replacement_candidates(target, len(content)) if tier == "hot" else [],
                 }
 
             entries.append(content)
-            self._set_entries(target, entries)
-            self.save_to_disk(target)
+            self._set_entries(target, entries, tier=tier)
+            self.save_to_disk(target, tier=tier)
 
-        return self._success_response(target, "Entry added.")
+        return self._success_response(target, "Entry added.", tier=tier)
 
-    def replace(self, target: str, old_text: str, new_content: str) -> Dict[str, Any]:
+    def replace(self, target: str, old_text: str, new_content: str, tier: str = "hot") -> Dict[str, Any]:
         """Find entry containing old_text substring, replace it with new_content."""
         old_text = old_text.strip()
         new_content = new_content.strip()
@@ -358,12 +429,12 @@ class MemoryStore:
         if scan_error:
             return {"success": False, "error": scan_error}
 
-        with self._file_lock(self._path_for(target)):
-            bak = self._reload_target(target)
+        with self._file_lock(self._path_for(target, tier)):
+            bak = self._reload_target(target, tier=tier)
             if bak:
-                return _drift_error(self._path_for(target), bak)
+                return _drift_error(self._path_for(target, tier), bak)
 
-            entries = self._entries_for(target)
+            entries = self._entries_for(target, tier=tier)
             matches = [(i, e) for i, e in enumerate(entries) if old_text in e]
 
             if not matches:
@@ -382,7 +453,7 @@ class MemoryStore:
                 # All identical -- safe to replace just the first
 
             idx = matches[0][0]
-            limit = self._char_limit(target)
+            limit = self._char_limit(target, tier=tier)
 
             # Check that replacement doesn't blow the budget
             test_entries = entries.copy()
@@ -399,23 +470,23 @@ class MemoryStore:
                 }
 
             entries[idx] = new_content
-            self._set_entries(target, entries)
-            self.save_to_disk(target)
+            self._set_entries(target, entries, tier=tier)
+            self.save_to_disk(target, tier=tier)
 
-        return self._success_response(target, "Entry replaced.")
+        return self._success_response(target, "Entry replaced.", tier=tier)
 
-    def remove(self, target: str, old_text: str) -> Dict[str, Any]:
+    def remove(self, target: str, old_text: str, tier: str = "hot") -> Dict[str, Any]:
         """Remove the entry containing old_text substring."""
         old_text = old_text.strip()
         if not old_text:
             return {"success": False, "error": "old_text cannot be empty."}
 
-        with self._file_lock(self._path_for(target)):
-            bak = self._reload_target(target)
+        with self._file_lock(self._path_for(target, tier)):
+            bak = self._reload_target(target, tier=tier)
             if bak:
-                return _drift_error(self._path_for(target), bak)
+                return _drift_error(self._path_for(target, tier), bak)
 
-            entries = self._entries_for(target)
+            entries = self._entries_for(target, tier=tier)
             matches = [(i, e) for i, e in enumerate(entries) if old_text in e]
 
             if not matches:
@@ -435,10 +506,29 @@ class MemoryStore:
 
             idx = matches[0][0]
             entries.pop(idx)
-            self._set_entries(target, entries)
-            self.save_to_disk(target)
+            self._set_entries(target, entries, tier=tier)
+            self.save_to_disk(target, tier=tier)
 
-        return self._success_response(target, "Entry removed.")
+        return self._success_response(target, "Entry removed.", tier=tier)
+
+    def read(self, target: str, tier: str = "all") -> Dict[str, Any]:
+        """Return live memory entries without changing prompt injection state."""
+        self.load_from_disk()
+        if tier not in {"hot", "warm", "all"}:
+            return {"success": False, "error": "tier must be 'hot', 'warm', or 'all'."}
+        result: Dict[str, Any] = {
+            "success": True,
+            "target": target,
+            "tier": tier,
+            "hot_usage": f"{self._char_count(target, tier='hot'):,}/{self._char_limit(target, tier='hot'):,}",
+            "warm_usage": f"{self._char_count(target, tier='warm'):,}/{self._char_limit(target, tier='warm'):,}",
+            "note": "Only hot entries are injected into the system prompt; warm entries are durable retrieval-only memory.",
+        }
+        if tier in {"hot", "all"}:
+            result["hot_entries"] = self._entries_for(target, tier="hot")
+        if tier in {"warm", "all"}:
+            result["warm_entries"] = self._entries_for(target, tier="warm")
+        return result
 
     def format_for_system_prompt(self, target: str) -> Optional[str]:
         """
@@ -455,15 +545,17 @@ class MemoryStore:
 
     # -- Internal helpers --
 
-    def _success_response(self, target: str, message: str = None) -> Dict[str, Any]:
-        entries = self._entries_for(target)
-        current = self._char_count(target)
-        limit = self._char_limit(target)
+    def _success_response(self, target: str, message: Optional[str] = None, tier: str = "hot") -> Dict[str, Any]:
+        entries = self._entries_for(target, tier=tier)
+        current = self._char_count(target, tier=tier)
+        limit = self._char_limit(target, tier=tier)
         pct = min(100, int((current / limit) * 100)) if limit > 0 else 0
 
         resp = {
             "success": True,
             "target": target,
+            "tier": tier,
+            "injected": tier == "hot",
             "entries": entries,
             "usage": f"{pct}% — {current:,}/{limit:,} chars",
             "entry_count": len(entries),
@@ -512,7 +604,7 @@ class MemoryStore:
         entries = [e.strip() for e in raw.split(ENTRY_DELIMITER)]
         return [e for e in entries if e]
 
-    def _detect_external_drift(self, target: str) -> Optional[str]:
+    def _detect_external_drift(self, target: str, tier: str = "hot") -> Optional[str]:
         """Return a backup-path string if on-disk content shows external drift.
 
         The memory file is supposed to be a list of small entries the tool
@@ -536,7 +628,7 @@ class MemoryStore:
         Note: this is an INSTANCE method (not static) because we need the
         per-target char_limit for signal #2.
         """
-        path = self._path_for(target)
+        path = self._path_for(target, tier)
         if not path.exists():
             return None
         try:
@@ -549,7 +641,7 @@ class MemoryStore:
         parsed = [e.strip() for e in raw.split(ENTRY_DELIMITER) if e.strip()]
         roundtrip = ENTRY_DELIMITER.join(parsed)
 
-        char_limit = self._char_limit(target)
+        char_limit = self._char_limit(target, tier=tier)
         max_entry_len = max((len(e) for e in parsed), default=0)
 
         drift_detected = (raw.strip() != roundtrip) or (max_entry_len > char_limit)
@@ -604,6 +696,7 @@ def memory_tool(
     target: str = "memory",
     content: str = None,
     old_text: str = None,
+    tier: str = "hot",
     store: Optional[MemoryStore] = None,
 ) -> str:
     """
@@ -620,22 +713,25 @@ def memory_tool(
     if action == "add":
         if not content:
             return tool_error("Content is required for 'add' action.", success=False)
-        result = store.add(target, content)
+        result = store.add(target, content, tier=tier)
 
     elif action == "replace":
         if not old_text:
             return tool_error("old_text is required for 'replace' action.", success=False)
         if not content:
             return tool_error("content is required for 'replace' action.", success=False)
-        result = store.replace(target, old_text, content)
+        result = store.replace(target, old_text, content, tier=tier)
 
     elif action == "remove":
         if not old_text:
             return tool_error("old_text is required for 'remove' action.", success=False)
-        result = store.remove(target, old_text)
+        result = store.remove(target, old_text, tier=tier)
+
+    elif action == "read":
+        result = store.read(target, tier=tier if tier in {"hot", "warm", "all"} else "all")
 
     else:
-        return tool_error(f"Unknown action '{action}'. Use: add, replace, remove", success=False)
+        return tool_error(f"Unknown action '{action}'. Use: add, replace, remove, read", success=False)
 
     return json.dumps(result, ensure_ascii=False)
 
@@ -671,7 +767,11 @@ MEMORY_SCHEMA = {
         "- 'user': who the user is -- name, role, preferences, communication style, pet peeves\n"
         "- 'memory': your notes -- environment facts, project conventions, tool quirks, lessons learned\n\n"
         "ACTIONS: add (new entry), replace (update existing -- old_text identifies it), "
-        "remove (delete -- old_text identifies it).\n\n"
+        "remove (delete -- old_text identifies it), read (inspect hot/warm memory).\n\n"
+        "TIERS: hot memory is compact and injected into the system prompt. Warm memory is "
+        "durable and retrievable but never injected; use tier='warm' for useful context "
+        "that should not bloat every prompt. If hot memory is full, add may save to warm "
+        "and return replacement_candidates for pruning hot memory.\n\n"
         "SKIP: trivial/obvious info, things easily re-discovered, raw data dumps, and temporary task state."
     ),
     "parameters": {
@@ -679,7 +779,7 @@ MEMORY_SCHEMA = {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["add", "replace", "remove"],
+                "enum": ["add", "replace", "remove", "read"],
                 "description": "The action to perform."
             },
             "target": {
@@ -694,6 +794,11 @@ MEMORY_SCHEMA = {
             "old_text": {
                 "type": "string",
                 "description": "Short unique substring identifying the entry to replace or remove."
+            },
+            "tier": {
+                "type": "string",
+                "enum": ["hot", "warm", "all"],
+                "description": "Memory tier. hot is injected; warm is retrieval-only; all is valid for read. Defaults to hot."
             },
         },
         "required": ["action", "target"],
@@ -713,6 +818,7 @@ registry.register(
         target=args.get("target", "memory"),
         content=args.get("content"),
         old_text=args.get("old_text"),
+        tier=args.get("tier", "hot"),
         store=kw.get("store")),
     check_fn=check_memory_requirements,
     emoji="🧠",

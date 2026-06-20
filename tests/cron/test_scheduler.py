@@ -906,12 +906,80 @@ class TestRunJobSessionPersistence:
         assert kwargs["session_db"] is fake_db
         assert kwargs["platform"] == "cron"
         assert kwargs["session_id"].startswith("cron_test-job_")
+        assert kwargs["skip_memory"] is True
+        assert "memory" in kwargs["disabled_toolsets"]
         fake_db.end_session.assert_called_once()
         call_args = fake_db.end_session.call_args
         assert call_args[0][0].startswith("cron_test-job_")
         assert call_args[0][1] == "cron_complete"
         fake_db.close.assert_called_once()
         mock_agent.close.assert_called_once()
+
+    def test_run_job_read_only_memory_injects_memory_but_disables_memory_tool(self, tmp_path):
+        job = {
+            "id": "memory-read-job",
+            "name": "memory read",
+            "prompt": "hello",
+            "memory_mode": "read_only",
+        }
+        fake_db = MagicMock()
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("dotenv.load_dotenv"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "***",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "openrouter",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+            success, output, final_response, error = run_job(job)
+
+        assert success is True
+        kwargs = mock_agent_cls.call_args.kwargs
+        assert kwargs["skip_memory"] is False
+        assert "memory" in kwargs["disabled_toolsets"]
+
+    def test_run_job_full_memory_allows_memory_tool(self, tmp_path):
+        job = {
+            "id": "memory-full-job",
+            "name": "memory full",
+            "prompt": "hello",
+            "memory_mode": "full",
+        }
+        fake_db = MagicMock()
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("dotenv.load_dotenv"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "***",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "openrouter",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+            success, output, final_response, error = run_job(job)
+
+        assert success is True
+        kwargs = mock_agent_cls.call_args.kwargs
+        assert kwargs["skip_memory"] is False
+        assert "memory" not in kwargs["disabled_toolsets"]
 
     def test_run_job_closes_agent_on_failure_to_prevent_fd_leak(self, tmp_path):
         # Regression: if ``run_conversation`` raises, the ephemeral cron
@@ -2124,7 +2192,7 @@ class TestRunJobWakeGate:
         import cron.scheduler as scheduler
 
         call_count = 0
-        def _script_stub(path):
+        def _script_stub(path, **kwargs):
             nonlocal call_count
             call_count += 1
             return (True, "regular output")

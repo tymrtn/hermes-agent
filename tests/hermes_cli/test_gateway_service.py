@@ -2579,3 +2579,22 @@ class TestServiceWorkingDirIsStable:
         assert m, "plist has no WorkingDirectory entry"
         assert Path(m.group(1)).resolve() == home.resolve()
         assert "/.worktrees/" not in m.group(1)
+
+    def test_systemd_unit_sets_pythonpath_for_source_checkout_imports(self, tmp_path, monkeypatch):
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: home)
+
+        unit = gateway_cli.generate_systemd_unit(system=False)
+
+        assert f'Environment="PYTHONPATH={gateway_cli.PROJECT_ROOT}"' in unit
+
+    def test_launchd_plist_sets_pythonpath_for_source_checkout_imports(self, tmp_path, monkeypatch):
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: home)
+
+        plist = gateway_cli.generate_launchd_plist()
+
+        assert "<key>PYTHONPATH</key>" in plist
+        assert f"<string>{gateway_cli.PROJECT_ROOT}</string>" in plist

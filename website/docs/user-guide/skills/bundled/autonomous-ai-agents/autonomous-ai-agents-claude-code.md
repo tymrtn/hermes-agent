@@ -722,7 +722,7 @@ Use `/context` in interactive mode to see a colored grid of context usage. Key t
 
 ## Cost & Performance Tips
 
-1. **Use `--max-turns`** in print mode to prevent runaway loops. Start with 5-10 for most tasks.
+1. **Avoid `--max-turns` by default** for Tyler-facing Claude Code delegation. Use terminal/process timeouts, scoped tools, and parent-agent verification instead. Only add `--max-turns` when you explicitly need a hard agent-loop fuse; if used, set it high enough that it is not the artificial failure point (usually `300–500` for real engineering work, not `5–10`).
 2. **Use `--max-budget-usd`** for cost caps. Note: minimum ~$0.05 for system prompt cache creation.
 3. **Use `--effort low`** for simple tasks (faster, cheaper). `high` or `max` for complex reasoning.
 4. **Use `--bare`** for CI/scripting to skip plugin/hook discovery overhead.
@@ -754,7 +754,7 @@ Use `/context` in interactive mode to see a colored grid of context usage. Key t
 1. **Prefer print mode (`-p`) for single tasks** — cleaner, no dialog handling, structured output
 2. **Use tmux for multi-turn interactive work** — the only reliable way to orchestrate the TUI
 3. **Always set `workdir`** — keep Claude focused on the right project directory
-4. **Set `--max-turns` in print mode** — prevents infinite loops and runaway costs
+4. **Do not set `--max-turns` by default in print mode** — low caps strand partial work and cause false failures. Use a high runaway fuse only when explicitly justified, and verify artifacts yourself.
 5. **Monitor tmux sessions** — use `tmux capture-pane -t <session> -p -S -50` to check progress
 6. **Look for the `❯` prompt** — indicates Claude is waiting for input (done or asking a question)
 7. **Clean up tmux sessions** — kill them when done to avoid resource leaks

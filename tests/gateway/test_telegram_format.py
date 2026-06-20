@@ -413,6 +413,22 @@ class TestFormatMessageBlockquote:
         assert "> Line two" in result
         assert "\\>" not in result
 
+    def test_blockquote_without_space_matches_telegram_docs(self, adapter):
+        """Telegram's MarkdownV2 examples use >Quote without a separating space."""
+        result = adapter.format_message(">Block quotation started\n>\n>Block quotation continued")
+        assert ">Block quotation started" in result
+        assert "\n>\n" in result
+        assert ">Block quotation continued" in result
+        assert "\\>" not in result
+
+    def test_expandable_blockquote_without_space_matches_telegram_docs(self, adapter):
+        """Expandable blockquotes use **>... plus trailing || in Bot API docs."""
+        result = adapter.format_message("**>Expandable block quotation started\n>The last line||")
+        assert "**>Expandable block quotation started" in result
+        assert ">The last line||" in result
+        assert "\\*" not in result
+        assert "\\>" not in result
+
     def test_blockquote_in_code_not_converted(self, adapter):
         result = adapter.format_message("```\n> not a quote\n```")
         assert "> not a quote" in result

@@ -849,6 +849,28 @@ class TestGetDueJobs:
         assert recovered_dt > now
 
 
+class TestMemoryMode:
+    def test_memory_mode_none_when_omitted(self, tmp_cron_dir):
+        job = create_job(prompt="monitor", schedule="every 1h")
+        assert job["memory_mode"] is None
+
+    def test_memory_mode_stored_normalized(self, tmp_cron_dir):
+        job = create_job(prompt="monitor", schedule="every 1h", memory_mode="read-only")
+        assert job["memory_mode"] == "read_only"
+        assert get_job(job["id"])["memory_mode"] == "read_only"
+
+    def test_memory_mode_rejects_invalid_value(self, tmp_cron_dir):
+        with pytest.raises(ValueError, match="memory_mode"):
+            create_job(prompt="monitor", schedule="every 1h", memory_mode="write_lots")
+
+    def test_memory_mode_updated_via_update_job(self, tmp_cron_dir):
+        job = create_job(prompt="monitor", schedule="every 1h")
+        update_job(job["id"], {"memory_mode": "full"})
+        assert get_job(job["id"])["memory_mode"] == "full"
+        update_job(job["id"], {"memory_mode": ""})
+        assert get_job(job["id"])["memory_mode"] is None
+
+
 class TestEnabledToolsets:
     def test_enabled_toolsets_stored(self, tmp_cron_dir):
         job = create_job(prompt="monitor", schedule="every 1h", enabled_toolsets=["web", "terminal"])

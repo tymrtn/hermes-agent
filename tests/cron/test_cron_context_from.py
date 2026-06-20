@@ -63,6 +63,19 @@ class TestJobContextFromField:
         job = create_job(prompt="Hello", schedule="every 1h")
         assert job.get("context_from") is None
 
+    def test_create_job_with_read_only_memory_mode(self, cron_env):
+        from cron.jobs import create_job, get_job
+
+        job = create_job(prompt="Hello", schedule="every 1h", memory_mode="read-only")
+        assert job["memory_mode"] == "read_only"
+        assert get_job(job["id"])["memory_mode"] == "read_only"
+
+    def test_create_job_rejects_invalid_memory_mode(self, cron_env):
+        from cron.jobs import create_job
+
+        with pytest.raises(ValueError, match="memory_mode"):
+            create_job(prompt="Hello", schedule="every 1h", memory_mode="write_lots")
+
     def test_context_from_empty_string_normalized_to_none(self, cron_env):
         from cron.jobs import create_job
 

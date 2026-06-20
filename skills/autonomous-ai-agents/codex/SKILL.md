@@ -119,6 +119,25 @@ terminal(command="codex exec 'Review PR #87. git diff origin/main...origin/pr/87
 terminal(command="gh pr comment 86 --body '<review>'", workdir="~/project")
 ```
 
+## Deauthorization / token-expiry recovery
+
+Symptom: cron or unattended Codex sessions produce only `request_dump_*.json`
+error files, or you see `token_expired` / HTTP 401 / "Codex got deauthorized" /
+"sign in again". The run often **reports success but does no work** — the
+expired session silently no-ops.
+
+Recovery (a Tyler-present credential gate — no agent can self-fix it):
+- **Hermes-managed Codex** (`model.provider: openai-codex`): re-run
+  `hermes auth add openai-codex` to refresh the OAuth in `~/.hermes/auth.json`.
+- **Standalone Codex CLI**: re-run `codex login` to re-establish the OAuth
+  session under `~/.codex/auth.json`.
+- After re-auth, smoke-test before trusting unattended jobs: `codex exec 'print
+  ok'` inside a git repo (or `hermes -p <profile> chat -q ...`).
+
+Detection: one expired token can silently kill every cron/agent run that depends
+on it. Surface the *class* (a single alert on the first 401) rather than waiting
+to notice N per-session error dumps.
+
 ## Rules
 
 1. **Always use `pty=true`** — Codex is an interactive terminal app and hangs without a PTY

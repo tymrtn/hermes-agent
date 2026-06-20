@@ -64,6 +64,25 @@ from utils import base_url_host_matches, env_var_enabled
 logger = logging.getLogger(__name__)
 
 
+def _redact_secure_markers(text: Any) -> Any:
+    """Remove [[secure]]...[[/secure]] payloads from durable agent records."""
+    if not isinstance(text, str) or "[[secure]]" not in text:
+        return text
+    return re.sub(
+        r"\[\[secure\]\].*?(?:\[\[/secure\]\]|$)",
+        "[redacted — secure message omitted from transcript]",
+        text,
+        flags=re.DOTALL,
+    )
+
+
+def _redact_secure_markers_in_messages(messages: list) -> None:
+    """In-place redaction for assistant transcript messages before persistence."""
+    for msg in messages:
+        if isinstance(msg, dict) and msg.get("role") == "assistant":
+            msg["content"] = _redact_secure_markers(msg.get("content"))
+
+
 def _ollama_context_limit_error(agent: Any, request_tokens: int) -> Optional[str]:
     """Return a user-facing error when Ollama is loaded with too little context."""
     if not getattr(agent, "tools", None):
@@ -4463,6 +4482,7 @@ def run_conversation(
     # can replay assistant("(empty)") / recovery nudges and fall into the
     # same empty-response loop again.
     agent._drop_trailing_empty_response_scaffolding(messages)
+    _redact_secure_markers_in_messages(messages)
     agent._persist_session(messages, conversation_history)
 
     # ── Turn-exit diagnostic log ─────────────────────────────────────
@@ -4704,7 +4724,7 @@ def run_conversation(
     # External memory provider: sync the completed turn + queue next prefetch.
     agent._sync_external_memory_for_turn(
         original_user_message=original_user_message,
-        final_response=final_response,
+        final_response=_redact_secure_markers(final_response),
         interrupted=interrupted,
         messages=messages,
     )

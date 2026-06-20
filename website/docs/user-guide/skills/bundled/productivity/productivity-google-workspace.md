@@ -21,7 +21,7 @@ Gmail, Calendar, Drive, Docs, Sheets via gws CLI or Python.
 | License | MIT |
 | Platforms | linux, macos, windows |
 | Tags | `Google`, `Gmail`, `Calendar`, `Drive`, `Sheets`, `Docs`, `Contacts`, `Email`, `OAuth` |
-| Related skills | [`envelope`](/docs/user-guide/skills/bundled/email/email-envelope), [`himalaya`](/docs/user-guide/skills/bundled/email/email-himalaya) |
+| Related skills | [`envelope`](/docs/user-guide/skills/bundled/email/email-envelope) |
 
 ## Reference: full SKILL.md
 

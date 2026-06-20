@@ -700,11 +700,13 @@ Use `/context` in interactive mode to see a colored grid of context usage. Key t
 | `MAX_THINKING_TOKENS` | Cap thinking tokens (set to `0` to disable thinking entirely) |
 | `MAX_MCP_OUTPUT_TOKENS` | Cap output from MCP servers (default varies; set e.g., `50000`) |
 | `CLAUDE_CODE_NO_FLICKER=1` | Enable alt-screen rendering to eliminate terminal flicker |
-| `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB` | Strip credentials from sub-processes for security |
+| `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB` | Strip credentials from sub-processes for security. **Side effect:** when set (`=1`), the baseline permission mode is forced to `default` (interactive approval), *overriding* `--permission-mode acceptEdits/dontAsk/bypassPermissions`. Explicitly-passed `--allowedTools` are still granted, so the fix in unattended/cron launches is to **always pass `--allowedTools` listing every tool the run needs** (e.g. `Read,Write,Edit,MultiEdit,Glob,Grep,Bash`). Omit it and the spawned agent silently makes no edits/commits even though it reports success. Set `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=0` only to opt out of the credential scrub entirely. |
+
+> ⚠️ **Unattended-run gotcha (env scrub vs. permission mode).** If a headless `claude -p` run reports `success` but made *no* edits/commits, check for `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1` in its environment: it downgrades the run to `default` (ask-first) mode regardless of `--permission-mode`, and with no human to approve, every write is silently declined. Always pair the scrub with an explicit `--allowedTools` allowlist. (Observed 2026-06-18: a fork-audit subprocess and the Dream Cycle launcher both emit `Permission mode forced to default — CLAUDE_CODE_SUBPROCESS_ENV_SCRUB is set`; the Dream Cycle still edits because it passes `--allowedTools`.)
 
 ## Cost & Performance Tips
 
-1. **Use `--max-turns`** in print mode to prevent runaway loops. Start with 5-10 for most tasks.
+1. **Avoid `--max-turns` by default** for Tyler-facing Claude Code delegation. Use terminal/process timeouts, scoped tools, and parent-agent verification instead. Only add `--max-turns` when you explicitly need a hard agent-loop fuse; if used, set it high enough that it is not the artificial failure point (usually `300–500` for real engineering work, not `5–10`).
 2. **Use `--max-budget-usd`** for cost caps. Note: minimum ~$0.05 for system prompt cache creation.
 3. **Use `--effort low`** for simple tasks (faster, cheaper). `high` or `max` for complex reasoning.
 4. **Use `--bare`** for CI/scripting to skip plugin/hook discovery overhead.
@@ -736,7 +738,7 @@ Use `/context` in interactive mode to see a colored grid of context usage. Key t
 1. **Prefer print mode (`-p`) for single tasks** — cleaner, no dialog handling, structured output
 2. **Use tmux for multi-turn interactive work** — the only reliable way to orchestrate the TUI
 3. **Always set `workdir`** — keep Claude focused on the right project directory
-4. **Set `--max-turns` in print mode** — prevents infinite loops and runaway costs
+4. **Do not set `--max-turns` by default in print mode** — low caps strand partial work and cause false failures. Use a high runaway fuse only when explicitly justified, and verify artifacts yourself.
 5. **Monitor tmux sessions** — use `tmux capture-pane -t <session> -p -S -50` to check progress
 6. **Look for the `❯` prompt** — indicates Claude is waiting for input (done or asking a question)
 7. **Clean up tmux sessions** — kill them when done to avoid resource leaks

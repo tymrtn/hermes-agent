@@ -528,6 +528,25 @@ def _normalize_profile(profile: Optional[str]) -> Optional[str]:
     return normalized
 
 
+def _normalize_memory_mode(memory_mode: Optional[str]) -> Optional[str]:
+    """Normalize optional per-job cron memory policy.
+
+    ``None`` means inherit ``cron.memory_mode`` from config. Stored values are
+    limited to the scheduler-supported enum so job records stay auditable.
+    """
+    if memory_mode is None:
+        return None
+    raw = str(memory_mode).strip().lower().replace("-", "_")
+    if not raw:
+        return None
+    if raw not in {"off", "read_only", "full"}:
+        raise ValueError(
+            "Cron memory_mode must be one of: off, read_only, full "
+            f"(got {memory_mode!r})"
+        )
+    return raw
+
+
 def create_job(
     prompt: Optional[str],
     schedule: str,
@@ -545,6 +564,7 @@ def create_job(
     enabled_toolsets: Optional[List[str]] = None,
     workdir: Optional[str] = None,
     profile: Optional[str] = None,
+    memory_mode: Optional[str] = None,
     no_agent: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -591,6 +611,9 @@ def create_job(
                 credentials, scripts, skills, and memory paths resolve
                 consistently. ``default`` selects the root profile; empty /
                 None preserves the scheduler's existing behaviour.
+        memory_mode: Optional per-job persistent memory policy. ``None``
+                inherits ``cron.memory_mode`` from config; otherwise one of
+                ``off``, ``read_only``, or ``full``.
         no_agent: When True, skip the agent entirely — run ``script`` on schedule
                 and deliver its stdout directly. Empty stdout = silent (no
                 delivery). Requires ``script`` to be set. Ideal for classic
@@ -629,6 +652,7 @@ def create_job(
     normalized_toolsets = normalized_toolsets or None
     normalized_workdir = _normalize_workdir(workdir)
     normalized_profile = _normalize_profile(profile)
+    normalized_memory_mode = _normalize_memory_mode(memory_mode)
     normalized_no_agent = bool(no_agent)
 
     # no_agent jobs are meaningless without a script — the script IS the job.
@@ -684,6 +708,7 @@ def create_job(
         "enabled_toolsets": normalized_toolsets,
         "workdir": normalized_workdir,
         "profile": normalized_profile,
+        "memory_mode": normalized_memory_mode,
     }
 
     jobs = load_jobs()
@@ -781,6 +806,9 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 updates["profile"] = None
             else:
                 updates["profile"] = _normalize_profile(_profile)
+
+        if "memory_mode" in updates:
+            updates["memory_mode"] = _normalize_memory_mode(updates["memory_mode"])
 
         updated = _apply_skill_fields({**job, **updates})
         schedule_changed = "schedule" in updates

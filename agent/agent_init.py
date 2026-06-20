@@ -1078,6 +1078,9 @@ def init_agent(
                 agent._memory_store = MemoryStore(
                     memory_char_limit=mem_config.get("memory_char_limit", 2200),
                     user_char_limit=mem_config.get("user_char_limit", 1375),
+                    warm_memory_enabled=mem_config.get("warm_memory_enabled", True),
+                    warm_memory_char_limit=mem_config.get("warm_memory_char_limit", 50000),
+                    warm_user_char_limit=mem_config.get("warm_user_char_limit", 25000),
                 )
                 agent._memory_store.load_from_disk()
         except Exception:

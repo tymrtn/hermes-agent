@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import time
 import types
 from unittest.mock import AsyncMock, MagicMock
 
@@ -184,6 +185,40 @@ class TestHaltPhrasePreflight:
 
         # Mode is "queue" — agent is NOT interrupted.
         agent.interrupt.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Early correction auto-interrupt
+# ---------------------------------------------------------------------------
+
+
+class TestEarlyCorrectionAutoInterrupt:
+    @pytest.mark.asyncio
+    async def test_text_followup_within_six_seconds_interrupts_even_in_queue_mode(self):
+        """A near-immediate second message is usually a typo correction.
+
+        It should interrupt the active turn automatically instead of waiting
+        behind the queued-mode button flow.
+        """
+        from gateway.run import GatewayRunner
+
+        runner, _ = _make_runner()
+        runner._busy_input_mode = "queue"
+        runner._busy_text_mode = "queue"
+        adapter = _make_adapter()
+        event = _make_event(text="correction: use the other branch")
+        sk = build_session_key(event.source)
+        runner.adapters[event.source.platform] = adapter
+
+        agent = MagicMock()
+        runner._running_agents[sk] = agent
+        runner._running_agents_ts[sk] = time.time() - 5.0
+
+        result = await GatewayRunner._handle_active_session_busy_message(runner, event, sk)
+
+        assert result is True
+        agent.interrupt.assert_called_once_with("correction: use the other branch")
+        assert adapter._pending_messages[sk] is event
 
 
 # ---------------------------------------------------------------------------

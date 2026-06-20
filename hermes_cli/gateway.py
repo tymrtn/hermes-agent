@@ -2316,6 +2316,7 @@ def _stable_service_working_dir() -> str:
 def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) -> str:
     python_path = get_python_path()
     working_dir = _stable_service_working_dir()
+    pythonpath = str(PROJECT_ROOT)
     detected_venv = _detect_venv_dir()
     venv_dir = str(detected_venv) if detected_venv else str(PROJECT_ROOT / "venv")
 
@@ -2351,6 +2352,7 @@ def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) 
         # (e.g. /root/) to the target user's home so the service can
         # actually access them.
         python_path = _remap_path_for_user(python_path, home_dir)
+        pythonpath = _remap_path_for_user(pythonpath, home_dir)
         # Anchor cwd to the target user's HERMES_HOME (stable, always exists)
         # rather than a remapped source-checkout path that can rot. See
         # _stable_service_working_dir() for the full rationale.
@@ -2379,6 +2381,7 @@ Environment="LOGNAME={username}"
 Environment="PATH={sane_path}"
 Environment="VIRTUAL_ENV={venv_dir}"
 Environment="HERMES_HOME={hermes_home}"
+Environment="PYTHONPATH={pythonpath}"
 Restart=always
 RestartSec=5
 RestartMaxDelaySec=300
@@ -2414,6 +2417,7 @@ WorkingDirectory={working_dir}
 Environment="PATH={sane_path}"
 Environment="VIRTUAL_ENV={venv_dir}"
 Environment="HERMES_HOME={hermes_home}"
+Environment="PYTHONPATH={pythonpath}"
 Restart=always
 RestartSec=5
 RestartMaxDelaySec=300
@@ -3013,6 +3017,7 @@ def generate_launchd_plist() -> str:
     # _stable_service_working_dir() for the rationale (same rot risk applies
     # to launchd's WorkingDirectory as to systemd's).
     working_dir = _stable_service_working_dir()
+    pythonpath = str(PROJECT_ROOT)
     hermes_home = str(get_hermes_home().resolve())
     log_dir = get_hermes_home() / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -3080,6 +3085,8 @@ def generate_launchd_plist() -> str:
         <string>{venv_dir}</string>
         <key>HERMES_HOME</key>
         <string>{hermes_home}</string>
+        <key>PYTHONPATH</key>
+        <string>{pythonpath}</string>
     </dict>
     
     <key>RunAtLoad</key>

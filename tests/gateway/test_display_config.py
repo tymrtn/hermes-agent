@@ -436,3 +436,56 @@ class TestCleanupProgress:
                 }
             }
             assert resolve_display_setting(config, "telegram", "cleanup_progress") is True, val
+
+    def test_retention_policy_defaults_to_immediate_cleanup(self):
+        """No retention config preserves legacy post-delivery cleanup."""
+        from gateway.display_config import resolve_display_setting
+
+        assert resolve_display_setting({}, "telegram", "cleanup_progress_idle_seconds") == 0
+        assert resolve_display_setting({}, "telegram", "cleanup_progress_max_exchanges") == 0
+
+    def test_retention_policy_normalises_numeric_strings(self):
+        """Idle seconds and exchange thresholds are configurable per platform."""
+        from gateway.display_config import resolve_display_setting
+
+        config = {
+            "display": {
+                "cleanup_progress_idle_seconds": "60",
+                "cleanup_progress_max_exchanges": "10",
+                "platforms": {
+                    "telegram": {
+                        "cleanup_progress_idle_seconds": "300.5",
+                        "cleanup_progress_max_exchanges": "5",
+                    }
+                },
+            }
+        }
+        assert resolve_display_setting(config, "telegram", "cleanup_progress_idle_seconds") == 300.5
+        assert resolve_display_setting(config, "telegram", "cleanup_progress_max_exchanges") == 5
+        assert resolve_display_setting(config, "discord", "cleanup_progress_idle_seconds") == 60.0
+        assert resolve_display_setting(config, "discord", "cleanup_progress_max_exchanges") == 10
+
+    def test_retention_policy_clamps_invalid_values_to_zero(self):
+        """Invalid or negative values fall back to disabled thresholds."""
+        from gateway.display_config import resolve_display_setting
+
+        config = {
+            "display": {
+                "cleanup_progress_idle_seconds": "nope",
+                "cleanup_progress_max_exchanges": -4,
+            }
+        }
+        assert resolve_display_setting(config, "telegram", "cleanup_progress_idle_seconds") == 0.0
+        assert resolve_display_setting(config, "telegram", "cleanup_progress_max_exchanges") == 0
+
+    def test_reset_trigger_is_configurable(self):
+        """Session reset/new cleanup can be disabled per platform."""
+        from gateway.display_config import resolve_display_setting
+
+        assert resolve_display_setting({}, "telegram", "cleanup_progress_on_reset") is True
+        config = {
+            "display": {
+                "platforms": {"telegram": {"cleanup_progress_on_reset": "off"}},
+            }
+        }
+        assert resolve_display_setting(config, "telegram", "cleanup_progress_on_reset") is False

@@ -126,6 +126,31 @@ _GATEWAY_PROVIDER_POLICY_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Tools that render their own interactive gateway surface must not also
+# produce ordinary tool-progress bubbles.  ``clarify`` already sends a prompt
+# with platform-native buttons; showing "clarify: <question>" underneath is a
+# duplicate, and on mobile it looks like the bot asked twice.
+_TOOL_PROGRESS_SUPPRESSED_TOOLS = frozenset({"clarify"})
+_SUPPRESSED_STATUS_ACTION_MARKERS = ("waiting for user clarify response",)
+
+
+def _suppress_gateway_tool_progress(tool_name: Optional[str]) -> bool:
+    """Return True when a tool's own UI replaces gateway progress text."""
+    if not tool_name:
+        return False
+    return str(tool_name).strip().lower() in _TOOL_PROGRESS_SUPPRESSED_TOOLS
+
+
+def _suppress_gateway_status_action(action: Optional[str]) -> bool:
+    """Return True when a heartbeat/status detail would duplicate tool UI."""
+    if not action:
+        return False
+    action_text = str(action).strip()
+    if _suppress_gateway_tool_progress(action_text):
+        return True
+    folded = action_text.casefold()
+    return any(marker in folded for marker in _SUPPRESSED_STATUS_ACTION_MARKERS)
+
 _GATEWAY_AUTH_ERROR_RE = re.compile(
     r"(provider\s+authentication\s+failed|incorrect\s+api\s+key|invalid\s+api\s+key|\b401\b)",
     re.IGNORECASE,
@@ -443,6 +468,13 @@ def _telegramize_command_mentions(text: str, platform: Any) -> str:
 # ``config.yaml`` ``agent.gateway_auto_continue_freshness``.
 _AUTO_CONTINUE_FRESHNESS_SECS_DEFAULT = 60 * 60
 
+# Near-immediate follow-ups usually mean "I fat-fingered that" rather than
+# "please wait until the current turn completes, then do another task".
+# Treat them as an implicit interrupt even when the profile's normal busy
+# text mode is queue. Keep the window deliberately short to avoid surprising
+# users who are legitimately adding context after the thought has settled.
+_EARLY_FOLLOWUP_AUTO_INTERRUPT_SECS = 6.0
+
 
 def _coerce_gateway_timestamp(value: Any) -> Optional[float]:
     """Best-effort conversion of stored gateway timestamps to epoch seconds.
@@ -510,6 +542,26 @@ def _float_env(name: str, default: float) -> float:
         return float(raw)
     except (TypeError, ValueError):
         return float(default)
+
+
+def _is_early_followup_auto_interrupt(
+    started_at: Any,
+    event_timestamp: Any,
+    *,
+    window_secs: float = _EARLY_FOLLOWUP_AUTO_INTERRUPT_SECS,
+) -> bool:
+    """Return True when a busy follow-up is close enough to be a correction."""
+    window = float(window_secs)
+    if window <= 0:
+        return False
+    start_ts = _coerce_gateway_timestamp(started_at)
+    if start_ts is None:
+        return False
+    current_ts = _coerce_gateway_timestamp(event_timestamp)
+    if current_ts is None:
+        current_ts = time.time()
+    elapsed = current_ts - start_ts
+    return 0 <= elapsed <= window
 
 
 def _is_fresh_gateway_interruption(
@@ -1975,6 +2027,13 @@ class GatewayRunner:
         # cleanup must clear all of them, not just the most recent.
         self._busy_control_bubble_ids: Dict[str, List[str]] = {}
 
+        # Per-session delayed cleanup for Telegram/gateway meta bubbles.
+        # ``cleanup_progress_idle_seconds`` lets us collect tool/status noise
+        # across a burst of turns and delete it only after the conversation
+        # goes quiet, rather than making the transcript jump while the user is
+        # actively interacting.
+        self._meta_cleanup_pending: Dict[str, Dict[str, Any]] = {}
+
         # Per-session FIFO of follow-up MessageEvents that arrived while
         # the agent was busy.  A button tap acts on ALL of them — texts
         # are joined, the chosen primitive fires once, and a reaction is
@@ -2002,6 +2061,11 @@ class GatewayRunner:
         # Per-session reasoning effort overrides from /reasoning.
         # Key: session_key, Value: parsed reasoning config dict.
         self._session_reasoning_overrides: Dict[str, Dict[str, Any]] = {}
+        # Per-session operating-mode skill selected by /mac or /phone.
+        # Unlike one-shot skill slash commands, these are meant to stay active
+        # for follow-up turns so Tyler can switch delivery rails without
+        # repeating the skill name before every prompt.
+        self._session_mode_skills: Dict[str, str] = {}
         self._kanban_notifier_profile = self._active_profile_name()
         # Teams meeting pipeline runtime (bound later when msgraph_webhook adapter exists).
         self._teams_pipeline_runtime = None
@@ -3502,6 +3566,25 @@ class GatewayRunner:
 
         effective_mode = self._busy_input_mode
         busy_text_mode = getattr(self, "__dict__", {}).get("_busy_text_mode", "interrupt")
+        early_followup_auto_interrupt = (
+            event.message_type == MessageType.TEXT
+            and not event.is_command()
+            and running_agent
+            and running_agent is not _AGENT_PENDING_SENTINEL
+            and _is_early_followup_auto_interrupt(
+                self._running_agents_ts.get(session_key),
+                getattr(event, "timestamp", None),
+            )
+        )
+        if early_followup_auto_interrupt:
+            logger.info(
+                "Auto-interrupting busy session %s for near-immediate follow-up "
+                "within %.1fs correction window",
+                session_key,
+                _EARLY_FOLLOWUP_AUTO_INTERRUPT_SECS,
+            )
+            effective_mode = "interrupt"
+            busy_text_mode = "interrupt"
         if (
             event.message_type == MessageType.TEXT
             and busy_text_mode == "queue"
@@ -4214,6 +4297,240 @@ class GatewayRunner:
 
         if followups is not None:
             followups.pop(session_key, None)
+
+    def _pause_meta_cleanup_for_session(self, session_key: Optional[str]) -> None:
+        """Pause any idle cleanup timer while a fresh turn is running."""
+        if not session_key:
+            return
+        pending = getattr(self, "_meta_cleanup_pending", None)
+        if not isinstance(pending, dict):
+            return
+        entry = pending.get(session_key)
+        if not entry:
+            return
+        fut = entry.get("future")
+        if fut is not None:
+            try:
+                fut.cancel()
+            except Exception:
+                pass
+            entry["future"] = None
+        entry["paused"] = True
+
+    def _resume_paused_meta_cleanup_for_session(
+        self,
+        session_key: Optional[str],
+        *,
+        loop: asyncio.AbstractEventLoop,
+        idle_seconds: float = 0.0,
+        max_exchanges: int = 0,
+    ) -> None:
+        """Re-arm a paused idle cleanup even when the next turn has no bubbles."""
+        if not session_key:
+            return
+        pending = getattr(self, "_meta_cleanup_pending", None)
+        if not isinstance(pending, dict):
+            return
+        entry = pending.get(session_key)
+        if not entry or not entry.get("ids") or entry.get("future") is not None:
+            return
+        try:
+            idle_delay = max(0.0, float(idle_seconds or 0.0))
+        except Exception:
+            idle_delay = 0.0
+        try:
+            exchange_limit = max(0, int(max_exchanges or 0))
+        except Exception:
+            exchange_limit = 0
+        if exchange_limit and int(entry.get("exchanges") or 0) < exchange_limit and idle_delay <= 0:
+            entry["paused"] = False
+            return
+        delay = 0.0 if exchange_limit and int(entry.get("exchanges") or 0) >= exchange_limit else idle_delay
+        entry["token"] = int(entry.get("token") or 0) + 1
+        token = entry["token"]
+        entry["paused"] = False
+
+        async def _delete_when_current() -> None:
+            try:
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                current = pending.get(session_key)
+                if not current or current.get("token") != token:
+                    return
+                pending.pop(session_key, None)
+                delete_adapter = current.get("adapter")
+                delete_chat_id = current.get("chat_id")
+                delete_ids = list(current.get("ids") or [])
+                for mid in delete_ids:
+                    try:
+                        await delete_adapter.delete_message(delete_chat_id, mid)
+                    except Exception:
+                        pass
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.debug("Meta message cleanup failed for %s: %s", session_key, exc)
+
+        entry["future"] = safe_schedule_threadsafe(
+            _delete_when_current(),
+            loop,
+            logger=logger,
+            log_message="Meta message cleanup scheduling error",
+        )
+
+    async def _flush_meta_cleanup_for_session(
+        self,
+        session_key: Optional[str],
+        *,
+        platform_key: str = "",
+        force: bool = False,
+    ) -> None:
+        """Immediately delete any pending meta bubbles for a reset session."""
+        if not session_key:
+            return
+        if not force:
+            try:
+                user_config = _load_gateway_config()
+            except Exception:
+                user_config = {}
+            try:
+                from gateway.display_config import resolve_display_setting
+                if not bool(
+                    resolve_display_setting(
+                        user_config,
+                        platform_key,
+                        "cleanup_progress_on_reset",
+                        True,
+                    )
+                ):
+                    return
+            except Exception:
+                pass
+        pending = getattr(self, "_meta_cleanup_pending", None)
+        if not isinstance(pending, dict):
+            return
+        entry = pending.pop(session_key, None)
+        if not entry:
+            return
+        fut = entry.get("future")
+        if fut is not None:
+            try:
+                fut.cancel()
+            except Exception:
+                pass
+        adapter = entry.get("adapter")
+        chat_id = entry.get("chat_id")
+        if adapter is None or not chat_id:
+            return
+        for mid in list(entry.get("ids") or []):
+            try:
+                await adapter.delete_message(chat_id, str(mid))
+            except Exception:
+                pass
+
+    def _schedule_meta_message_cleanup(
+        self,
+        *,
+        session_key: Optional[str],
+        chat_id: str,
+        adapter: Any,
+        message_ids: List[str],
+        loop: asyncio.AbstractEventLoop,
+        idle_seconds: float = 0.0,
+        max_exchanges: int = 0,
+    ) -> None:
+        """Delete accumulated gateway meta messages after idle/turn thresholds.
+
+        This powers Telegram history condensation: progress/status bubbles are
+        useful live, but become transcript barnacles after the final answer.
+        We only delete bot-owned messages that were explicitly tracked by the
+        cleanup_progress path; user messages and final assistant answers are
+        never touched.
+        """
+        if not session_key or not message_ids or adapter is None:
+            return
+        if type(adapter).delete_message is BasePlatformAdapter.delete_message:
+            return
+
+        pending = getattr(self, "_meta_cleanup_pending", None)
+        if not isinstance(pending, dict):
+            pending = {}
+            self._meta_cleanup_pending = pending
+
+        entry = pending.setdefault(
+            session_key,
+            {
+                "chat_id": chat_id,
+                "adapter": adapter,
+                "ids": [],
+                "exchanges": 0,
+                "future": None,
+                "token": 0,
+            },
+        )
+        entry["chat_id"] = chat_id
+        entry["adapter"] = adapter
+        ids = entry.setdefault("ids", [])
+        seen = set(str(mid) for mid in ids)
+        for mid in message_ids:
+            smid = str(mid)
+            if smid and smid not in seen:
+                ids.append(smid)
+                seen.add(smid)
+        entry["exchanges"] = int(entry.get("exchanges") or 0) + 1
+        entry["token"] = int(entry.get("token") or 0) + 1
+
+        old_future = entry.get("future")
+        if old_future is not None:
+            try:
+                old_future.cancel()
+            except Exception:
+                pass
+
+        try:
+            idle_delay = max(0.0, float(idle_seconds or 0.0))
+        except Exception:
+            idle_delay = 0.0
+        try:
+            exchange_limit = max(0, int(max_exchanges or 0))
+        except Exception:
+            exchange_limit = 0
+        if exchange_limit and entry["exchanges"] < exchange_limit and idle_delay <= 0:
+            # Exchange-count-only mode: retain the accumulated ids until the
+            # Nth successful cleanup-tracked turn.  With no idle delay there
+            # is intentionally no timer to schedule yet.
+            entry["future"] = None
+            return
+        delay = 0.0 if exchange_limit and entry["exchanges"] >= exchange_limit else idle_delay
+        token = entry["token"]
+
+        async def _delete_when_current() -> None:
+            try:
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                current = pending.get(session_key)
+                if not current or current.get("token") != token:
+                    return
+                pending.pop(session_key, None)
+                delete_adapter = current.get("adapter")
+                delete_chat_id = current.get("chat_id")
+                delete_ids = list(current.get("ids") or [])
+                for mid in delete_ids:
+                    try:
+                        await delete_adapter.delete_message(delete_chat_id, mid)
+                    except Exception:
+                        pass
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.debug("Meta message cleanup failed for %s: %s", session_key, exc)
+
+        entry["future"] = safe_schedule_threadsafe(
+            _delete_when_current(),
+            loop,
+            logger=logger,
+            log_message="Meta message cleanup scheduling error",
+        )
 
     async def _drain_active_agents(self, timeout: float) -> tuple[Dict[str, Any], bool]:
         snapshot = self._snapshot_running_agents()
@@ -9082,6 +9399,17 @@ class GatewayRunner:
                         cmd_key, user_instruction, task_id=_quick_key
                     )
                     if msg:
+                        _mode_skill = str(_skill_name or "").strip().lower()
+                        if _mode_skill in {"mac", "phone"}:
+                            _mode_skills = getattr(self, "_session_mode_skills", None)
+                            if _mode_skills is None:
+                                _mode_skills = self._session_mode_skills = {}
+                            _mode_skills[_quick_key] = _mode_skill
+                            logger.info(
+                                "Gateway session %s switched operating-mode skill to %s",
+                                _quick_key,
+                                _mode_skill,
+                            )
                         event.text = msg
                         # Fall through to normal message processing with skill content
                 else:
@@ -9565,6 +9893,8 @@ class GatewayRunner:
             # or a queued "/model switched" note.
             self._session_model_overrides.pop(session_key, None)
             self._set_session_reasoning_override(session_key, None)
+            if hasattr(self, "_session_mode_skills"):
+                self._session_mode_skills.pop(session_key, None)
             if hasattr(self, "_pending_model_notes"):
                 self._pending_model_notes.pop(session_key, None)
         
@@ -9746,6 +10076,8 @@ class GatewayRunner:
                     )
             except Exception as e:
                 logger.warning("[Gateway] Failed to auto-load skill(s) %s: %s", _skill_names, e)
+
+        self._maybe_apply_session_mode_skill(event, session_key, _quick_key)
 
         # Load conversation history from transcript
         history = self.session_store.load_transcript(session_entry.session_id)
@@ -10725,12 +11057,57 @@ class GatewayRunner:
 
         return "\n".join(lines)
 
+    def _maybe_apply_session_mode_skill(
+        self,
+        event: MessageEvent,
+        session_key: str,
+        task_id: str,
+    ) -> bool:
+        """Inject the session's persistent /mac or /phone skill on plain turns.
+
+        A direct /mac or /phone slash command is still a normal skill command;
+        this helper handles subsequent ordinary messages in the same session.
+        """
+        _mode_skills = getattr(self, "_session_mode_skills", {})
+        _mode_skill = _mode_skills.get(session_key) if isinstance(_mode_skills, dict) else None
+        if _mode_skill not in {"mac", "phone"}:
+            return False
+        if event.get_command():
+            return False
+        try:
+            from agent.skill_commands import build_skill_invocation_message
+            _mode_msg = build_skill_invocation_message(
+                f"/{_mode_skill}",
+                event.text or "",
+                task_id=task_id,
+                runtime_note=(
+                    f'Tyler previously switched this gateway session into /{_mode_skill} mode. '
+                    "Apply this mode to the current user message."
+                ),
+            )
+            if not _mode_msg:
+                return False
+            event.text = _mode_msg
+            return True
+        except Exception as e:
+            logger.debug(
+                "Gateway failed to auto-load session mode skill %s for %s: %s",
+                _mode_skill,
+                session_key,
+                e,
+            )
+            return False
+
     async def _handle_reset_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
         """Handle /new or /reset command."""
         source = event.source
         
         # Get existing session key
         session_key = self._session_key_for_source(source)
+        await self._flush_meta_cleanup_for_session(
+            session_key,
+            platform_key=_platform_config_key(source.platform),
+        )
         self._invalidate_session_run_generation(session_key, reason="session_reset")
 
         # Snapshot the old entry so on_session_finalize can report the
@@ -10775,6 +11152,8 @@ class GatewayRunner:
         # picks up configured defaults instead of previous session switches.
         self._session_model_overrides.pop(session_key, None)
         self._set_session_reasoning_override(session_key, None)
+        if hasattr(self, "_session_mode_skills"):
+            self._session_mode_skills.pop(session_key, None)
         if hasattr(self, "_pending_model_notes"):
             self._pending_model_notes.pop(session_key, None)
 
@@ -13035,7 +13414,10 @@ class GatewayRunner:
             response,
             metadata=metadata,
         )
-        if response:
+        # ``event`` may be None when the queued turn came from a leftover
+        # /steer rather than a dequeued message event — text delivery above
+        # must still happen; only reply-anchored media delivery needs it.
+        if response and event is not None:
             await self._deliver_media_from_response(
                 response,
                 event,
@@ -17771,6 +18153,30 @@ class GatewayRunner:
         _cleanup_progress = bool(
             resolve_display_setting(user_config, platform_key, "cleanup_progress")
         )
+        try:
+            _cleanup_idle_seconds = float(
+                resolve_display_setting(
+                    user_config,
+                    platform_key,
+                    "cleanup_progress_idle_seconds",
+                    0,
+                ) or 0
+            )
+        except Exception:
+            _cleanup_idle_seconds = 0.0
+        try:
+            _cleanup_max_exchanges = int(
+                resolve_display_setting(
+                    user_config,
+                    platform_key,
+                    "cleanup_progress_max_exchanges",
+                    0,
+                ) or 0
+            )
+        except Exception:
+            _cleanup_max_exchanges = 0
+        if _cleanup_progress and session_key and (_cleanup_idle_seconds > 0 or _cleanup_max_exchanges > 0):
+            self._pause_meta_cleanup_for_session(session_key)
         _cleanup_adapter = self.adapters.get(source.platform) if _cleanup_progress else None
         if _cleanup_adapter is not None and (
             type(_cleanup_adapter).delete_message is BasePlatformAdapter.delete_message
@@ -17787,6 +18193,9 @@ class GatewayRunner:
         def progress_callback(event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
             """Callback invoked by agent on tool lifecycle events."""
             if not progress_queue or not _run_still_current():
+                return
+
+            if _suppress_gateway_tool_progress(tool_name):
                 return
 
             # First-touch onboarding: the first time a tool takes longer than
@@ -19364,7 +19773,7 @@ class GatewayRunner:
                                 f"iteration {_a['api_call_count']}/{_a['max_iterations']}"
                             )
                         _action = _a.get("current_tool") or _a.get("last_activity_desc")
-                        if _action:
+                        if _action and not _suppress_gateway_status_action(_action):
                             _parts.append(str(_action))
                         if _parts:
                             _status_detail = " — " + ", ".join(_parts)
@@ -19719,10 +20128,18 @@ class GatewayRunner:
                                 "Queued follow-up for session %s: final stream delivery not confirmed; sending first response before continuing.",
                                 session_key or "?",
                             )
+                            # ``pending_event`` (the dequeued follow-up) is the
+                            # only MessageEvent in _run_agent scope — the original
+                            # inbound event is not threaded this deep.  It may be
+                            # None on the leftover-/steer path; the helper guards
+                            # media delivery accordingly.  (A bare ``event`` here
+                            # raised NameError on every queued follow-up, silently
+                            # dropping the first response — seen 5x in gateway.log
+                            # 2026-06-09 → 2026-06-12.)
                             await self._send_first_response_before_queued_followup(
                                 adapter=adapter,
                                 source=source,
-                                event=event,
+                                event=pending_event,
                                 response=first_response,
                                 metadata=_status_thread_metadata,
                             )
@@ -19960,10 +20377,8 @@ class GatewayRunner:
         if (
             _cleanup_progress
             and _cleanup_adapter is not None
-            and _cleanup_msg_ids
             and session_key
             and isinstance(response, dict)
-            and not response.get("failed")
             and hasattr(_cleanup_adapter, "register_post_delivery_callback")
         ):
             _ids_snapshot = list(_cleanup_msg_ids)
@@ -19972,29 +20387,43 @@ class GatewayRunner:
             _loop_snapshot = asyncio.get_running_loop()
 
             def _cleanup_temp_bubbles() -> None:
-                async def _delete_all() -> None:
-                    for _mid in _ids_snapshot:
-                        try:
-                            await _adapter_snapshot.delete_message(
-                                _chat_id_snapshot, _mid
-                            )
-                        except Exception:
-                            pass
                 try:
-                    safe_schedule_threadsafe(
-                        _delete_all(), _loop_snapshot,
-                        logger=logger,
-                        log_message="Temp bubble cleanup scheduling error",
-                    )
+                    if _ids_snapshot and not response.get("failed"):
+                        self._schedule_meta_message_cleanup(
+                            session_key=session_key,
+                            chat_id=_chat_id_snapshot,
+                            adapter=_adapter_snapshot,
+                            message_ids=_ids_snapshot,
+                            loop=_loop_snapshot,
+                            idle_seconds=_cleanup_idle_seconds,
+                            max_exchanges=_cleanup_max_exchanges,
+                        )
+                    else:
+                        self._resume_paused_meta_cleanup_for_session(
+                            session_key,
+                            loop=_loop_snapshot,
+                            idle_seconds=_cleanup_idle_seconds,
+                            max_exchanges=_cleanup_max_exchanges,
+                        )
                 except Exception:
                     pass
 
             try:
-                _cleanup_adapter.register_post_delivery_callback(
-                    session_key,
-                    _cleanup_temp_bubbles,
-                    generation=run_generation,
-                )
+                _should_register_cleanup = bool(_ids_snapshot and not response.get("failed"))
+                if not _should_register_cleanup:
+                    _pending = getattr(self, "_meta_cleanup_pending", {})
+                    _pending_entry = _pending.get(session_key) if isinstance(_pending, dict) else None
+                    _should_register_cleanup = bool(
+                        _pending_entry
+                        and _pending_entry.get("ids")
+                        and _pending_entry.get("future") is None
+                    )
+                if _should_register_cleanup:
+                    _cleanup_adapter.register_post_delivery_callback(
+                        session_key,
+                        _cleanup_temp_bubbles,
+                        generation=run_generation,
+                    )
             except Exception as _rpe:
                 logger.debug("Post-delivery cleanup registration failed: %s", _rpe)
 
