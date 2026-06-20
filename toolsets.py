@@ -71,6 +71,8 @@ _HERMES_CORE_TOOLS = [
     "kanban_unblock",
     # Computer use (macOS, gated on cua-driver being installed via check_fn)
     "computer_use",
+    # Local macOS Messages/iMessage search (opt-in; gated by IMESSAGE_SEARCH_ENABLED).
+    "imessage_search",
 ]
 
 # Webhook events may originate from untrusted third-party content (for example,
@@ -147,6 +149,12 @@ TOOLSETS = {
             "or keyboard focus. Works with any tool-capable model."
         ),
         "tools": ["computer_use"],
+        "includes": []
+    },
+
+    "imessage": {
+        "description": "Read-only local macOS Messages/iMessage/SMS search. Requires IMESSAGE_SEARCH_ENABLED=true and Full Disk Access.",
+        "tools": ["imessage_search"],
         "includes": []
     },
 
