@@ -458,6 +458,13 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
     """
     if not text:
         return text
+    # The agent loop uses this local status string when a turn is cancelled
+    # while blocked on the provider. It is cancellation metadata, not assistant
+    # prose. ACP already suppresses it; gateway surfaces should do the same so
+    # mobile users do not receive cryptic internal "Operation interrupted"
+    # messages after busy-session interrupts.
+    if str(text).startswith("Operation interrupted: waiting for model response ("):
+        return ""
     if _gateway_platform_value(platform) != "telegram":
         return text
 

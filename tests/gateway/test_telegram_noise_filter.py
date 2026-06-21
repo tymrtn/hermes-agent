@@ -83,6 +83,14 @@ def test_telegram_final_response_keeps_normal_answers():
     assert _sanitize_gateway_final_response(Platform.TELEGRAM, answer) == answer
 
 
+def test_gateway_final_response_suppresses_interrupt_status_metadata():
+    """Provider-wait interrupt status is metadata, not user-facing prose."""
+    status = "Operation interrupted: waiting for model response (0.4s elapsed)."
+
+    assert _sanitize_gateway_final_response(Platform.TELEGRAM, status) == ""
+    assert _sanitize_gateway_final_response(Platform.DISCORD, status) == ""
+
+
 def test_telegram_final_response_links_kanban_card_ids(monkeypatch):
     """Kanban card mentions in Telegram should deeplink to the local dashboard."""
     monkeypatch.delenv("HERMES_DASHBOARD_PUBLIC_URL", raising=False)
