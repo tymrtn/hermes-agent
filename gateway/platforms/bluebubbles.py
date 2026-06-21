@@ -244,16 +244,6 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         self.client = httpx.AsyncClient(timeout=30.0, limits=platform_httpx_limits())
         try:
             await self._api_get("/api/v1/ping")
-            info = await self._api_get("/api/v1/server/info")
-            server_data = (info or {}).get("data", {})
-            self._private_api_enabled = bool(server_data.get("private_api"))
-            self._helper_connected = bool(server_data.get("helper_connected"))
-            logger.info(
-                "[bluebubbles] connected to %s (private_api=%s, helper=%s)",
-                self.server_url,
-                self._private_api_enabled,
-                self._helper_connected,
-            )
         except Exception as exc:
             logger.error(
                 "[bluebubbles] cannot reach server at %s: %s", self.server_url, exc
@@ -262,6 +252,31 @@ class BlueBubblesAdapter(BasePlatformAdapter):
                 await self.client.aclose()
                 self.client = None
             return False
+
+        try:
+            info = await self._api_get("/api/v1/server/info")
+            server_data = (info or {}).get("data", {})
+            self._private_api_enabled = bool(server_data.get("private_api"))
+            self._helper_connected = bool(server_data.get("helper_connected"))
+        except Exception as exc:
+            # Some BlueBubbles installs expose the core REST/webhook endpoints
+            # while /server/info returns 500 (usually helper/private-API state).
+            # Basic messaging and webhook registration can still work, so do
+            # not fail the whole platform on optional capability discovery.
+            self._private_api_enabled = False
+            self._helper_connected = False
+            logger.warning(
+                "[bluebubbles] server info unavailable at %s: %s; continuing with basic messaging",
+                self.server_url,
+                exc,
+            )
+
+        logger.info(
+            "[bluebubbles] connected to %s (private_api=%s, helper=%s)",
+            self.server_url,
+            self._private_api_enabled,
+            self._helper_connected,
+        )
 
         app = web.Application()
         app.router.add_get("/health", lambda _: web.Response(text="ok"))

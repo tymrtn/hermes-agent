@@ -641,6 +641,56 @@ class TestBlueBubblesWebhookRegistration:
             {"get": mock_get, "post": mock_post, "delete": mock_delete},
         )()
 
+    # -- connect --
+
+    @pytest.mark.asyncio
+    async def test_connect_continues_when_server_info_fails(self, monkeypatch):
+        """Ping is the connectivity gate; /server/info is optional capability discovery."""
+        from gateway.platforms import bluebubbles as bb
+        from aiohttp import web
+
+        adapter = _make_adapter(monkeypatch)
+        calls = []
+
+        async def fake_api_get(path):
+            calls.append(path)
+            if path == "/api/v1/ping":
+                return {"status": 200, "data": "pong"}
+            if path == "/api/v1/server/info":
+                raise RuntimeError("server info 500")
+            return {"status": 200, "data": []}
+
+        async def fake_register():
+            calls.append("register")
+            return True
+
+        class FakeRunner:
+            async def setup(self):
+                calls.append("runner.setup")
+            async def cleanup(self):
+                calls.append("runner.cleanup")
+
+        class FakeSite:
+            def __init__(self, *args, **kwargs):
+                pass
+            async def start(self):
+                calls.append("site.start")
+
+        class FakeClient:
+            async def aclose(self):
+                calls.append("client.close")
+
+        monkeypatch.setattr(bb.httpx, "AsyncClient", lambda *a, **k: FakeClient())
+        monkeypatch.setattr(web, "AppRunner", lambda app, access_log=None: FakeRunner())
+        monkeypatch.setattr(web, "TCPSite", FakeSite)
+        adapter._api_get = fake_api_get
+        adapter._register_webhook = fake_register
+
+        assert await adapter.connect() is True
+        assert adapter._private_api_enabled is False
+        assert adapter._helper_connected is False
+        assert "register" in calls
+
     # -- _find_registered_webhooks --
 
     def test_find_registered_webhooks_returns_matches(self, monkeypatch):
