@@ -625,7 +625,7 @@ _AUTO_CONTINUE_FRESHNESS_SECS_DEFAULT = 60 * 60
 # Treat them as an implicit interrupt even when the profile's normal busy
 # text mode is queue. Keep the window deliberately short to avoid surprising
 # users who are legitimately adding context after the thought has settled.
-_EARLY_FOLLOWUP_AUTO_INTERRUPT_SECS = 6.0
+_EARLY_FOLLOWUP_AUTO_INTERRUPT_SECS = 10.0
 
 
 def _coerce_gateway_timestamp(value: Any) -> Optional[float]:
@@ -4520,15 +4520,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass  # don't let interrupt failure block the ack
 
         # Track this follow-up for the button-tap path (a tap acts on every
-        # follow-up that arrived during the current busy turn) and ensure
-        # the [/steer][/interrupt][/stop] keyboard is attached to the
-        # active tool bubble — or a standalone control bubble if no tool
-        # has fired yet.  Best-effort: failures are logged and don't block
-        # the busy ack.
+        # follow-up that arrived during the current busy turn).  For queue and
+        # steer flows, also ensure the [/steer][/interrupt][/stop] keyboard is
+        # attached to the active tool bubble — or a standalone control bubble if
+        # no tool has fired yet.  Plain interrupt flow does not need a control
+        # bubble; acknowledge it with a lightning reaction on the user's message
+        # instead of adding another Telegram chat bubble.
         try:
             _pf = getattr(self, "_pending_followups", None)
             if _pf is not None:
                 _pf.setdefault(session_key, []).append(event)
+        except Exception as _bs_err:
+            logger.debug("Busy-session follow-up tracking failed for %s: %s", session_key, _bs_err)
+
+        if effective_mode == "interrupt" and not is_queue_mode and not is_steer_mode:
+            try:
+                if hasattr(adapter, "set_busy_reaction"):
+                    reacted = await adapter.set_busy_reaction(event, REACTION_INTERRUPT)
+                    if reacted:
+                        self._busy_ack_ts[session_key] = time.time()
+                        return True
+            except Exception as _react_err:
+                logger.debug("Busy-session interrupt reaction failed for %s: %s", session_key, _react_err)
+
+        try:
             await self._ensure_busy_session_controls(session_key, event)
         except Exception as _bs_err:
             logger.debug("Busy-session control attach failed for %s: %s", session_key, _bs_err)

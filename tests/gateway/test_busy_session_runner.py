@@ -194,11 +194,12 @@ class TestHaltPhrasePreflight:
 
 class TestEarlyCorrectionAutoInterrupt:
     @pytest.mark.asyncio
-    async def test_text_followup_within_six_seconds_interrupts_even_in_queue_mode(self):
+    async def test_text_followup_within_ten_seconds_interrupts_even_in_queue_mode(self):
         """A near-immediate second message is usually a typo correction.
 
         It should interrupt the active turn automatically instead of waiting
-        behind the queued-mode button flow.
+        behind the queued-mode button flow, and Telegram should acknowledge the
+        interrupt with a lightning reaction instead of a chat bubble.
         """
         from gateway.run import GatewayRunner
 
@@ -212,13 +213,38 @@ class TestEarlyCorrectionAutoInterrupt:
 
         agent = MagicMock()
         runner._running_agents[sk] = agent
-        runner._running_agents_ts[sk] = time.time() - 5.0
+        runner._running_agents_ts[sk] = time.time() - 9.5
 
         result = await GatewayRunner._handle_active_session_busy_message(runner, event, sk)
 
         assert result is True
         agent.interrupt.assert_called_once_with("correction: use the other branch")
         assert adapter._pending_messages[sk] is event
+        adapter.set_busy_reaction.assert_awaited_once_with(event, REACTION_INTERRUPT)
+        adapter._send_with_retry.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_text_followup_after_ten_seconds_stays_queued_in_queue_mode(self):
+        """After the correction window, queue-mode text should show controls."""
+        from gateway.run import GatewayRunner
+
+        runner, _ = _make_runner()
+        runner._busy_input_mode = "queue"
+        runner._busy_text_mode = "queue"
+        adapter = _make_adapter()
+        event = _make_event(text="additional context for later")
+        sk = build_session_key(event.source)
+        runner.adapters[event.source.platform] = adapter
+
+        agent = MagicMock()
+        runner._running_agents[sk] = agent
+        runner._running_agents_ts[sk] = time.time() - 10.5
+
+        result = await GatewayRunner._handle_active_session_busy_message(runner, event, sk)
+
+        assert result is False
+        agent.interrupt.assert_not_called()
+        adapter.set_busy_reaction.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
