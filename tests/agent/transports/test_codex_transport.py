@@ -146,14 +146,19 @@ class TestCodexBuildKwargs:
         )
         assert kw.get("max_output_tokens") == 4096
 
-    def test_codex_backend_no_max_output_tokens(self, transport):
+    def test_codex_backend_preserves_max_output_tokens(self, transport):
+        """chatgpt.com/backend-api/codex can return status=incomplete
+        reason=max_output_tokens when the cap is omitted or too small. The
+        transport must forward the caller's cap so continuation retries can
+        actually increase the output budget.
+        """
         messages = [{"role": "user", "content": "Hi"}]
         kw = transport.build_kwargs(
             model="gpt-5.4", messages=messages, tools=[],
             max_tokens=4096,
             is_codex_backend=True,
         )
-        assert "max_output_tokens" not in kw
+        assert kw.get("max_output_tokens") == 4096
 
     def test_codex_backend_sets_cache_routing_headers(self, transport):
         """Codex backend sends session_id / x-client-request-id as HTTP

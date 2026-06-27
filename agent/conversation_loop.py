@@ -3788,8 +3788,22 @@ def run_conversation(
                         agent._emit_interim_assistant_message(interim_msg)
 
                 if agent._codex_incomplete_retries < 3:
+                    if incomplete_reason in {"max_output_tokens", "length"}:
+                        _codex_requested_cap = agent._requested_output_cap_from_api_kwargs(api_kwargs)
+                        _codex_boost_base = agent.max_tokens if agent.max_tokens else 4096
+                        _codex_boost = _codex_boost_base * (agent._codex_incomplete_retries + 1)
+                        if _codex_requested_cap is not None:
+                            _codex_boost = max(_codex_boost, _codex_requested_cap)
+                        _codex_boost_cap = max(32768, _codex_requested_cap or 0)
+                        agent._ephemeral_max_output_tokens = min(_codex_boost, _codex_boost_cap)
                     if not agent.quiet_mode:
-                        agent._vprint(f"{agent.log_prefix}↻ Codex response incomplete; continuing turn ({agent._codex_incomplete_retries}/3)")
+                        _cap_note = ""
+                        if getattr(agent, "_ephemeral_max_output_tokens", None) is not None:
+                            _cap_note = f" with max_output_tokens={agent._ephemeral_max_output_tokens:,}"
+                        agent._vprint(
+                            f"{agent.log_prefix}↻ Codex response incomplete; continuing turn "
+                            f"({agent._codex_incomplete_retries}/3){_cap_note}"
+                        )
                     agent._session_messages = messages
                     continue
 

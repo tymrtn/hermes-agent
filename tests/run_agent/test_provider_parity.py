@@ -526,14 +526,25 @@ class TestBuildApiKwargsCodex:
         kwargs = agent._build_api_kwargs(messages)
         assert kwargs["service_tier"] == "priority"
 
-    def test_omits_max_output_tokens_for_codex_backend(self, monkeypatch):
+    def test_includes_max_output_tokens_for_codex_backend(self, monkeypatch):
         agent = _make_agent(monkeypatch, "openai-codex", api_mode="codex_responses",
                             base_url="https://chatgpt.com/backend-api/codex")
         agent.model = "gpt-5.4"
         agent.max_tokens = 20
         messages = [{"role": "user", "content": "hi"}]
         kwargs = agent._build_api_kwargs(messages)
-        assert "max_output_tokens" not in kwargs
+        assert kwargs["max_output_tokens"] == 20
+
+    def test_codex_backend_uses_ephemeral_max_output_tokens(self, monkeypatch):
+        agent = _make_agent(monkeypatch, "openai-codex", api_mode="codex_responses",
+                            base_url="https://chatgpt.com/backend-api/codex")
+        agent.model = "gpt-5.4"
+        agent.max_tokens = 20
+        setattr(agent, "_ephemeral_max_output_tokens", 8192)
+        messages = [{"role": "user", "content": "hi"}]
+        kwargs = agent._build_api_kwargs(messages)
+        assert kwargs["max_output_tokens"] == 8192
+        assert getattr(agent, "_ephemeral_max_output_tokens") is None
 
     def test_includes_encrypted_content_in_include(self, monkeypatch):
         agent = _make_agent(monkeypatch, "openai-codex", api_mode="codex_responses",
