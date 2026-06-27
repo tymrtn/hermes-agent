@@ -121,7 +121,7 @@ _PATTERNS: List[Tuple[str, str, str]] = [
 INVISIBLE_CHARS = frozenset({
     '\u200b',  # zero-width space
     '\u200c',  # zero-width non-joiner
-    '\u200d',  # zero-width joiner
+    '\u200d',  # zero-width joiner (allowed only inside emoji ZWJ sequences)
     '\u2060',  # word joiner
     '\u2062',  # invisible times
     '\u2063',  # invisible separator
@@ -137,6 +137,59 @@ INVISIBLE_CHARS = frozenset({
     '\u2068',  # first strong isolate
     '\u2069',  # pop directional isolate
 })
+
+_EMOJI_VARIATION_SELECTOR = '\ufe0f'
+_EMOJI_MODIFIER_RANGE = range(0x1F3FB, 0x1F400)  # Fitzpatrick skin tones
+
+
+def _is_emoji_codepoint(ch: str) -> bool:
+    """Best-effort Extended_Pictographic check for emoji ZWJ validation.
+
+    Python's stdlib does not expose Unicode emoji properties.  These ranges
+    cover the codepoints used in standard emoji ZWJ sequences: pictographs in
+    the SMP plus BMP symbol blocks such as gender signs, hearts, and tools.
+    """
+    cp = ord(ch)
+    return (
+        0x1F000 <= cp <= 0x1FAFF  # SMP emoji / symbols / pictographs
+        or 0x2600 <= cp <= 0x27BF  # BMP misc symbols + dingbats
+        or cp in {0x2640, 0x2642}  # gender signs (kept explicit for clarity)
+    )
+
+
+def _previous_emoji_base(content: str, index: int) -> str | None:
+    i = index - 1
+    while i >= 0 and (
+        content[i] == _EMOJI_VARIATION_SELECTOR
+        or ord(content[i]) in _EMOJI_MODIFIER_RANGE
+    ):
+        i -= 1
+    if i >= 0 and _is_emoji_codepoint(content[i]):
+        return content[i]
+    return None
+
+
+def _next_emoji_base(content: str, index: int) -> str | None:
+    i = index + 1
+    while i < len(content) and content[i] == _EMOJI_VARIATION_SELECTOR:
+        i += 1
+    if i < len(content) and _is_emoji_codepoint(content[i]):
+        return content[i]
+    return None
+
+
+def _is_emoji_zwj(content: str, index: int) -> bool:
+    """Return True when U+200D joins two emoji bases.
+
+    U+200D is suspicious in prose (e.g. i‍g‍n‍o‍r‍e) but required for normal
+    Unicode emoji sequences like 🤸‍♀️, 👩🏽‍💻, and family emoji.  Treat only the
+    latter as harmless; every other zero-width joiner remains a finding.
+    """
+    return (
+        content[index] == '\u200d'
+        and _previous_emoji_base(content, index) is not None
+        and _next_emoji_base(content, index) is not None
+    )
 
 
 # Compiled pattern sets, indexed by scope.  Compiled once at import time;
@@ -206,11 +259,17 @@ def scan_for_threats(content: str, scope: str = "context") -> List[str]:
 
     findings: List[str] = []
 
-    # Invisible unicode — single pass through the content set, not 17
-    # ``in`` lookups.
-    char_set = set(content)
-    invisible_hits = char_set & INVISIBLE_CHARS
-    for ch in invisible_hits:
+    # Invisible unicode.  Most of these characters are never acceptable in
+    # privileged context.  U+200D is special: it is both a promptware hiding
+    # primitive in prose and the standard joiner for emoji sequences.  Allow it
+    # only when it is actually joining emoji bases.
+    seen_invisible: set[str] = set()
+    for index, ch in enumerate(content):
+        if ch not in INVISIBLE_CHARS or ch in seen_invisible:
+            continue
+        if ch == '\u200d' and _is_emoji_zwj(content, index):
+            continue
+        seen_invisible.add(ch)
         findings.append(f"invisible_unicode_U+{ord(ch):04X}")
 
     # Threat patterns
