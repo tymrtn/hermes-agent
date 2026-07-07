@@ -15,6 +15,7 @@ import os
 import html as _html
 import re
 import threading
+from collections import deque
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set, Any
 
@@ -594,6 +595,11 @@ class TelegramAdapter(BasePlatformAdapter):
         # Clarify button state: clarify_id → session_key (for the clarify tool's
         # multiple-choice prompts; see GatewayRunner clarify_callback wiring).
         self._clarify_state: Dict[str, str] = {}
+        # Recently resolved clarify ids — guards the double-tap race where a
+        # second tap lands after state was popped but before the message edit
+        # stripped the keyboard, so the late-reply injection can't duplicate
+        # an answer the agent already received.
+        self._recently_resolved_clarifies: "deque[str]" = deque(maxlen=64)
         # Notification mode for message sends.
         # "important" — only final responses, approvals, and slash confirmations
         #               trigger notifications; tool progress, streaming, status
@@ -4431,6 +4437,99 @@ class TelegramAdapter(BasePlatformAdapter):
             # Catch-all (e.g. page counter button "mx:noop")
             await query.answer()
 
+    def _recover_clarify_choice_text(self, query) -> Optional[str]:
+        """Recover the tapped button's label from the message's own inline keyboard.
+
+        Survives gateway restarts and ``clarify_timeout`` eviction: the
+        keyboard attached to the Telegram message still carries the choice
+        labels even after both ``_clarify_state`` and the clarify registry
+        are gone.
+        """
+        try:
+            markup = getattr(getattr(query, "message", None), "reply_markup", None)
+            rows = getattr(markup, "inline_keyboard", None)
+            if not rows:
+                return None
+            tapped = str(getattr(query, "data", "") or "")
+            if not tapped:
+                return None
+            for row in rows:
+                for btn in row:
+                    if str(getattr(btn, "callback_data", "") or "") == tapped:
+                        text = getattr(btn, "text", None)
+                        if text and str(text).strip():
+                            return str(text).strip()
+        except Exception:
+            return None
+        return None
+
+    async def _inject_late_clarify_reply(self, query, choice_text: str) -> bool:
+        """Deliver a late clarify tap as a fresh inbound user message.
+
+        The agent thread that asked the question is gone (timeout eviction or
+        gateway restart), so the tap cannot resolve the original clarify. The
+        user's decision is still valuable: wrap the question and the chosen
+        answer as a normal message event so the agent gets a new turn with
+        full context instead of the decision being discarded.
+        """
+        try:
+            from types import SimpleNamespace
+
+            message = getattr(query, "message", None)
+            user = getattr(query, "from_user", None)
+            chat = getattr(message, "chat", None)
+            if message is None or user is None or chat is None:
+                return False
+            question = str(getattr(message, "text", "") or "").lstrip("❓").strip()
+            if len(question) > 400:
+                question = question[:400] + "…"
+            synthetic = (
+                f'[Late reply to an expired choice prompt] The question was: "{question}"'
+                f" — my answer: {choice_text}"
+            )
+            shim = SimpleNamespace(
+                chat=chat,
+                from_user=user,
+                text=synthetic,
+                caption=None,
+                message_id=getattr(message, "message_id", None),
+                message_thread_id=getattr(message, "message_thread_id", None),
+                is_topic_message=bool(getattr(message, "is_topic_message", False)),
+                reply_to_message=None,
+                quote=None,
+                forward_origin=None,
+                is_automatic_forward=False,
+                # The tap is happening now; the original prompt's date is old.
+                date=datetime.now(timezone.utc),
+            )
+            event = self._build_message_event(shim, MessageType.TEXT)
+            self._enqueue_text_event(event)
+            return True
+        except Exception as exc:
+            logger.warning("[%s] late clarify injection failed: %s", self.name, exc)
+            return False
+
+    async def _confirm_late_clarify_delivery(
+        self, query, user_display: str, choice_text: str
+    ) -> None:
+        """Ack a late tap that was re-delivered as a fresh message."""
+        try:
+            await query.answer(text=f"✓ {choice_text[:48]} — delivered as a new message")
+        except Exception:
+            pass
+        try:
+            await query.edit_message_text(
+                text=(
+                    f"❓ {_html.escape(query.message.text or '')}\n\n"
+                    f"<b>{_html.escape(user_display)}:</b> {_html.escape(choice_text)}"
+                    " <i>(prompt had expired — answer delivered as a new message)</i>"
+                ),
+                parse_mode=ParseMode.HTML,
+                reply_markup=None,
+            )
+        except Exception:
+            pass
+
     async def _notify_clarify_expired(self, query, user_display: str) -> None:
         """Tell the user a clarify tap arrived too late to be delivered.
 
@@ -4681,6 +4780,33 @@ class TelegramAdapter(BasePlatformAdapter):
 
                 session_key = self._clarify_state.get(clarify_id)
                 if not session_key:
+                    # Two ways to get here: the clarify was genuinely resolved
+                    # (the edit already stripped the keyboard; only a rapid
+                    # double-tap races in), or the gateway restarted and
+                    # ``_clarify_state`` was lost while the buttons survived
+                    # in chat. In the restart case the user's decision is
+                    # recoverable from the keyboard — deliver it as a fresh
+                    # message instead of discarding it.
+                    user_display = getattr(query.from_user, "first_name", "User")
+                    if clarify_id not in self._recently_resolved_clarifies:
+                        if choice_token == "other":
+                            try:
+                                await query.answer(
+                                    text="✏️ This prompt expired — just type your answer."
+                                )
+                            except Exception:
+                                pass
+                            return
+                        label = self._recover_clarify_choice_text(query)
+                        if label and await self._inject_late_clarify_reply(query, label):
+                            await self._confirm_late_clarify_delivery(
+                                query, user_display, label
+                            )
+                            logger.info(
+                                "Telegram clarify button: post-restart tap delivered as new message (id=%s, choice=%r)",
+                                clarify_id, label,
+                            )
+                            return
                     await query.answer(text="This prompt has already been resolved.")
                     return
 
@@ -4702,9 +4828,27 @@ class TelegramAdapter(BasePlatformAdapter):
 
                     if not flipped:
                         # Entry evicted (clarify_timeout) or gateway restarted
-                        # between ask and tap — a typed answer would go nowhere.
+                        # between ask and tap — the original wait is gone, but
+                        # a typed answer still reaches the agent as a normal
+                        # message turn. Say so instead of dead-ending on /retry.
                         self._clarify_state.pop(clarify_id, None)
-                        await self._notify_clarify_expired(query, user_display)
+                        try:
+                            await query.answer(
+                                text="✏️ This prompt expired — just type your answer."
+                            )
+                        except Exception:
+                            pass
+                        try:
+                            await query.edit_message_text(
+                                text=(
+                                    f"❓ {_html.escape(query.message.text or '')}\n\n"
+                                    "<i>⚠️ This prompt expired — type your answer as a normal message.</i>"
+                                ),
+                                parse_mode=ParseMode.HTML,
+                                reply_markup=None,
+                            )
+                        except Exception:
+                            pass
                         return
 
                     await query.answer(text="✏️ Type your answer in the chat.")
@@ -4753,6 +4897,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     resolved = False
 
                 if resolved:
+                    self._recently_resolved_clarifies.append(clarify_id)
                     await query.answer(text=f"✓ {resolved_text[:60]}")
                     try:
                         await query.edit_message_text(
@@ -4767,14 +4912,26 @@ class TelegramAdapter(BasePlatformAdapter):
                         clarify_id, resolved_text, user_display,
                     )
                 else:
-                    # Entry evicted (clarify_timeout) or gateway restarted
-                    # between ask and tap — surface this instead of leaving a
-                    # misleading ✓ on a button the agent will never receive.
-                    await self._notify_clarify_expired(query, user_display)
-                    logger.warning(
-                        "Telegram clarify button: resolve_gateway_clarify returned False (id=%s)",
-                        clarify_id,
-                    )
+                    # Entry evicted (clarify_timeout) — the waiting agent
+                    # thread is gone, but the decision is still recoverable
+                    # from the message's own keyboard. Deliver it as a fresh
+                    # inbound message so the answer reaches the agent instead
+                    # of being discarded behind an expiry notice.
+                    label = self._recover_clarify_choice_text(query)
+                    if label and await self._inject_late_clarify_reply(query, label):
+                        await self._confirm_late_clarify_delivery(
+                            query, user_display, label
+                        )
+                        logger.info(
+                            "Telegram clarify button: late tap delivered as new message (id=%s, choice=%r)",
+                            clarify_id, label,
+                        )
+                    else:
+                        await self._notify_clarify_expired(query, user_display)
+                        logger.warning(
+                            "Telegram clarify button: resolve_gateway_clarify returned False (id=%s)",
+                            clarify_id,
+                        )
         # --- Busy-session button callbacks (bs:primitive:session_key) ---
         if data.startswith("bs:"):
             await self._handle_busy_session_callback(

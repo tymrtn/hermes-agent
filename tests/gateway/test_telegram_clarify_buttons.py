@@ -464,6 +464,163 @@ class TestTelegramClarifyCallback:
         assert "cidOtherExpired" not in adapter._clarify_state
 
     @pytest.mark.asyncio
+    async def test_numeric_choice_expired_with_keyboard_injects_late_reply(self):
+        """Late tap after entry eviction must deliver the recovered choice as
+        a fresh inbound message instead of discarding the decision."""
+        adapter = _make_adapter()
+        adapter._clarify_state["cidLate"] = "sk-late"
+        # No clarify registry entry → resolve_gateway_clarify returns False.
+
+        fake_event = MagicMock()
+        adapter._build_message_event = MagicMock(return_value=fake_event)
+        adapter._enqueue_text_event = MagicMock()
+
+        keyboard = SimpleNamespace(
+            inline_keyboard=[
+                [SimpleNamespace(text="red", callback_data="cl:cidLate:0")],
+                [SimpleNamespace(text="green", callback_data="cl:cidLate:1")],
+            ]
+        )
+        query = AsyncMock()
+        query.data = "cl:cidLate:1"
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.message.text = "Pick a color"
+        query.message.reply_markup = keyboard
+        query.from_user = MagicMock()
+        query.from_user.id = "777"
+        query.from_user.first_name = "Tester"
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+
+        update = MagicMock()
+        update.callback_query = query
+        context = MagicMock()
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            await adapter._handle_callback_query(update, context)
+
+        # The recovered choice went into a synthetic inbound message.
+        adapter._enqueue_text_event.assert_called_once_with(fake_event)
+        shim = adapter._build_message_event.call_args[0][0]
+        assert "green" in shim.text
+        assert "Pick a color" in shim.text
+        # The ack tells the user the answer was delivered, and the keyboard
+        # is stripped so it cannot be tapped again.
+        answer_text = query.answer.call_args[1]["text"]
+        assert "delivered" in answer_text.lower()
+        assert query.edit_message_text.call_args[1]["reply_markup"] is None
+
+    @pytest.mark.asyncio
+    async def test_post_restart_tap_injects_late_reply(self):
+        """After a gateway restart _clarify_state is empty but the keyboard
+        survives in chat — the tap must still deliver the decision."""
+        adapter = _make_adapter()
+        # No _clarify_state entry at all (restart wiped it).
+
+        fake_event = MagicMock()
+        adapter._build_message_event = MagicMock(return_value=fake_event)
+        adapter._enqueue_text_event = MagicMock()
+
+        keyboard = SimpleNamespace(
+            inline_keyboard=[
+                [SimpleNamespace(text="ship it", callback_data="cl:cidRestart:0")],
+            ]
+        )
+        query = AsyncMock()
+        query.data = "cl:cidRestart:0"
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.message.text = "Deploy now?"
+        query.message.reply_markup = keyboard
+        query.from_user = MagicMock()
+        query.from_user.id = "777"
+        query.from_user.first_name = "Tester"
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+
+        update = MagicMock()
+        update.callback_query = query
+        context = MagicMock()
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            await adapter._handle_callback_query(update, context)
+
+        adapter._enqueue_text_event.assert_called_once_with(fake_event)
+        shim = adapter._build_message_event.call_args[0][0]
+        assert "ship it" in shim.text
+        answer_text = query.answer.call_args[1]["text"]
+        assert "delivered" in answer_text.lower()
+
+    @pytest.mark.asyncio
+    async def test_double_tap_after_resolve_not_reinjected(self):
+        """A second tap racing in after a successful resolve must not deliver
+        a duplicate answer."""
+        adapter = _make_adapter()
+        adapter._recently_resolved_clarifies.append("cidDouble")
+        adapter._enqueue_text_event = MagicMock()
+
+        keyboard = SimpleNamespace(
+            inline_keyboard=[
+                [SimpleNamespace(text="yes", callback_data="cl:cidDouble:0")],
+            ]
+        )
+        query = AsyncMock()
+        query.data = "cl:cidDouble:0"
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.message.text = "Sure?"
+        query.message.reply_markup = keyboard
+        query.from_user = MagicMock()
+        query.from_user.id = "777"
+        query.from_user.first_name = "Tester"
+        query.answer = AsyncMock()
+
+        update = MagicMock()
+        update.callback_query = query
+        context = MagicMock()
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            await adapter._handle_callback_query(update, context)
+
+        adapter._enqueue_text_event.assert_not_called()
+        assert "already" in query.answer.call_args[1]["text"].lower()
+
+    @pytest.mark.asyncio
+    async def test_inject_late_reply_builds_real_event(self):
+        """The SimpleNamespace shim must survive the real _build_message_event."""
+        adapter = _make_adapter()
+        adapter._enqueue_text_event = MagicMock()
+
+        chat = SimpleNamespace(
+            id=12345, type="private", title=None, full_name="Tyler", is_forum=False
+        )
+        user = SimpleNamespace(id=777, full_name="Tyler", is_bot=False)
+        message = SimpleNamespace(
+            chat=chat,
+            from_user=user,
+            text="❓ Deploy now?",
+            message_id=42,
+            message_thread_id=None,
+            is_topic_message=False,
+            reply_to_message=None,
+            quote=None,
+            forward_origin=None,
+            is_automatic_forward=False,
+            reply_markup=None,
+        )
+        query = SimpleNamespace(message=message, from_user=user, data="cl:x:0")
+
+        ok = await adapter._inject_late_clarify_reply(query, "ship it")
+
+        assert ok is True
+        adapter._enqueue_text_event.assert_called_once()
+        event = adapter._enqueue_text_event.call_args[0][0]
+        assert "ship it" in event.text
+        assert "Deploy now?" in event.text
+        assert event.source.chat_id == "12345"
+
+    @pytest.mark.asyncio
     async def test_invalid_choice_token(self):
         from tools import clarify_gateway as cm
 
