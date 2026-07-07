@@ -21,6 +21,19 @@ from typing import Dict, List, Optional, Set, Any
 logger = logging.getLogger(__name__)
 
 
+def normalize_telegram_chat_id(chat_id: Any) -> Any:
+    """Return an int chat id when Telegram expects one, preserving handles."""
+    if isinstance(chat_id, int):
+        return chat_id
+    text = str(chat_id).strip()
+    if text and text.lstrip("-").isdigit():
+        try:
+            return int(text)
+        except ValueError:
+            return text
+    return text
+
+
 def _redact_telegram_error_text(error: object) -> str:
     """Redact secrets from Telegram transport errors before logging or returning them."""
     text = "" if error is None else str(error)
@@ -529,6 +542,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self._polling_network_error_count: int = 0
         self._polling_error_callback_ref = None
         self._polling_heartbeat_task: Optional[asyncio.Task] = None
+        self._post_connect_task: Optional[asyncio.Task] = None
         # Consecutive heartbeat probes that saw queued updates the running
         # poller is not consuming. get_me() can't see this — the send path is
         # healthy while the getUpdates consumer is wedged — so the heartbeat
@@ -2428,6 +2442,7 @@ class TelegramAdapter(BasePlatformAdapter):
             return False
         
         try:
+            self._drop_delayed_deliveries = False
             if not self._acquire_platform_lock('telegram-bot-token', self.config.token, 'Telegram bot token'):
                 return False
 
@@ -2794,33 +2809,36 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         """Stop polling/webhook, cancel pending album flushes, and disconnect."""
-        pending_media_group_tasks = list(self._media_group_tasks.values())
-        for task in pending_media_group_tasks:
-            task.cancel()
-        if pending_media_group_tasks:
-            await asyncio.gather(*pending_media_group_tasks, return_exceptions=True)
-        self._media_group_tasks.clear()
-        self._media_group_events.clear()
+        self._drop_delayed_deliveries = True
 
-        if self._app:
+        post_connect_task = getattr(self, "_post_connect_task", None)
+        if post_connect_task and not post_connect_task.done():
+            post_connect_task.cancel()
+            await asyncio.gather(post_connect_task, return_exceptions=True)
+        self._post_connect_task = None
+
+        await self._cancel_pending_delivery_tasks()
+
+        app = getattr(self, "_app", None)
+        if app:
             try:
                 # Only stop the updater if it's running.  Bounded with a
                 # timeout: a CLOSE-WAIT socket can wedge stop() on epoll
                 # indefinitely, which would hang disconnect() (and any
                 # gateway shutdown/restart waiting on it) forever.  On timeout
                 # we fall through to app.stop()/shutdown() to force teardown.
-                if self._app.updater and self._app.updater.running:
+                if app.updater and app.updater.running:
                     try:
-                        await asyncio.wait_for(self._app.updater.stop(), timeout=_UPDATER_STOP_TIMEOUT)
+                        await asyncio.wait_for(app.updater.stop(), timeout=_UPDATER_STOP_TIMEOUT)
                     except asyncio.TimeoutError:
                         logger.warning(
                             "[%s] updater.stop() timed out during disconnect "
                             "(likely CLOSE-WAIT socket); forcing app shutdown",
                             self.name,
                         )
-                if self._app.running:
-                    await self._app.stop()
-                await self._app.shutdown()
+                if app.running:
+                    await app.stop()
+                await app.shutdown()
             except Exception as e:
                 logger.warning(
                     "[%s] Error during Telegram disconnect: %s",
@@ -2831,6 +2849,10 @@ class TelegramAdapter(BasePlatformAdapter):
         self._app = None
         self._bot = None
         logger.info("[%s] Disconnected from Telegram", self.name)
+
+    def _mark_disconnected(self) -> None:
+        self._drop_delayed_deliveries = True
+        super()._mark_disconnected()
 
     def _should_thread_reply(self, reply_to: Optional[str], chunk_index: int) -> bool:
         """Determine if this message chunk should thread to the original message.
@@ -5299,7 +5321,11 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
-            print(f"[{self.name}] Failed to send document: {e}")
+            logger.warning(
+                "[%s] Failed to send document: %s",
+                self.name,
+                _redact_telegram_error_text(e),
+            )
             return await super().send_document(chat_id, file_path, caption, file_name, reply_to, metadata=metadata)
 
     async def send_video(
@@ -5346,7 +5372,11 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
-            print(f"[{self.name}] Failed to send video: {e}")
+            logger.warning(
+                "[%s] Failed to send video: %s",
+                self.name,
+                _redact_telegram_error_text(e),
+            )
             return await super().send_video(chat_id, video_path, caption, reply_to, metadata=metadata)
 
     async def send_image(
@@ -6472,6 +6502,108 @@ class TelegramAdapter(BasePlatformAdapter):
         event = self._apply_telegram_group_observe_attribution(event)
         await self.handle_message(event)
 
+    def _should_drop_delayed_delivery(self) -> bool:
+        """Whether delayed text/media flushes should be dropped during teardown."""
+        return bool(getattr(self, "_drop_delayed_deliveries", False))
+
+    def _telegram_media_size_allowed(self, media: Any, label: str) -> tuple[bool, Optional[str]]:
+        """Return whether a Telegram media object is small enough to download."""
+        size = getattr(media, "file_size", None)
+        max_bytes = int(getattr(self, "_max_doc_bytes", 20 * 1024 * 1024))
+        if size is None:
+            return False, f"The {label} is too large or its size could not be verified. Maximum: {max_bytes // (1024 * 1024)} MB."
+        try:
+            size_int = int(size)
+        except (TypeError, ValueError):
+            return False, f"The {label} is too large or its size could not be verified. Maximum: {max_bytes // (1024 * 1024)} MB."
+        if size_int > max_bytes:
+            return False, f"The {label} is too large. Maximum: {max_bytes // (1024 * 1024)} MB."
+        return True, None
+
+    async def _cancel_pending_delivery_tasks(self) -> None:
+        """Cancel delayed Telegram delivery tasks and clear their buffers."""
+        current_task = asyncio.current_task()
+
+        task_maps = [
+            (getattr(self, "_pending_text_batches", None), getattr(self, "_pending_text_batch_tasks", None)),
+            (getattr(self, "_pending_photo_batches", None), getattr(self, "_pending_photo_batch_tasks", None)),
+            (getattr(self, "_media_group_events", None), getattr(self, "_media_group_tasks", None)),
+        ]
+        tasks: list[Any] = []
+        for _, task_map in task_maps:
+            if isinstance(task_map, dict):
+                tasks.extend(
+                    task
+                    for task in task_map.values()
+                    if task is not None and task is not current_task and not task.done()
+                )
+
+        polling_task = getattr(self, "_polling_error_task", None)
+        if polling_task is not None and polling_task is not current_task and not polling_task.done():
+            tasks.append(polling_task)
+
+        awaitable_tasks = []
+        for task in tasks:
+            task.cancel()
+            if asyncio.isfuture(task) or asyncio.iscoroutine(task) or hasattr(task, "__await__"):
+                awaitable_tasks.append(task)
+        if awaitable_tasks:
+            await asyncio.gather(*awaitable_tasks, return_exceptions=True)
+
+        for batch_map, task_map in task_maps:
+            if isinstance(batch_map, dict):
+                batch_map.clear()
+            if isinstance(task_map, dict):
+                task_map.clear()
+        if polling_task is not None and polling_task is not current_task:
+            self._polling_error_task = None
+
+    @staticmethod
+    def _append_observed_note(text: Optional[str], note: str) -> str:
+        """Append an operational note to event text without losing user text."""
+        note = (note or "").strip()
+        if not note:
+            return text or ""
+        if text and text.strip():
+            return f"{text.rstrip()}\n\n{note}"
+        return note
+
+    async def _surface_media_cache_failure(
+        self,
+        msg: Message,
+        event: MessageEvent,
+        media_label: str,
+        exc: Exception,
+        *,
+        display_name: Optional[str] = None,
+    ) -> None:
+        """Notify the user and pass an explicit attachment-failure note onward."""
+        label = media_label or "attachment"
+        name = f" '{display_name}'" if display_name else ""
+        exc_type = type(exc).__name__
+        safe_error = _redact_telegram_error_text(exc)
+
+        try:
+            await msg.reply_text(
+                f"Couldn't download {label}{name}: {exc_type}. Please try sending it again."
+            )
+        except Exception as reply_exc:
+            logger.warning(
+                "[%s] Failed to notify user about %s cache failure: %s",
+                self.name,
+                label,
+                _redact_telegram_error_text(reply_exc),
+            )
+
+        event.media_urls = []
+        event.media_types = []
+        event.text = self._append_observed_note(
+            event.text,
+            f"The user's {label}{name} could not be downloaded from Telegram "
+            f"({exc_type}: {safe_error}). Ask them to resend it or provide another copy.",
+        )
+        await self.handle_message(event)
+
     # ------------------------------------------------------------------
     # Text message aggregation (handles Telegram client-side splits)
     # ------------------------------------------------------------------
@@ -6730,6 +6862,7 @@ class TelegramAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.warning("[Telegram] Failed to cache photo: %s", e, exc_info=True)
                 await self._surface_media_cache_failure(msg, event, "photo", e)
+                return
 
         # Download voice/audio messages to cache for STT transcription
         if msg.voice:
@@ -6743,6 +6876,7 @@ class TelegramAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.warning("[Telegram] Failed to cache voice: %s", e, exc_info=True)
                 await self._surface_media_cache_failure(msg, event, "voice message", e)
+                return
         elif msg.audio:
             try:
                 file_obj = await msg.audio.get_file()
@@ -6754,6 +6888,7 @@ class TelegramAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.warning("[Telegram] Failed to cache audio: %s", e, exc_info=True)
                 await self._surface_media_cache_failure(msg, event, "audio file", e)
+                return
 
         elif msg.video:
             try:
@@ -6778,6 +6913,7 @@ class TelegramAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.warning("[Telegram] Failed to cache video: %s", e, exc_info=True)
                 await self._surface_media_cache_failure(msg, event, "video file", e)
+                return
 
         # Download document files to cache for agent processing
         elif msg.document:
@@ -6914,6 +7050,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     msg, event, "attachment", e,
                     display_name=getattr(doc, "file_name", None) or None,
                 )
+                return
 
         media_group_id = getattr(msg, "media_group_id", None)
         if media_group_id:
@@ -6956,7 +7093,7 @@ class TelegramAdapter(BasePlatformAdapter):
     async def _flush_media_group_event(self, media_group_id: str) -> None:
         current_task = asyncio.current_task()
         try:
-            await asyncio.sleep(self.MEDIA_GROUP_WAIT_SECONDS)
+            await asyncio.sleep(type(self).MEDIA_GROUP_WAIT_SECONDS)
             event = self._media_group_events.pop(media_group_id, None)
             if event is not None:
                 if self._should_drop_delayed_delivery():

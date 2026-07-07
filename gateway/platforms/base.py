@@ -2969,6 +2969,13 @@ class BasePlatformAdapter(ABC):
         # tests and never run ``BasePlatformAdapter.__init__``.
         self._topic_recovery_fn = fn  # type: ignore[attr-defined]
 
+    def set_authorization_check(
+        self,
+        fn: Optional[Callable[[str, Optional[str], Optional[str]], bool]],
+    ) -> None:
+        """Install the gateway-level sender authorization hook."""
+        self._authorization_check = fn
+
     def _apply_topic_recovery(self, event: MessageEvent) -> None:
         """Rewrite ``event.source.thread_id`` in place if the hook returns one."""
         recover = getattr(self, "_topic_recovery_fn", None)
