@@ -1279,14 +1279,14 @@ DEFAULT_CONFIG = {
                                       # context turns when your aux model is flaky.
         "codex_gpt55_autoraise": True,  # When True, gpt-5.5 on the ChatGPT Codex OAuth
                                       # route raises its compaction trigger to 85% (vs the
-                                      # global `threshold` above). Codex hard-caps gpt-5.5
-                                      # at a 272K window, so the default 50% would compact
-                                      # at ~136K and waste half the usable context. Set to
-                                      # False to opt back down to the global threshold
-                                      # (e.g. 0.50) for Codex gpt-5.5 sessions. Only this
-                                      # exact route is affected — gpt-5.5 on OpenAI's
-                                      # direct API, OpenRouter, and Copilot keep the
-                                      # global threshold regardless.
+                                      # global `threshold` above). Codex gpt-5.5 has a
+                                      # 1M-class window, so the default threshold can
+                                      # compact much earlier than useful. Set to False to
+                                      # opt back down to the global threshold (e.g. 0.50)
+                                      # for Codex gpt-5.5 sessions. Only this exact route
+                                      # is affected — gpt-5.5 on OpenAI's direct API,
+                                      # OpenRouter, and Copilot keep the global threshold
+                                      # regardless.
         "in_place": False,            # When True, compaction rewrites the message
                                       # list and rebuilds the system prompt WITHOUT
                                       # rotating the session id — the conversation

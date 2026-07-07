@@ -267,10 +267,10 @@ def _compression_threshold_for_model(
 
     Per-model/route overrides:
       - Arcee Trinity Large Thinking → 0.75 (preserve reasoning context).
-      - gpt-5.5 on the Codex OAuth route → 0.85, because Codex caps the window
-        at 272K and the default 50% trigger would compact at ~136K. Gated by
-        ``allow_codex_gpt55_autoraise`` so the user can opt back down to the
-        global default (the caller passes the config flag through here).
+      - gpt-5.5 on the Codex OAuth route → 0.85, because it has a 1M-class
+        window and the default trigger would compact long before that is useful.
+        Gated by ``allow_codex_gpt55_autoraise`` so the user can opt back down
+        to the global default (the caller passes the config flag through here).
 
     Returns a float in (0, 1] to override the global ``compression.threshold``
     config value, or ``None`` to leave the user's config value unchanged.

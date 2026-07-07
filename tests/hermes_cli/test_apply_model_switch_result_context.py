@@ -4,7 +4,7 @@ Bug (April 2026): after choosing a model from the interactive `/model` picker,
 ``HermesCLI._apply_model_switch_result()`` printed ``ModelInfo.context_window``
 straight from models.dev, which always reports the vendor-wide value (e.g.
 gpt-5.5 = 1,050,000 on ``openai``). That ignored provider-specific caps — in
-particular, ChatGPT Codex OAuth enforces 272K on the same slug. The sibling
+particular, some ChatGPT Codex OAuth slugs enforce 272K. The sibling
 ``_handle_model_switch()`` (typed ``/model <name>``) was already fixed to use
 ``resolve_display_context_length()``; the picker path was missed, causing
 "sometimes 1M, sometimes 272K" for the same model across sibling UI paths.
@@ -56,11 +56,11 @@ def _run_display(monkeypatch, result):
 
 def test_picker_path_uses_provider_aware_context_on_codex(monkeypatch):
     """``_apply_model_switch_result`` must prefer the provider-aware resolver
-    (272K on Codex) over the raw models.dev value (1.05M for gpt-5.5).
+    (272K on a capped Codex slug) over the raw models.dev value.
     """
     result = ModelSwitchResult(
         success=True,
-        new_model="gpt-5.5",
+        new_model="gpt-5.4",
         target_provider="openai-codex",
         provider_changed=True,
         api_key="",
@@ -70,7 +70,7 @@ def test_picker_path_uses_provider_aware_context_on_codex(monkeypatch):
         provider_label="ChatGPT Codex",
         resolved_via_alias=False,
         capabilities=None,
-        model_info=_FakeModelInfo(),  # models.dev says 1.05M
+        model_info=_FakeModelInfo(),  # generic catalog says 1.05M
         is_global=False,
     )
     with patch(
@@ -84,7 +84,7 @@ def test_picker_path_uses_provider_aware_context_on_codex(monkeypatch):
         f"picker-path display must show Codex's 272K cap, got: {ctx_line!r}"
     )
     assert "1,050,000" not in ctx_line, (
-        f"picker-path display leaked models.dev's 1.05M for Codex: {ctx_line!r}"
+        f"picker-path display leaked generic 1.05M context for Codex: {ctx_line!r}"
     )
 
 
