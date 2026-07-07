@@ -311,6 +311,57 @@ def test_board_override_is_isolated_per_concurrent_call(kanban_home, monkeypatch
 
 
 # ---------------------------------------------------------------------------
+# Regression: the board-env restore helper must exist and run cleanly.
+#
+# A merge between Tyler's env-var fork and the upstream contextvar refactor
+# dropped the `_restore_board_env` helper while keeping its two call sites,
+# so the `finally: _restore_board_env()` cleanup raised
+# `NameError: name '_restore_board_env' is not defined` on *every* kanban
+# subcommand that dispatched a handler. The concurrent-isolation test above
+# runs its workers in threads, which swallow the exception (the side-effecting
+# `create` still commits before the crash), so it never caught this. These run
+# in the main thread and assert the return code directly.
+# ---------------------------------------------------------------------------
+
+def test_kanban_command_does_not_crash_in_finally(kanban_home, monkeypatch):
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
+    sub = parser.add_subparsers(dest="command")
+    kc.build_parser(sub)
+
+    # `list` dispatches a handler, so it exercises the `finally` cleanup that
+    # previously raised NameError. Must return cleanly, not raise.
+    args = parser.parse_args(["kanban", "list"])
+    assert kc.kanban_command(args) == 0
+
+
+def test_board_override_restores_env_after_call(kanban_home, monkeypatch):
+    kb.create_board("alpha")
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
+    sub = parser.add_subparsers(dest="command")
+    kc.build_parser(sub)
+
+    args = parser.parse_args(["kanban", "--board", "alpha", "list"])
+    assert kc.kanban_command(args) == 0
+    # The process-global env override must not leak past the call.
+    assert os.environ.get("HERMES_KANBAN_BOARD") is None
+
+
+def test_board_override_restores_prior_env_value(kanban_home, monkeypatch):
+    kb.create_board("alpha")
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
+    sub = parser.add_subparsers(dest="command")
+    kc.build_parser(sub)
+
+    args = parser.parse_args(["kanban", "--board", "alpha", "list"])
+    assert kc.kanban_command(args) == 0
+    # A pre-existing env value must be restored verbatim, not clobbered/dropped.
+    assert os.environ.get("HERMES_KANBAN_BOARD") == "default"
+
+
+# ---------------------------------------------------------------------------
 # Integration with the COMMAND_REGISTRY
 # ---------------------------------------------------------------------------
 

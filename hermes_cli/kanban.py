@@ -891,6 +891,27 @@ def kanban_command(args: argparse.Namespace) -> int:
     # dispatcher uses for workers — consistency is a feature here.
     board_override = getattr(args, "board", None)
     board_scope = contextlib.nullcontext()
+    # The board-scope context manager (scoped_current_board) only isolates the
+    # in-process _CURRENT_BOARD_OVERRIDE contextvar. The lines below still set
+    # the process-global HERMES_KANBAN_BOARD env var so dispatched worker
+    # subprocesses inherit the right board (get_current_board resolution order).
+    # That global mutation must be undone on every exit path, otherwise it
+    # leaks into later calls in long-lived processes (gateway/dispatcher).
+    # A merge between Tyler's env-var fork and the upstream contextvar refactor
+    # dropped this helper while keeping its call sites, so every kanban
+    # subcommand crashed with `NameError: name '_restore_board_env'` in the
+    # finally block below. Reinstated here.
+    prev_board_env = os.environ.get("HERMES_KANBAN_BOARD")
+    restore_board_env = False
+
+    def _restore_board_env() -> None:
+        if not restore_board_env:
+            return
+        if prev_board_env is None:
+            os.environ.pop("HERMES_KANBAN_BOARD", None)
+        else:
+            os.environ["HERMES_KANBAN_BOARD"] = prev_board_env
+
     if board_override:
         try:
             normed = kb._normalize_board_slug(board_override)
