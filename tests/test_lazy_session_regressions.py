@@ -367,6 +367,27 @@ class TestGatewaySurfacesNullResponse:
         assert "output limit" in response
         assert "continue" in response.lower()
 
+    def test_output_truncation_final_response_gets_actionable_recovery_message(self):
+        """Raw truncation sentinels in final_response are normalized too."""
+        from gateway.run import _normalize_empty_agent_response
+
+        agent_result = {
+            "final_response": "⚠️ Response truncated due to output length limit",
+            "api_calls": 4,
+            "partial": True,
+            "interrupted": False,
+        }
+
+        response = _normalize_empty_agent_response(
+            agent_result,
+            agent_result["final_response"],
+            history_len=10,
+        )
+
+        assert "Response truncated due to output length limit" not in response
+        assert "output limit" in response
+        assert "continue" in response.lower()
+
     def test_interrupted_response_stays_empty(self):
         """Interrupted agent → response stays empty (platform handles UX)."""
         from gateway.run import _normalize_empty_agent_response

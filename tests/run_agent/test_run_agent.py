@@ -4345,8 +4345,38 @@ class TestRunConversation:
 
         # Without think tags, the agent should attempt continuation retries
         # (up to 3), not immediately fire thinking-exhaustion.
-        assert result["api_calls"] == 3
+        assert result["api_calls"] == 4
         assert result["completed"] is False
+
+    def test_length_continuation_boosts_small_output_cap(self, agent):
+        """Text self-recovery should increase max_tokens on continuation."""
+        self._setup_agent(agent)
+        agent.max_tokens = 4096
+        requested_caps = []
+
+        def _fake_build_api_kwargs(api_messages):
+            ephemeral = getattr(agent, "_ephemeral_max_output_tokens", None)
+            if ephemeral is not None:
+                agent._ephemeral_max_output_tokens = None
+            cap = ephemeral if ephemeral is not None else agent.max_tokens
+            requested_caps.append(cap)
+            return {"model": agent.model, "messages": api_messages, "max_tokens": cap}
+
+        first = _mock_response(content="Part 1 ", finish_reason="length")
+        second = _mock_response(content="Part 2", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [first, second]
+
+        with (
+            patch.object(agent, "_build_api_kwargs", side_effect=_fake_build_api_kwargs),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is True
+        assert result["final_response"] == "Part 1 Part 2"
+        assert requested_caps == [4096, 8192]
 
     def test_length_with_tool_calls_returns_partial_without_executing_tools(self, agent):
         self._setup_agent(agent)

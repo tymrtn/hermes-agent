@@ -1678,7 +1678,7 @@ def run_conversation(
                             if assistant_message.content:
                                 truncated_response_parts.append(assistant_message.content)
 
-                            if length_continue_retries < 3:
+                            if length_continue_retries <= 3:
                                 _is_partial_stream_stub = (
                                     getattr(response, "id", "") == PARTIAL_STREAM_STUB_ID
                                 )
@@ -1705,6 +1705,20 @@ def run_conversation(
                                         f"{agent.log_prefix}↻ Requesting continuation "
                                         f"({length_continue_retries}/3)..."
                                     )
+
+                                # Text continuation was previously a plain
+                                # "continue" with the same output cap, so long
+                                # answers could hit the same limit repeatedly
+                                # and leak a raw truncation sentinel after a few
+                                # attempts. Give each self-recovery pass more
+                                # room, preserving any larger provider default.
+                                _text_boost_base = agent.max_tokens if agent.max_tokens else 4096
+                                _text_boost = _text_boost_base * (length_continue_retries + 1)
+                                _text_requested_cap = agent._requested_output_cap_from_api_kwargs(api_kwargs)
+                                if _text_requested_cap is not None:
+                                    _text_boost = max(_text_boost, _text_requested_cap)
+                                _text_boost_cap = max(32768, _text_requested_cap or 0)
+                                agent._ephemeral_max_output_tokens = min(_text_boost, _text_boost_cap)
 
                                 _continue_content = _get_continuation_prompt(
                                     _is_partial_stream_stub, _dropped_tools

@@ -2420,6 +2420,16 @@ def _normalize_empty_agent_response(
     Fix for #18765.
     """
     if response:
+        # Some agent paths surface the internal truncation sentinel as the
+        # final_response string instead of returning an empty partial result.
+        # Normalize that too; otherwise Telegram receives the raw developer
+        # error as if it were the answer.
+        response_text = str(response)
+        if "truncat" in response_text.lower() and "length" in response_text.lower():
+            return (
+                "⚠️ The response hit the model output limit before it finished. "
+                "Send `continue` to resume, or ask for a shorter answer/attached file."
+            )
         return response
 
     if agent_result.get("failed"):
