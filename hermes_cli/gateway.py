@@ -1406,7 +1406,7 @@ def _windows_gateway_should_absorb_console_controls() -> bool:
 
 _SERVICE_BASE = "hermes-gateway"
 SERVICE_DESCRIPTION = "Hermes Agent Gateway - Messaging Platform Integration"
-
+GATEWAY_SERVICE_NOFILE_LIMIT = 8192
 
 def _profile_suffix() -> str:
     """Derive a service-name suffix from the current HERMES_HOME.
@@ -2443,6 +2443,7 @@ Environment="PYTHONPATH={pythonpath}"
 Restart=always
 RestartSec=5
 RestartForceExitStatus={GATEWAY_SERVICE_RESTART_EXIT_CODE}
+LimitNOFILE={GATEWAY_SERVICE_NOFILE_LIMIT}
 KillMode=mixed
 KillSignal=SIGTERM
 ExecReload=/bin/kill -USR1 $MAINPID
@@ -2477,6 +2478,7 @@ Environment="PYTHONPATH={pythonpath}"
 Restart=always
 RestartSec=5
 RestartForceExitStatus={GATEWAY_SERVICE_RESTART_EXIT_CODE}
+LimitNOFILE={GATEWAY_SERVICE_NOFILE_LIMIT}
 KillMode=mixed
 KillSignal=SIGTERM
 ExecReload=/bin/kill -USR1 $MAINPID
@@ -3414,6 +3416,12 @@ def generate_launchd_plist() -> str:
         <string>Aqua</string>
         <string>Background</string>
     </array>
+
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>{GATEWAY_SERVICE_NOFILE_LIMIT}</integer>
+    </dict>
     
     <key>RunAtLoad</key>
     <true/>
