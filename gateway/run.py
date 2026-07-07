@@ -19484,8 +19484,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 timeout = _clarify_mod.get_clarify_timeout()
                 response = _clarify_mod.wait_for_response(clarify_id, timeout=float(timeout))
                 if response is None or response == "":
-                    # Timeout or session-boundary cancellation
-                    return f"[user did not respond within {int(timeout / 60)}m]"
+                    # Timeout or session-boundary cancellation. Steer the
+                    # agent onto the parked-decision rail instead of leaving
+                    # it to improvise: a late button tap is re-delivered as a
+                    # fresh message by the platform adapter, so the decision
+                    # must survive somewhere durable until then.
+                    return (
+                        f"[user did not respond within {int(timeout / 60)}m — "
+                        "do not end on this unanswered question: continue any "
+                        "reversible work under your stated default and record "
+                        "the open decision as a durable work item (kanban "
+                        "decision card) so a late answer can resume it]"
+                    )
                 return response
 
             agent.clarify_callback = _clarify_callback_sync
