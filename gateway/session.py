@@ -779,6 +779,25 @@ class SessionEntry:
             except (TypeError, ValueError):
                 parent_updated_at = None
 
+        session_key = data["session_key"]
+        session_id = data["session_id"]
+
+        # Validate path-sensitive fields to prevent directory traversal (CWE-22).
+        # ``session_id`` is the value used as a filename
+        # (``sessions_dir / f"{session_id}.json"``), so it must pass the strict
+        # guard. ``session_key`` is a *logical* routing key that never touches
+        # the filesystem — interior ``/`` is legitimate (Google Chat resource
+        # names are ``spaces/<id>`` and ``spaces/<id>/threads/<id>``), so it
+        # only needs the relaxed guard against genuine traversal vectors.
+        if _is_path_unsafe(session_id):
+            raise ValueError(
+                "Invalid session_id: potential directory traversal detected"
+            )
+        if _is_session_key_unsafe(session_key):
+            raise ValueError(
+                "Invalid session_key: potential directory traversal detected"
+            )
+
         return cls(
             session_key=session_key,
             session_id=session_id,
@@ -807,6 +826,7 @@ class SessionEntry:
             reset_had_activity=data.get("reset_had_activity", False),
             parent_session_id=data.get("parent_session_id"),
             parent_updated_at=parent_updated_at,
+            model_override=sanitize_model_override(data.get("model_override")),
         )
 
 
@@ -1523,6 +1543,9 @@ class SessionStore:
                 )
                 return None
 
+        if entry.suspended:
+            return "suspended"
+
         policy = self.config.get_reset_policy(
             platform=source.platform,
             session_type=source.chat_type
@@ -1690,21 +1713,25 @@ class SessionStore:
                     was_auto_reset = False
                     auto_reset_reason = None
                     reset_had_activity = False
+                    parent_session_id = None
+                    parent_updated_at = None
                     # Fall through to the recovery/create path below; the
                     # stale entry is gone so we must NOT consult its
-                    # suspended/resume/reset state.
+                    # suspended/resume/reset state or return it as live.
                 else:
                     reset_reason = self._should_reset(entry, source)
-                if not reset_reason:
-                    entry.updated_at = now
-                    self._save()
-                    return entry
-                else:
+                    if not reset_reason:
+                        entry.updated_at = now
+                        self._save()
+                        return entry
+
                     # Session is being auto-reset.
                     was_auto_reset = True
                     auto_reset_reason = reset_reason
                     # Track whether the expired session had any real conversation
-                    reset_had_activity = entry.total_tokens > 0
+                    reset_had_activity = (
+                        entry.total_tokens > 0 or entry.last_prompt_tokens > 0
+                    )
                     parent_session_id = entry.session_id
                     parent_updated_at = entry.updated_at
                     db_end_session_id = entry.session_id

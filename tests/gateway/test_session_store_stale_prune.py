@@ -57,6 +57,7 @@ def _db_returning(rows: dict) -> MagicMock:
     """SessionDB mock where get_session maps session_id -> row dict."""
     db = MagicMock()
     db.get_session.side_effect = lambda sid: rows.get(sid)
+    db.get_compression_tip.side_effect = lambda sid: sid
     return db
 
 
@@ -150,6 +151,35 @@ class TestPruneStaleSessionsLocked:
         store._prune_stale_sessions_locked()
 
         assert key not in store._entries
+
+    def test_get_or_create_drops_stale_entry_without_reset_reason_crash(self, tmp_path):
+        """Live routing self-heal must not return or reset-check stale entries.
+
+        If a gateway stays up while state.db marks the routed session ended,
+        get_or_create_session() drops the stale sessions.json entry and falls
+        through to DB recovery / new-session creation. The stale-drop path used
+        to skip reset_reason assignment, then read it anyway and crashed with
+        UnboundLocalError before the user received a response.
+        """
+        db = _db_returning({"sid_stale": {"end_reason": "session_reset", "id": "sid_stale"}})
+        db.find_latest_gateway_session_for_peer.return_value = None
+        store = _make_store_with_db(tmp_path, db)
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="5140768830",
+            chat_type="dm",
+            user_id="5140768830",
+            user_name="João",
+        )
+        key = store._generate_session_key(source)
+        store._entries[key] = _make_entry_with_origin(key, "sid_stale")
+
+        entry = store.get_or_create_session(source)
+
+        assert entry.session_id != "sid_stale"
+        assert entry.was_auto_reset is False
+        assert store._entries[key].session_id == entry.session_id
+        db.find_latest_gateway_session_for_peer.assert_called_once()
 
     def test_noop_when_db_is_none(self, tmp_path):
         config = GatewayConfig(default_reset_policy=SessionResetPolicy(mode="none"))

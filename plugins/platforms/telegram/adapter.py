@@ -537,6 +537,13 @@ class TelegramAdapter(BasePlatformAdapter):
         )
         self._pending_text_batches: Dict[str, MessageEvent] = {}
         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
+        # Saturated-overflow edit dedup: (chat_id, message_id) -> last preview
+        # text sent while a streamed message exceeded MAX_MESSAGE_LENGTH. The
+        # mid-stream overflow path in edit_message() reads this via .get()/.pop()
+        # BEFORE its first write, so it must exist from construction — otherwise
+        # edit_message() raises AttributeError and floods the log, breaking
+        # stream/progress delivery for any long streamed reply.
+        self._last_overflow_preview: Dict[tuple, str] = {}
         self._drop_delayed_deliveries = False
         self._polling_error_task: Optional[asyncio.Task] = None
         self._polling_conflict_count: int = 0
@@ -3335,6 +3342,11 @@ class TelegramAdapter(BasePlatformAdapter):
                 if busy_keyboard is not None:
                     edit_kwargs["reply_markup"] = busy_keyboard
                 await self._bot.edit_message_text(**edit_kwargs)
+                if _saturated_preview:
+                    # Record the just-sent saturated preview so the next
+                    # identical oversized edit is deduped (see #58563) instead
+                    # of re-editing every ~0.8s tick and tripping flood control.
+                    self._last_overflow_preview[_preview_key] = content
                 return SendResult(success=True, message_id=message_id)
 
             formatted = self.format_message(content)
@@ -3352,11 +3364,16 @@ class TelegramAdapter(BasePlatformAdapter):
                 # "Message is not modified" is a no-op, not an error
                 if "not modified" in str(fmt_err).lower():
                     return SendResult(success=True, message_id=message_id)
-                # Fallback: retry without markdown formatting
+                # Fallback: retry without markdown formatting. Strip the
+                # *formatted* (MarkdownV2) text, not raw content — format_message
+                # already applied one conversion layer, so stripping formatted
+                # yields clean plain text (e.g. "final **bold**" -> "final *bold*"
+                # -> "final bold"). Stripping raw content would leave a stray
+                # emphasis layer behind.
                 fallback_kwargs: Dict[str, Any] = dict(
                     chat_id=int(chat_id),
                     message_id=int(message_id),
-                    text=content,
+                    text=_strip_mdv2(formatted),
                 )
                 if busy_keyboard is not None:
                     fallback_kwargs["reply_markup"] = busy_keyboard
