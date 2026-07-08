@@ -814,6 +814,108 @@ def _normalize_profile(profile: Optional[str]) -> Optional[str]:
     return normalized
 
 
+def _resolve_default_model_snapshot() -> Optional[str]:
+    """Resolve the global default model the same way the cron ticker does.
+
+    Mirrors the unpinned-model resolution in ``cron/scheduler.py`` ``run_job``:
+    read ``config.yaml`` ``model.default`` (or the ``model`` alias / bare string
+    form), applying the managed-scope overlay and env expansion. Used by
+    ``create_job`` to snapshot the default model for unpinned jobs so a later
+    swap of the global default is detected at fire time (#44585).
+
+    Returns the resolved model string, or ``None`` if config is missing/empty
+    or resolution fails (fail-open — caller treats ``None`` as "no snapshot").
+    """
+    try:
+        import yaml
+        from hermes_cli.config import _expand_env_vars
+
+        cfg_path = get_hermes_home() / "config.yaml"
+        if not cfg_path.exists():
+            return None
+        with cfg_path.open(encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        try:
+            from hermes_cli import managed_scope
+            cfg = managed_scope.apply_managed_overlay(cfg)
+        except Exception:
+            pass
+        cfg = _expand_env_vars(cfg)
+        model_cfg = cfg.get("model") or {}
+        if isinstance(model_cfg, str):
+            return model_cfg.strip() or None
+        if isinstance(model_cfg, dict):
+            default = model_cfg.get("default") or model_cfg.get("model")
+            if isinstance(default, str):
+                return default.strip() or None
+        return None
+    except Exception:
+        return None
+
+
+def _normalize_job_optional_text(value: Any, *, strip_trailing_slash: bool = False) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if strip_trailing_slash:
+        text = text.rstrip("/")
+    return text or None
+
+
+def _compute_provider_model_snapshots(
+    *,
+    provider: Any,
+    model: Any,
+    base_url: Any,
+    no_agent: Any,
+) -> Tuple[Optional[str], Optional[str]]:
+    """Snapshot unpinned inference axes for the provider/model drift guard.
+
+    Agent cron jobs with unpinned provider/model follow global config at fire
+    time. Capture the current resolution for each unpinned axis so a later
+    global switch fails closed instead of silently changing spend. Pinned axes
+    and no-agent script jobs intentionally carry no snapshot.
+    """
+    normalized_provider = _normalize_job_optional_text(provider)
+    normalized_model = _normalize_job_optional_text(model)
+    normalized_base_url = _normalize_job_optional_text(
+        base_url,
+        strip_trailing_slash=True,
+    )
+    if bool(no_agent):
+        return None, None
+
+    provider_snapshot: Optional[str] = None
+    model_snapshot: Optional[str] = None
+    if normalized_provider is None:
+        try:
+            from hermes_cli.runtime_provider import resolve_runtime_provider
+
+            runtime_kwargs = {"requested": None}
+            if normalized_base_url:
+                runtime_kwargs["explicit_base_url"] = normalized_base_url
+            snap = resolve_runtime_provider(**runtime_kwargs)
+            snap_provider = str(snap.get("provider") or "").strip().lower()
+            provider_snapshot = snap_provider or None
+        except Exception:
+            provider_snapshot = None
+    if normalized_model is None:
+        try:
+            model_snapshot = _resolve_default_model_snapshot() or None
+        except Exception:
+            model_snapshot = None
+    return provider_snapshot, model_snapshot
+
+
+def _normalized_inference_axes(job: Dict[str, Any]) -> Tuple[Optional[str], Optional[str], Optional[str], bool]:
+    """Return the stored inference-routing fields in their semantic form."""
+    return (
+        _normalize_job_optional_text(job.get("provider")),
+        _normalize_job_optional_text(job.get("model")),
+        _normalize_job_optional_text(job.get("base_url"), strip_trailing_slash=True),
+        bool(job.get("no_agent")),
+    )
+
 def _normalize_memory_mode(memory_mode: Optional[str]) -> Optional[str]:
     """Normalize optional per-job cron memory policy.
 
@@ -1131,6 +1233,7 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
             if "memory_mode" in updates:
                 updates["memory_mode"] = _normalize_memory_mode(updates["memory_mode"])
 
+            previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})
             schedule_changed = "schedule" in updates
             inference_fields_changed = bool(
