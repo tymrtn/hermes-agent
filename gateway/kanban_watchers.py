@@ -320,6 +320,16 @@ class GatewayKanbanWatchersMixin:
                     # wrong bot (the cross-profile mis-delivery this whole change
                     # exists to fix). The helper returns None only when the profile
                     # (or default) genuinely has no adapter for the platform.
+                    #
+                    # A sub stamped with THIS gateway's own profile is the
+                    # default-adapter case: in a per-profile gateway the active
+                    # profile's adapters live in self.adapters and
+                    # _profile_adapters is empty, so passing the name through
+                    # made _authorization_adapter fail closed and the notifier
+                    # claim/rewind/retry forever at debug level — subscriptions
+                    # owned by the dispatching profile never delivered.
+                    if sub_profile and sub_profile == notifier_profile:
+                        sub_profile = ""
                     adapter = self._authorization_adapter(plat, sub_profile or None)
                     if adapter is None:
                         logger.debug(
