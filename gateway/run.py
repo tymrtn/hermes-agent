@@ -19362,12 +19362,44 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             def _deliver_bg_review_message(message: str) -> None:
                 if not _status_adapter or not _run_still_current():
                     return
-                safe_schedule_threadsafe(
-                    _status_adapter.send(
+                status_adapter = _status_adapter
+
+                async def _send_and_track_cleanup() -> None:
+                    result = await status_adapter.send(
                         _status_chat_id,
                         message,
                         metadata=_non_conversational_metadata(_status_thread_metadata, platform=source.platform),
-                    ),
+                    )
+                    if not (
+                        _cleanup_progress
+                        and _cleanup_adapter is not None
+                        and session_key
+                        and getattr(result, "success", False)
+                    ):
+                        return
+                    message_ids: list[str] = []
+                    raw_response = getattr(result, "raw_response", None)
+                    if isinstance(raw_response, dict):
+                        raw_ids = raw_response.get("message_ids")
+                        if isinstance(raw_ids, (list, tuple)):
+                            message_ids.extend(str(mid) for mid in raw_ids if mid)
+                    result_mid = getattr(result, "message_id", None)
+                    if result_mid:
+                        message_ids.append(str(result_mid))
+                    if not message_ids:
+                        return
+                    self._schedule_meta_message_cleanup(
+                        session_key=session_key,
+                        chat_id=_status_chat_id,
+                        adapter=_cleanup_adapter,
+                        message_ids=list(dict.fromkeys(message_ids)),
+                        loop=_loop_for_step,
+                        idle_seconds=_cleanup_idle_seconds,
+                        max_exchanges=_cleanup_max_exchanges,
+                    )
+
+                safe_schedule_threadsafe(
+                    _send_and_track_cleanup(),
                     _loop_for_step,
                     logger=logger,
                     log_message="background_review_callback scheduling error",

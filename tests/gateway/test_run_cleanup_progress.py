@@ -143,6 +143,21 @@ class FailingAgent:
         }
 
 
+class BackgroundReviewAgent:
+    """Emits a self-improvement summary without tool-progress bubbles."""
+
+    def __init__(self, **kwargs):
+        self.tools = []
+        self.background_review_callback = None
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        if self.background_review_callback is not None:
+            self.background_review_callback(
+                "💾 Self-improvement review: Patched SKILL.md in skill 'demo' (1 replacement)."
+            )
+        return {"final_response": "done", "messages": [], "api_calls": 1}
+
+
 def _make_runner(adapter):
     gateway_run = importlib.import_module("gateway.run")
     GatewayRunner = gateway_run.GatewayRunner
@@ -272,6 +287,43 @@ async def test_cleanup_registers_callback_and_deletes_on_success(monkeypatch, tm
     assert len(adapter.deleted) >= 1, f"deleted={adapter.deleted} sent={adapter.sent}"
     for entry in adapter.deleted:
         assert entry["chat_id"] == "-1001"
+
+
+@pytest.mark.asyncio
+async def test_cleanup_deletes_background_review_summary(monkeypatch, tmp_path):
+    """Self-improvement summaries are bot-owned meta bubbles, not final answers."""
+    adapter = CleanupCaptureAdapter()
+    runner = _make_runner(adapter)
+    gateway_run = _install_fakes(monkeypatch, BackgroundReviewAgent, cleanup_on=True)
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="-1001")
+    session_key = "agent:main:telegram:group:-1001"
+
+    result = await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-1",
+        session_key=session_key,
+    )
+
+    assert result["final_response"] == "done"
+    cb = adapter.pop_post_delivery_callback(session_key)
+    assert callable(cb)
+    await _fire_post_delivery_cb(cb)
+
+    for _ in range(30):
+        await asyncio.sleep(0.01)
+        if adapter.deleted:
+            break
+
+    review_sends = [s for s in adapter.sent if "Self-improvement review" in s["content"]]
+    assert len(review_sends) == 1
+    assert adapter.deleted == [
+        {"chat_id": "-1001", "message_id": review_sends[0]["message_id"]}
+    ]
 
 
 @pytest.mark.asyncio
