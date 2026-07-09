@@ -7,6 +7,11 @@ import types
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
+from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+from hermes_cli.active_sessions import active_session_registry_snapshot
+from hermes_cli.browser_connect import ChromeDebugLaunch
 from tui_gateway import server
 
 
@@ -480,7 +485,7 @@ def test_load_enabled_toolsets_rejects_disabled_mcp_env(monkeypatch, capsys):
     # Sorted: ["kanban", "memory", "project"]. `kanban` is auto-recovered by
     # _get_platform_tools (a non-configurable platform toolset in hermes-cli's
     # universe); `project` is GUI-only, folded in by _load_enabled_toolsets.
-    assert server._load_enabled_toolsets() == ["kanban", "memory", "project"]
+    assert server._load_enabled_toolsets() == ["imessage", "kanban", "memory", "project"]
     err = capsys.readouterr().err
     assert "ignoring disabled MCP servers" in err
     assert "mcp-off" in err
@@ -501,7 +506,7 @@ def test_load_enabled_toolsets_falls_back_when_tui_env_invalid(monkeypatch, caps
         config_mod, "load_config", lambda: {"platform_toolsets": {"cli": ["memory"]}}
     )
 
-    assert server._load_enabled_toolsets() == ["kanban", "memory", "project"]
+    assert server._load_enabled_toolsets() == ["imessage", "kanban", "memory", "project"]
     assert "using configured CLI toolsets" in capsys.readouterr().err
 
 
@@ -829,7 +834,7 @@ def test_session_close_commits_memory_and_fires_finalize_hook(monkeypatch):
     monkeypatch.setattr(
         server,
         "_notify_session_boundary",
-        lambda event, session_id: calls["hooks"].append((event, session_id)),
+        lambda event, session_id, *_args: calls["hooks"].append((event, session_id)),
     )
 
     try:
@@ -847,7 +852,7 @@ def test_init_session_fires_reset_hook(monkeypatch):
     hooks = []
 
     class _FakeWorker:
-        def __init__(self, key, model):
+        def __init__(self, key, model, profile_home=None):
             self.key = key
 
         def close(self):
@@ -859,7 +864,7 @@ def test_init_session_fires_reset_hook(monkeypatch):
     monkeypatch.setattr(
         server,
         "_notify_session_boundary",
-        lambda event, session_id: hooks.append((event, session_id)),
+        lambda event, session_id, *_args: hooks.append((event, session_id)),
     )
 
     import tools.approval as _approval
@@ -913,6 +918,295 @@ def test_session_title_queues_when_db_row_not_ready(monkeypatch):
         assert get_resp["result"]["title"] == "queued title"
     finally:
         server._sessions.pop("sid", None)
+
+
+def test_notification_event_routing_by_session_key(monkeypatch):
+    """Background-process events surface only in the session that owns them."""
+    mine = _session(session_key="mine")
+    other = _session(session_key="other")
+    monkeypatch.setattr(server, "_sessions", {"a": mine, "b": other})
+
+    # My own event → handle it.
+    assert server._notification_event_belongs_elsewhere("a", mine, {"session_key": "mine"}) is False
+    # Global/system event with no owner → handle it.
+    assert server._notification_event_belongs_elsewhere("a", mine, {"session_key": ""}) is False
+    assert server._notification_event_belongs_elsewhere("a", mine, {}) is False
+    # Owned by another *live* session → defer to that session's poller.
+    assert server._notification_event_belongs_elsewhere("a", mine, {"session_key": "other"}) is True
+    # Owner is gone (not in _sessions) → handle as fallback so it isn't lost.
+    assert server._notification_event_belongs_elsewhere("a", mine, {"session_key": "ghost"}) is False
+
+
+def test_async_delegation_event_prefers_origin_ui_session(monkeypatch):
+    """Detached subagent completions return to the commissioning TUI tab.
+
+    Regression: when the durable session key was stale/orphaned, whichever
+    desktop poller woke first could consume the async result and inject it into
+    an unrelated session.
+    """
+    mine = _session(session_key="current-key")
+    other = _session(session_key="unrelated-key")
+    monkeypatch.setattr(server, "_sessions", {"origin-sid": mine, "other-sid": other})
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    evt = {
+        "type": "async_delegation",
+        "session_key": "stale-or-rotated-key",
+        "origin_ui_session_id": "origin-sid",
+    }
+
+    assert server._notification_event_belongs_elsewhere("other-sid", other, evt) is True
+    assert server._notification_event_belongs_elsewhere("origin-sid", mine, evt) is False
+
+
+def test_notification_event_follows_compression_continuation(monkeypatch):
+    """Events keyed to a compressed parent route to the live continuation."""
+    old_parent = _session(session_key="old-parent")
+    live_tip = _session(session_key="new-tip")
+    monkeypatch.setattr(server, "_sessions", {"old-sid": old_parent, "tip-sid": live_tip})
+
+    class _DB:
+        def resolve_resume_session_id(self, session_id):
+            return "new-tip" if session_id == "old-parent" else session_id
+
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+    evt = {"type": "async_delegation", "session_key": "old-parent"}
+
+    assert server._notification_event_belongs_elsewhere("old-sid", old_parent, evt) is True
+    assert server._notification_event_belongs_elsewhere("tip-sid", live_tip, evt) is False
+    # A third session must leave it alone for the continuation's poller.
+    third = _session(session_key="third")
+    monkeypatch.setattr(
+        server,
+        "_sessions",
+        {"old-sid": old_parent, "tip-sid": live_tip, "third-sid": third},
+    )
+    assert server._notification_event_belongs_elsewhere("third-sid", third, evt) is True
+
+
+def test_finalized_origin_ui_session_falls_back_to_live_continuation(monkeypatch):
+    """A closed origin tab must not steal its resumed continuation's result."""
+    finalized_origin = _session(session_key="old-parent", _finalized=True)
+    live_tip = _session(session_key="new-tip")
+    monkeypatch.setattr(
+        server,
+        "_sessions",
+        {"origin-sid": finalized_origin, "tip-sid": live_tip},
+    )
+
+    class _DB:
+        def resolve_resume_session_id(self, session_id):
+            return "new-tip" if session_id == "old-parent" else session_id
+
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+    evt = {
+        "type": "async_delegation",
+        "session_key": "old-parent",
+        "origin_ui_session_id": "origin-sid",
+    }
+
+    assert server._notification_event_belongs_elsewhere("origin-sid", finalized_origin, evt) is True
+    assert server._notification_event_belongs_elsewhere("tip-sid", live_tip, evt) is False
+
+
+def test_prompt_submit_rejects_negative_truncate_ordinal(monkeypatch):
+    """A negative truncate_before_user_ordinal must be rejected, not honoured.
+
+    The handler validates the upper bound (`ordinal >= len(user_indices)`) but a
+    negative ordinal would otherwise slip through and hit Python negative
+    indexing: `user_indices[-1]` selects the LAST user turn, truncating history
+    to everything before it and persisting that loss via replace_messages — an
+    unrecoverable overwrite of the session DB. Reject it on the safe 4018 path
+    and leave the in-memory history and the DB untouched.
+    """
+    replaced = []
+
+    class _FakeDB:
+        def replace_messages(self, key, messages):
+            replaced.append((key, list(messages)))
+
+    history = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "ok"},
+        {"role": "user", "content": "second"},
+        {"role": "assistant", "content": "done"},
+    ]
+    server._sessions["trunc-sid"] = _session(history=list(history))
+    monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
+    # If the guard ever lets a negative ordinal through, these would run and the
+    # session would be marked busy; failing here makes that regression loud.
+    monkeypatch.setattr(
+        server, "_start_agent_build", lambda *a, **k: pytest.fail("must not start a turn")
+    )
+    monkeypatch.setattr(
+        server, "_start_inflight_turn", lambda *a, **k: pytest.fail("must not start a turn")
+    )
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "prompt.submit",
+                "params": {
+                    "session_id": "trunc-sid",
+                    "text": "next",
+                    "truncate_before_user_ordinal": -1,
+                },
+            }
+        )
+        assert resp["error"]["code"] == 4018
+        # History and the DB are left exactly as they were — no silent loss.
+        assert server._sessions["trunc-sid"]["history"] == history
+        assert server._sessions["trunc-sid"]["running"] is False
+        assert replaced == []
+    finally:
+        server._sessions.pop("trunc-sid", None)
+
+
+def test_session_create_does_not_persist_empty_row(monkeypatch):
+    """session.create must NOT eagerly write a DB row.
+
+    Every TUI/desktop launch opens a session here just to paint the composer;
+    eagerly creating a row left an empty "Untitled" session behind for every
+    launch the user never typed into. The row is created lazily on first prompt.
+    """
+    created = []
+
+    class _FakeDB:
+        def create_session(self, *args, **kwargs):
+            created.append((args, kwargs))
+
+    monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
+    monkeypatch.setattr(server, "_start_agent_build", lambda *a, **k: None)
+    monkeypatch.setattr(
+        server.threading,
+        "Timer",
+        lambda *a, **k: types.SimpleNamespace(daemon=False, start=lambda: None),
+    )
+
+    resp = server.handle_request(
+        {"id": "1", "method": "session.create", "params": {"cols": 80}}
+    )
+    sid = resp["result"]["session_id"]
+    try:
+        assert resp["result"]["stored_session_id"]
+        assert created == [], "session.create should not persist an empty DB row"
+    finally:
+        server._sessions.pop(sid, None)
+
+
+def test_ensure_session_db_row_persists_explicit_cwd(monkeypatch, tmp_path):
+    """An explicitly chosen workspace is persisted as the session cwd."""
+    created = []
+
+    class _FakeDB:
+        def create_session(self, key, source=None, model=None, model_config=None, parent_session_id=None, cwd=None):
+            created.append(
+                {"key": key, "source": source, "model": model, "model_config": model_config, "cwd": cwd}
+            )
+
+    monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
+    monkeypatch.setattr(server, "_resolve_model", lambda: "test-model")
+
+    server._ensure_session_db_row({"session_key": "k1", "cwd": str(tmp_path), "explicit_cwd": True})
+
+    assert created == [
+        {"key": "k1", "source": "tui", "model": "test-model", "model_config": None, "cwd": str(tmp_path)}
+    ]
+
+
+def test_ensure_session_db_row_persists_session_source(monkeypatch):
+    created = []
+
+    class _FakeDB:
+        def create_session(self, key, source=None, model=None, model_config=None, parent_session_id=None, cwd=None):
+            created.append(
+                {"key": key, "source": source, "model": model, "model_config": model_config, "cwd": cwd}
+            )
+
+    monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
+    monkeypatch.setattr(server, "_resolve_model", lambda: "test-model")
+
+    server._ensure_session_db_row({"session_key": "k1", "source": "tool"})
+
+    assert created == [
+        {"key": "k1", "source": "tool", "model": "test-model", "model_config": None, "cwd": None}
+    ]
+
+
+def test_ensure_session_db_row_defaults_to_no_workspace(monkeypatch, tmp_path):
+    """Without an explicit workspace, cwd is left null so the session groups
+    under "No workspace" rather than the gateway's launch directory."""
+    created = []
+
+    class _FakeDB:
+        def create_session(self, key, source=None, model=None, model_config=None, parent_session_id=None, cwd=None):
+            created.append(
+                {"key": key, "source": source, "model": model, "model_config": model_config, "cwd": cwd}
+            )
+
+    monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
+    monkeypatch.setattr(server, "_resolve_model", lambda: "test-model")
+
+    server._ensure_session_db_row({"session_key": "k1", "cwd": str(tmp_path)})
+
+    assert created == [
+        {"key": "k1", "source": "tui", "model": "test-model", "model_config": None, "cwd": None}
+    ]
+
+
+def test_ensure_session_db_row_persists_session_model_override(monkeypatch):
+    """The session's composer pick (model + effort + fast) must own the DB row.
+
+    Regression for the "switched to gpt-5.5, reconnect snapped back to opus"
+    bug: the row was created with the global default and won the INSERT-OR-IGNORE
+    race, so resume rebuilt from the global model and silently reverted the
+    chat. The override model + a model_config carrying provider/reasoning/
+    service_tier must be persisted so session.resume restores all three.
+    """
+    created = []
+
+    class _FakeDB:
+        def create_session(self, key, source=None, model=None, model_config=None, parent_session_id=None, cwd=None):
+            created.append(
+                {"key": key, "model": model, "model_config": model_config, "cwd": cwd}
+            )
+
+    monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
+    monkeypatch.setattr(server, "_resolve_model", lambda: "global/default")
+
+    server._ensure_session_db_row(
+        {
+            "session_key": "k1",
+            "model_override": {"model": "openai/gpt-5.5", "provider": "openrouter"},
+            "create_reasoning_override": {"effort": "high"},
+            "create_service_tier_override": "priority",
+        }
+    )
+
+    assert len(created) == 1
+    row = created[0]
+    assert row["model"] == "openai/gpt-5.5"
+    assert row["model_config"]["model"] == "openai/gpt-5.5"
+    assert row["model_config"]["provider"] == "openrouter"
+    assert row["model_config"]["reasoning_config"] == {"effort": "high"}
+    assert row["model_config"]["service_tier"] == "priority"
+
+
+def test_ensure_session_db_row_no_override_uses_global(monkeypatch):
+    """A chat that made no explicit pick falls back to the global model and
+    writes no model_config (so it tracks the profile default)."""
+    created = []
+
+    class _FakeDB:
+        def create_session(self, key, source=None, model=None, model_config=None, parent_session_id=None, cwd=None):
+            created.append({"model": model, "model_config": model_config})
+
+    monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
+    monkeypatch.setattr(server, "_resolve_model", lambda: "global/default")
+
+    server._ensure_session_db_row({"session_key": "k1", "model_override": None})
+
+    assert created == [{"model": "global/default", "model_config": None}]
 
 
 def test_session_title_clears_pending_after_persist(monkeypatch):
@@ -1706,7 +2000,7 @@ def test_complete_slash_includes_provider_alias():
         {"id": "1", "method": "complete.slash", "params": {"text": "/pro"}}
     )
 
-    assert any(item["text"] == "provider" for item in resp["result"]["items"])
+    assert any(item["text"] == "profile" for item in resp["result"]["items"])
 
 
 def test_complete_slash_returns_plain_string_fields():
@@ -1868,7 +2162,7 @@ def test_config_set_model_waits_for_lazy_agent_before_switch(monkeypatch):
         target["agent"] = agent
         agent_ready.set()
 
-    def fake_apply(sid, target, raw):
+    def fake_apply(sid, target, raw, **_kwargs):
         calls.append(("apply", sid, target.get("agent"), raw))
         if target.get("agent") is not agent:
             raise AssertionError("model switch ran before lazy agent was ready")
@@ -1895,7 +2189,7 @@ def test_config_set_model_uses_live_switch_path(monkeypatch):
     server._sessions["sid"] = _session()
     seen = {}
 
-    def _fake_apply(sid, session, raw):
+    def _fake_apply(sid, session, raw, **_kwargs):
         seen["args"] = (sid, session["session_key"], raw)
         return {"value": "new/model", "warning": "catalog unreachable"}
 
@@ -1941,7 +2235,7 @@ def test_config_set_model_global_persists(monkeypatch):
 
     server._sessions["sid"] = _session(agent=_Agent())
     monkeypatch.setattr("hermes_cli.model_switch.switch_model", _switch_model)
-    monkeypatch.setattr(server, "_restart_slash_worker", lambda session: None)
+    monkeypatch.setattr(server, "_restart_slash_worker", lambda *args, **kwargs: None)
     monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
     # _persist_model_switch uses targeted save_config_value writes (#48305) so it
     # preserves sibling model.* keys instead of rewriting the whole block.
@@ -2001,7 +2295,7 @@ def test_config_set_model_syncs_inference_provider_env(monkeypatch):
     monkeypatch.setattr(
         "hermes_cli.model_switch.switch_model", lambda **_kwargs: result
     )
-    monkeypatch.setattr(server, "_restart_slash_worker", lambda session: None)
+    monkeypatch.setattr(server, "_restart_slash_worker", lambda *args, **kwargs: None)
     monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
 
     server.handle_request(
@@ -2016,7 +2310,7 @@ def test_config_set_model_syncs_inference_provider_env(monkeypatch):
         }
     )
 
-    assert os.environ["HERMES_INFERENCE_PROVIDER"] == "anthropic"
+    assert server._sessions["sid"]["model_override"]["provider"] == "anthropic"
 
 
 def test_config_set_model_syncs_tui_provider_unconditionally(monkeypatch):
@@ -2052,7 +2346,7 @@ def test_config_set_model_syncs_tui_provider_unconditionally(monkeypatch):
     monkeypatch.setattr(
         "hermes_cli.model_switch.switch_model", lambda **_kwargs: result
     )
-    monkeypatch.setattr(server, "_restart_slash_worker", lambda session: None)
+    monkeypatch.setattr(server, "_restart_slash_worker", lambda *args, **kwargs: None)
     monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
 
     server.handle_request(
@@ -2070,8 +2364,7 @@ def test_config_set_model_syncs_tui_provider_unconditionally(monkeypatch):
     # Both env vars must reflect the user's choice. HERMES_TUI_PROVIDER is
     # the canonical explicit-this-process carrier consumed by
     # _resolve_startup_runtime() on /new.
-    assert os.environ["HERMES_TUI_PROVIDER"] == "custom:xuanji"
-    assert os.environ["HERMES_INFERENCE_PROVIDER"] == "custom:xuanji"
+    assert server._sessions["sid"]["model_override"]["provider"] == "custom:xuanji"
 
 
 def test_config_set_model_syncs_tui_provider_env(monkeypatch):
@@ -2088,7 +2381,7 @@ def test_config_set_model_syncs_tui_provider_env(monkeypatch):
     agent = Agent()
     server._sessions["sid"] = _session(agent=agent)
     monkeypatch.setenv("HERMES_TUI_PROVIDER", "openai-codex")
-    monkeypatch.setattr(server, "_restart_slash_worker", lambda session: None)
+    monkeypatch.setattr(server, "_restart_slash_worker", lambda *args, **kwargs: None)
     monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
 
     def fake_switch_model(**kwargs):
@@ -2118,7 +2411,7 @@ def test_config_set_model_syncs_tui_provider_env(monkeypatch):
         )
 
         assert resp["result"]["value"] == "anthropic/claude-sonnet-4.6"
-        assert os.environ["HERMES_TUI_PROVIDER"] == "anthropic"
+        assert server._sessions["sid"]["model_override"]["provider"] == "anthropic"
         assert os.environ["HERMES_MODEL"] == "anthropic/claude-sonnet-4.6"
         assert os.environ["HERMES_INFERENCE_MODEL"] == "anthropic/claude-sonnet-4.6"
     finally:
@@ -2233,7 +2526,7 @@ def test_session_compress_syncs_session_key_after_rotation(monkeypatch):
     monkeypatch.setattr(server, "_session_info", lambda _agent, *a: {"model": "x"})
     restart_calls = []
     monkeypatch.setattr(
-        server, "_restart_slash_worker", lambda s: restart_calls.append(s)
+        server, "_restart_slash_worker", lambda *args: restart_calls.append(args)
     )
 
     try:
@@ -2824,6 +3117,25 @@ def test_session_info_includes_session_title(monkeypatch):
     assert info["title"] == "Dashboard title"
 
 
+def test_session_info_includes_install_warning_for_pip(monkeypatch):
+    """pip installs surface install_warning; git installs don't (issue: pip/brew deprecation)."""
+    monkeypatch.setattr("hermes_cli.config.detect_install_method", lambda: "pip")
+
+    info = server._session_info(types.SimpleNamespace(tools=[], model="", provider=""))
+
+    assert "install_warning" in info
+    assert "pip" in info["install_warning"]
+    assert "platform-support" in info["install_warning"]
+
+
+def test_session_info_omits_install_warning_for_git(monkeypatch):
+    monkeypatch.setattr("hermes_cli.config.detect_install_method", lambda: "git")
+
+    info = server._session_info(types.SimpleNamespace(tools=[], model="", provider=""))
+
+    assert "install_warning" not in info
+
+
 # ---------------------------------------------------------------------------
 # History-mutating commands must reject while session.running is True.
 # Without these guards, prompt.submit's post-run history write either
@@ -3372,7 +3684,7 @@ def test_config_set_model_rejects_while_running(monkeypatch):
     """/model via config.set must reject during an in-flight turn."""
     seen = {"called": False}
 
-    def _fake_apply(sid, session, raw):
+    def _fake_apply(sid, session, raw, **_kwargs):
         seen["called"] = True
         return {"value": raw, "warning": ""}
 
@@ -3406,7 +3718,7 @@ def test_config_set_model_allowed_when_idle(monkeypatch):
     """Regression guard: idle sessions can still switch models."""
     seen = {"called": False}
 
-    def _fake_apply(sid, session, raw):
+    def _fake_apply(sid, session, raw, **_kwargs):
         seen["called"] = True
         return {"value": "newmodel", "warning": ""}
 
@@ -3550,7 +3862,7 @@ def test_session_create_close_race_does_not_orphan_worker(monkeypatch):
     unregistered_keys: list[str] = []
 
     class _FakeWorker:
-        def __init__(self, key, model):
+        def __init__(self, key, model, profile_home=None):
             self.key = key
             self._closed = False
 
@@ -3576,7 +3888,7 @@ def test_session_create_close_race_does_not_orphan_worker(monkeypatch):
     release_build = threading.Event()
     build_entered = threading.Event()
 
-    def _slow_make_agent(sid, key, session_id=None):
+    def _slow_make_agent(sid, key, session_id=None, session_db=None, **_kwargs):
         build_started.set()
         build_entered.set()
         release_build.wait(timeout=3.0)
@@ -3671,7 +3983,7 @@ def test_session_create_no_race_keeps_worker_alive(monkeypatch):
     unregistered_keys: list[str] = []
 
     class _FakeWorker:
-        def __init__(self, key, model):
+        def __init__(self, key, model, profile_home=None):
             self.key = key
 
         def close(self):
@@ -3684,7 +3996,7 @@ def test_session_create_no_race_keeps_worker_alive(monkeypatch):
             self.base_url = ""
             self.api_key = ""
 
-    monkeypatch.setattr(server, "_make_agent", lambda sid, key: _FakeAgent())
+    monkeypatch.setattr(server, "_make_agent", lambda sid, key, session_db=None, **_kwargs: _FakeAgent())
     monkeypatch.setattr(server, "_SlashWorker", _FakeWorker)
     monkeypatch.setattr(
         server,
@@ -3753,7 +4065,7 @@ def test_get_db_degrades_cleanly_when_sessiondb_init_fails(monkeypatch):
 
 def test_session_create_continues_when_state_db_is_unavailable(monkeypatch):
     class _FakeWorker:
-        def __init__(self, key, model):
+        def __init__(self, key, model, profile_home=None):
             self.key = key
 
         def close(self):
@@ -3768,7 +4080,7 @@ def test_session_create_continues_when_state_db_is_unavailable(monkeypatch):
 
     emits = []
 
-    monkeypatch.setattr(server, "_make_agent", lambda sid, key: _FakeAgent())
+    monkeypatch.setattr(server, "_make_agent", lambda sid, key, session_db=None, **_kwargs: _FakeAgent())
     monkeypatch.setattr(server, "_SlashWorker", _FakeWorker)
     monkeypatch.setattr(server, "_get_db", lambda: None)
     monkeypatch.setattr(server, "_session_info", lambda _a, *a2: {"model": "x"})
@@ -3801,7 +4113,7 @@ def test_session_create_lazy_info_reports_desktop_contract(monkeypatch):
     date" on every launch even against a current backend."""
 
     class _FakeWorker:
-        def __init__(self, key, model):
+        def __init__(self, key, model, profile_home=None):
             self.key = key
 
         def close(self):
@@ -4057,6 +4369,52 @@ def test_model_options_propagates_list_exception(monkeypatch):
     assert "error" in resp
     assert resp["error"]["code"] == 5033
     assert "catalog blew up" in resp["error"]["message"]
+
+
+def test_model_options_hides_unconfigured_providers_by_default(monkeypatch):
+    from hermes_cli.inventory import ConfigContext
+
+    calls = []
+
+    monkeypatch.setattr(server, "_resolve_model", lambda: "")
+    monkeypatch.setattr(
+        "hermes_cli.inventory.load_picker_context",
+        lambda: ConfigContext(
+            current_provider="",
+            current_model="",
+            current_base_url="",
+            user_providers={},
+            custom_providers=[],
+        ),
+    )
+
+    def _fake_build_models_payload(_ctx, **kwargs):
+        calls.append(kwargs)
+        return {"providers": [], "model": "", "provider": ""}
+
+    monkeypatch.setattr(
+        "hermes_cli.inventory.build_models_payload",
+        _fake_build_models_payload,
+    )
+
+    resp = server._methods["model.options"](99, {"session_id": ""})
+    assert "result" in resp, resp
+    assert calls[-1]["explicit_only"] is False
+    assert calls[-1]["include_unconfigured"] is False
+
+    resp = server._methods["model.options"](
+        100,
+        {"session_id": "", "explicit_only": True},
+    )
+    assert "result" in resp, resp
+    assert calls[-1]["explicit_only"] is True
+
+    resp = server._methods["model.options"](
+        101,
+        {"session_id": "", "include_unconfigured": True},
+    )
+    assert "result" in resp, resp
+    assert calls[-1]["include_unconfigured"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -4478,7 +4836,7 @@ def test_session_most_recent_returns_first_non_denied(monkeypatch):
     """Drops `tool` rows like session.list does, returns the first hit."""
 
     class _DB:
-        def list_sessions_rich(self, *, source=None, limit=200, order_by_last_active=False):
+        def list_sessions_rich(self, *, source=None, limit=200, order_by_last_active=False, compact_rows=False):
             return [
                 {"id": "tool-1", "source": "tool", "title": "noise", "started_at": 100},
                 {"id": "tui-1", "source": "tui", "title": "real", "started_at": 99},
@@ -4497,7 +4855,7 @@ def test_session_most_recent_returns_first_non_denied(monkeypatch):
 
 def test_session_most_recent_returns_null_when_only_tool_rows(monkeypatch):
     class _DB:
-        def list_sessions_rich(self, *, source=None, limit=200, order_by_last_active=False):
+        def list_sessions_rich(self, *, source=None, limit=200, order_by_last_active=False, compact_rows=False):
             return [{"id": "tool-1", "source": "tool", "started_at": 1}]
 
     monkeypatch.setattr(server, "_get_db", lambda: _DB())
@@ -4515,7 +4873,7 @@ def test_session_most_recent_folds_db_exception_into_null_result(monkeypatch):
     'no answer' (Copilot review on #17130)."""
 
     class _BrokenDB:
-        def list_sessions_rich(self, *, source=None, limit=200, order_by_last_active=False):
+        def list_sessions_rich(self, *, source=None, limit=200, order_by_last_active=False, compact_rows=False):
             raise RuntimeError("db locked")
 
     monkeypatch.setattr(server, "_get_db", lambda: _BrokenDB())
@@ -4770,8 +5128,10 @@ def test_browser_manage_connect_default_local_reports_launch_hint(monkeypatch):
         _stub_urlopen(monkeypatch, ok=False)
         with (
             patch(
-                "hermes_cli.browser_connect.try_launch_chrome_debug", return_value=False
+                "hermes_cli.browser_connect.launch_chrome_debug",
+                return_value=ChromeDebugLaunch(),
             ),
+            patch("hermes_cli.browser_connect.manual_chrome_debug_command", return_value=None),
             patch(
                 "hermes_cli.browser_connect.get_chrome_debug_candidates",
                 return_value=[],
@@ -4826,8 +5186,10 @@ def test_browser_manage_connect_no_session_skips_progress_events(monkeypatch):
         _stub_urlopen(monkeypatch, ok=False)
         with (
             patch(
-                "hermes_cli.browser_connect.try_launch_chrome_debug", return_value=False
+                "hermes_cli.browser_connect.launch_chrome_debug",
+                return_value=ChromeDebugLaunch(),
             ),
+            patch("hermes_cli.browser_connect.manual_chrome_debug_command", return_value=None),
             patch(
                 "hermes_cli.browser_connect.get_chrome_debug_candidates",
                 return_value=[],
