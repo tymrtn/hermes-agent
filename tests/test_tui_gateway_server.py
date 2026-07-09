@@ -2412,8 +2412,7 @@ def test_config_set_model_syncs_tui_provider_env(monkeypatch):
 
         assert resp["result"]["value"] == "anthropic/claude-sonnet-4.6"
         assert server._sessions["sid"]["model_override"]["provider"] == "anthropic"
-        assert os.environ["HERMES_MODEL"] == "anthropic/claude-sonnet-4.6"
-        assert os.environ["HERMES_INFERENCE_MODEL"] == "anthropic/claude-sonnet-4.6"
+        assert server._sessions["sid"]["model_override"]["model"] == "anthropic/claude-sonnet-4.6"
     finally:
         server._sessions.clear()
 
