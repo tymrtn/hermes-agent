@@ -317,6 +317,23 @@ async def test_expect_edits_metadata_keeps_preview_on_legacy_path():
 
 
 @pytest.mark.asyncio
+async def test_notify_final_after_native_draft_uses_rich_path():
+    adapter = _make_adapter()
+
+    result = await adapter.send(
+        "12345",
+        RICH_CONTENT,
+        metadata={"expect_edits": True, "notify": True},
+    )
+
+    assert result.success is True
+    bot = adapter._bot
+    assert bot is not None
+    bot.do_api_request.assert_awaited_once()
+    bot.send_message.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_oversized_content_skips_rich_and_chunks():
     adapter = _make_adapter()
     # > 32,768 characters -> rich pre-check fails, legacy chunking takes over.
@@ -583,20 +600,27 @@ async def test_notification_opt_in_drops_disable_flag():
 
 @pytest.mark.asyncio
 async def test_table_only_uses_rich_when_rich_messages_opt_out():
-    """Pipe tables auto-route to sendRichMessage even without the full opt-in."""
+    """Explicit opt-out keeps tables on the copyable legacy path."""
     adapter = _make_adapter(extra={"rich_messages": False})
 
     result = await adapter.send("12345", TABLE_ONLY_CONTENT)
 
     assert result.success is True
-    api_kwargs = _rich_api_kwargs(adapter)
-    assert api_kwargs["rich_message"]["markdown"] == TABLE_ONLY_CONTENT
-    adapter._bot.send_message.assert_not_called()
+    adapter._bot.do_api_request.assert_not_called()
+    adapter._bot.send_message.assert_awaited()
+
+
+def test_table_like_delimiter_inside_fence_does_not_bypass_rich_opt_out():
+    adapter = _make_adapter(extra={"rich_messages": False})
+    fenced = "```text\n| a | b |\n|---|---|\n```"
+
+    assert adapter._content_is_pipe_table_primary(fenced) is False
+    assert adapter._rich_delivery_enabled(fenced) is False
 
 
 @pytest.mark.asyncio
 async def test_table_only_uses_rich_with_default_config():
-    """Default config keeps task lists on legacy but upgrades bare tables."""
+    """Default config keeps tables on the legacy opt-in path."""
     config = PlatformConfig(enabled=True, token="fake-token")
     adapter = TelegramAdapter(config)
     bot = MagicMock()
@@ -608,14 +632,14 @@ async def test_table_only_uses_rich_with_default_config():
     result = await adapter.send("12345", TABLE_ONLY_CONTENT)
 
     assert result.success is True
-    bot.do_api_request.assert_awaited_once()
-    bot.send_message.assert_not_called()
+    bot.do_api_request.assert_not_called()
+    bot.send_message.assert_awaited()
 
 
 @pytest.mark.asyncio
 async def test_dm_topic_resumed_send_uses_rich_for_table_without_reply_anchor():
     """Resumed/synthetic DM-topic sends route tables via direct_messages_topic_id."""
-    adapter = _make_adapter(extra={"rich_messages": False})
+    adapter = _make_adapter(extra={"rich_messages": True})
 
     result = await adapter.send(
         "123",
@@ -636,7 +660,7 @@ async def test_dm_topic_resumed_send_uses_rich_for_table_without_reply_anchor():
 
 @pytest.mark.asyncio
 async def test_finalize_edit_rich_includes_forum_topic_routing():
-    adapter = _make_adapter(extra={"rich_messages": False})
+    adapter = _make_adapter(extra={"rich_messages": True})
 
     result = await adapter.edit_message(
         "-100123",
@@ -787,9 +811,8 @@ def test_prefers_fresh_final_streaming_honors_rich_opt_out():
 
 
 # ----------------------------------------------------------------------
-# streaming_overflow_limit: with rich on, the stream consumer may accumulate up
-# to the 32,768-char rich cap before splitting, so a reply that fits one
-# sendRichMessage / sendRichMessageDraft isn't fragmented at the 4,096 limit.
+# streaming_overflow_limit: with rich on, accumulate to the rich cap before
+# splitting; explicit opt-out preserves the legacy 4,096-unit stream contract.
 # ----------------------------------------------------------------------
 def test_streaming_overflow_limit_is_rich_cap_when_enabled():
     adapter = _make_adapter()
