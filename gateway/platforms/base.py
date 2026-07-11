@@ -4459,6 +4459,12 @@ class BasePlatformAdapter(ABC):
             return result
 
         error_str = result.error or ""
+        if isinstance(result.raw_response, dict) and result.raw_response.get(
+            "delivery_ambiguous"
+        ):
+            # The transport may have accepted the message before disconnecting.
+            # Retrying would risk duplicate user-visible delivery.
+            return result
         is_network = result.retryable or self._is_retryable_error(error_str)
 
         # Timeout errors are not safe to retry (message may have been
@@ -4490,6 +4496,10 @@ class BasePlatformAdapter(ABC):
                 )
                 if result.success:
                     logger.info("[%s] Send succeeded on retry %d", self.name, attempt)
+                    return result
+                if isinstance(result.raw_response, dict) and result.raw_response.get(
+                    "delivery_ambiguous"
+                ):
                     return result
                 error_str = result.error or ""
                 if result.retry_after is not None:
