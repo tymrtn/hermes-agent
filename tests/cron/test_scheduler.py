@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
 
-from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _merge_mcp_into_per_job_toolsets
+from cron.scheduler import _resolve_origin, _resolve_delivery_target, _cron_delivery_platform, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _merge_mcp_into_per_job_toolsets
 from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
 
@@ -137,6 +137,21 @@ class TestResolveOrigin:
 
 
 class TestResolveDeliveryTarget:
+    def test_generation_platform_is_telegram_for_telegram_origin(self):
+        job = {
+            "deliver": "origin",
+            "origin": {"platform": "telegram", "chat_id": "123"},
+        }
+        assert _cron_delivery_platform(job) == "telegram"
+
+    def test_generation_platform_is_common_denominator_for_mixed_fanout(self, monkeypatch):
+        monkeypatch.setenv("DISCORD_HOME_CHANNEL", "456")
+        job = {
+            "deliver": "origin,discord",
+            "origin": {"platform": "telegram", "chat_id": "123"},
+        }
+        assert _cron_delivery_platform(job) is None
+
     def test_origin_delivery_preserves_thread_id(self):
         job = {
             "deliver": "origin",
@@ -568,7 +583,7 @@ class TestDeliverResultWrapping:
         return media_file.resolve()
 
     def test_delivery_wraps_content_with_header_and_footer(self):
-        """Delivered content should include task name header and agent-invisible note."""
+        """Telegram delivery uses a compact native-Markdown wrapper."""
         from gateway.config import Platform
 
         pconfig = MagicMock()
@@ -588,11 +603,35 @@ class TestDeliverResultWrapping:
 
         send_mock.assert_called_once()
         sent_content = send_mock.call_args.kwargs.get("content") or send_mock.call_args[0][-1]
-        assert "Cronjob Response: daily-report" in sent_content
+        assert sent_content.startswith("## ⏰ daily-report")
+        assert "`job_id: test-job`" in sent_content
+        assert "-------------" not in sent_content
+        assert "Here is today's summary." in sent_content
+        assert "*To stop or manage this job" in sent_content
+        assert "_To stop" not in sent_content
+
+    def test_non_telegram_delivery_preserves_plain_text_wrapper(self):
+        """Destination-aware wrapping must not alter other transports."""
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.DISCORD: pconfig}
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock:
+            _deliver_result({
+                "id": "test-job",
+                "name": "daily-report",
+                "deliver": "origin",
+                "origin": {"platform": "discord", "chat_id": "123"},
+            }, "Here is today's summary.")
+
+        sent_content = send_mock.call_args.kwargs.get("content") or send_mock.call_args[0][-1]
+        assert sent_content.startswith("Cronjob Response: daily-report")
         assert "(job_id: test-job)" in sent_content
         assert "-------------" in sent_content
-        assert "Here is today's summary." in sent_content
-        assert "To stop or manage this job" in sent_content
 
     def test_delivery_uses_job_id_when_no_name(self):
         """When a job has no name, the wrapper should fall back to job id."""
@@ -613,7 +652,7 @@ class TestDeliverResultWrapping:
             _deliver_result(job, "Output.")
 
         sent_content = send_mock.call_args.kwargs.get("content") or send_mock.call_args[0][-1]
-        assert "Cronjob Response: abc-123" in sent_content
+        assert sent_content.startswith("## ⏰ abc-123")
 
     def test_delivery_skips_wrapping_when_config_disabled(self):
         """When cron.wrap_response is false, deliver raw content without header/footer."""
@@ -998,6 +1037,7 @@ class TestRunJobSessionPersistence:
         assert kwargs["session_id"].startswith("cron_test-job_")
         assert kwargs["skip_memory"] is True
         assert "memory" in kwargs["disabled_toolsets"]
+        assert mock_agent._cron_delivery_platform is None
         fake_db.end_session.assert_called_once()
         call_args = fake_db.end_session.call_args
         assert call_args[0][0].startswith("cron_test-job_")

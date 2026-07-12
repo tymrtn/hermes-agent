@@ -393,6 +393,9 @@ def init_agent(
     agent.tool_progress_mode = tool_progress_mode
     agent.ephemeral_system_prompt = ephemeral_system_prompt
     agent.platform = platform  # "cli", "telegram", "discord", "whatsapp", etc.
+    # Cron scheduler may set this once before the first prompt build so cron
+    # autonomy guidance and destination formatting guidance can coexist.
+    agent._cron_delivery_platform = None
     agent._user_id = user_id  # Platform user identifier (gateway sessions)
     agent._user_id_alt = user_id_alt  # Optional stable alternate platform identifier
     agent._user_name = user_name
