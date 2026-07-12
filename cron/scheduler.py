@@ -1344,6 +1344,48 @@ def _resolve_delivery_target(job: dict) -> Optional[dict]:
     return targets[0] if targets else None
 
 
+def _cron_delivery_platform(job: dict) -> Optional[str]:
+    """Return one generation-format platform when every target agrees."""
+    platforms = {
+        str(target.get("platform") or "").strip().lower()
+        for target in _resolve_delivery_targets(job)
+    }
+    platforms.discard("")
+    return next(iter(platforms)) if len(platforms) == 1 else None
+
+
+def _format_cron_delivery_content(
+    job: dict, content: str, platform_name: str, wrap_response: bool
+) -> str:
+    """Apply the destination-specific cron envelope without changing payload."""
+    if not wrap_response:
+        return content
+
+    task_name = job.get("name", job["id"])
+    job_id = job.get("id", "")
+    footer = (
+        f'To stop or manage this job, send me a new message '
+        f'(e.g. "stop reminder {task_name}").'
+    )
+    if str(platform_name).lower() == "telegram":
+        return (
+            f"## ⏰ {task_name}\n\n"
+            f"{content}\n\n"
+            f"---\n"
+            f"`job_id: {job_id}`\n\n"
+            f"*{footer}*"
+        )
+
+    # Preserve the legacy byte shape for every non-Telegram destination.
+    return (
+        f"Cronjob Response: {task_name}\n"
+        f"(job_id: {job_id})\n"
+        f"-------------\n\n"
+        f"{content}\n\n"
+        f"{footer}"
+    )
+
+
 # Media extension sets — audio routing is centralized in gateway.platforms.base
 # via should_send_media_as_audio() so Telegram-specific rules stay in one place.
 _VIDEO_EXTS = frozenset({'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'})
@@ -1530,34 +1572,15 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     except Exception:
         pass
 
-    if wrap_response:
-        task_name = job.get("name", job["id"])
-        job_id = job.get("id", "")
-        delivery_content = (
-            f"Cronjob Response: {task_name}\n"
-            f"(job_id: {job_id})\n"
-            f"-------------\n\n"
-            f"{content}\n\n"
-            f"To stop or manage this job, send me a new message (e.g. \"stop reminder {task_name}\")."
-        )
-    else:
-        delivery_content = content
-
-    # Extract MEDIA: tags so attachments are forwarded as files, not raw text
+    # Extract MEDIA: tags per target below because the wrapper is destination
+    # specific. Attachments themselves remain identical across fan-out targets.
     from gateway.platforms.base import BasePlatformAdapter
-    media_files, cleaned_delivery_content = BasePlatformAdapter.extract_media(delivery_content)
-    media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
     auto_attach_local_paths = True
     try:
         gateway_cfg = user_cfg.get("gateway", {}) if isinstance(user_cfg, dict) else {}
         auto_attach_local_paths = gateway_cfg.get("auto_attach_local_paths", True)
     except Exception:
         auto_attach_local_paths = True
-    if auto_attach_local_paths and BasePlatformAdapter.auto_attach_local_paths_enabled():
-        local_files, cleaned_delivery_content = BasePlatformAdapter.extract_local_files(cleaned_delivery_content)
-        local_files = BasePlatformAdapter.filter_local_delivery_paths(local_files)
-        media_files.extend((path, False) for path in local_files)
-
     # Resolve the delivery-mirror gate ONCE (default off). When on, each
     # successful delivery is also appended to the target chat's gateway session
     # transcript so a user reply in that chat sees the cron output in context.
@@ -1584,6 +1607,20 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         platform_name = target["platform"]
         chat_id = target["chat_id"]
         thread_id = target.get("thread_id")
+
+        delivery_content = _format_cron_delivery_content(
+            job, content, platform_name, wrap_response
+        )
+        media_files, cleaned_delivery_content = BasePlatformAdapter.extract_media(
+            delivery_content
+        )
+        media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+        if auto_attach_local_paths and BasePlatformAdapter.auto_attach_local_paths_enabled():
+            local_files, cleaned_delivery_content = BasePlatformAdapter.extract_local_files(
+                cleaned_delivery_content
+            )
+            local_files = BasePlatformAdapter.filter_local_delivery_paths(local_files)
+            media_files.extend((path, False) for path in local_files)
 
         # Diagnostic: log thread_id for topic-aware delivery debugging
         origin = _resolve_origin(job) or {}
@@ -3192,6 +3229,10 @@ def run_job(
             session_id=_cron_session_id,
             session_db=_session_db,
         )
+        # Preserve cron execution semantics/toolsets while making the cached
+        # prompt aware of a single concrete delivery format. This is assigned
+        # before the first conversation builds the prompt and never mutates.
+        agent._cron_delivery_platform = _cron_delivery_platform(job)
         
         # Run the agent with an *inactivity*-based timeout: the job can run
         # for hours if it's actively calling tools / receiving stream tokens,

@@ -430,6 +430,27 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             pass
 
     _effective_hint = _resolve_platform_hint(agent, platform_key, _default_hint)
+    if platform_key == "cron":
+        # Keep the cron autonomy contract and append the resolved destination's
+        # formatting contract. The scheduler sets this once before first prompt
+        # construction, preserving prompt-cache stability and role alternation.
+        delivery_platform = str(
+            getattr(agent, "_cron_delivery_platform", "") or ""
+        ).lower().strip()
+        if delivery_platform and delivery_platform != "cron":
+            delivery_hint = PLATFORM_HINTS.get(delivery_platform, "")
+            if not delivery_hint:
+                try:
+                    from gateway.platform_registry import platform_registry
+                    entry = platform_registry.get(delivery_platform)
+                    delivery_hint = entry.platform_hint if entry else ""
+                except Exception:
+                    delivery_hint = ""
+            delivery_hint = _resolve_platform_hint(
+                agent, delivery_platform, delivery_hint
+            )
+            if delivery_hint:
+                _effective_hint = f"{_effective_hint}\n\n{delivery_hint}".strip()
     if platform_key == "tui" and _effective_hint:
         _effective_hint = _tui_embedded_pane_clarifier(_effective_hint)
     if _effective_hint:
