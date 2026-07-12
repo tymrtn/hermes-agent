@@ -99,3 +99,33 @@ class TestCodingContextBlock:
         monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
         agent = _make_agent(valid_tool_names=[], platform="cli")
         assert "coding agent" not in _stable_prompt(agent)
+
+
+class TestCronDeliveryPlatformHint:
+    def test_telegram_contract_is_appended_without_losing_cron_contract(self):
+        agent = _make_agent(platform="cron", _cron_delivery_platform="telegram")
+
+        stable = _stable_prompt(agent)
+
+        assert "scheduled cron job" in stable
+        assert "Standard Markdown is automatically converted" in stable
+        assert "Supported: **bold**, *italic*" in stable
+        assert "rich Markdown" in stable
+
+    def test_non_telegram_destination_does_not_receive_telegram_contract(self):
+        agent = _make_agent(platform="cron", _cron_delivery_platform="discord")
+
+        stable = _stable_prompt(agent)
+
+        assert "scheduled cron job" in stable
+        assert "Discord server or group chat" in stable
+        assert "Telegram now supports rich Markdown" not in stable
+
+    def test_mixed_destinations_do_not_guess_a_format_contract(self):
+        agent = _make_agent(platform="cron", _cron_delivery_platform=None)
+
+        stable = _stable_prompt(agent)
+
+        assert "scheduled cron job" in stable
+        assert "Telegram now supports rich Markdown" not in stable
+        assert "Discord server or group chat" not in stable
