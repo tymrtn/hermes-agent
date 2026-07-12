@@ -10,9 +10,16 @@ from hermes_cli import kanban_db as kb
 class RecordingAdapter:
     def __init__(self):
         self.sent = []
+        self.platform = Platform.TELEGRAM
 
     async def send(self, chat_id, text, metadata=None):
         self.sent.append({"chat_id": chat_id, "text": text, "metadata": metadata or {}})
+
+
+class NumericPlatformKey:
+    """Compatibility-style adapter key whose enum value is not a string."""
+
+    value = 1
 
 
 class DisconnectedAdapters(dict):
@@ -85,6 +92,25 @@ def test_kanban_notifier_dedupes_board_slugs_pointing_to_same_db(tmp_path, monke
 
     assert len(adapter.sent) == 1
     assert "Kanban" in adapter.sent[0]["text"]
+    assert tid in adapter.sent[0]["text"]
+
+
+def test_kanban_notifier_recovers_platform_from_adapter_for_numeric_enum_key(tmp_path, monkeypatch):
+    """A non-string enum ``.value`` must not crash every notifier tick."""
+    db_path = tmp_path / "numeric-platform-key.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    tid = _create_completed_subscription()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    # A compatibility/plugin path adds an enum-like auxiliary key whose
+    # ``.value`` is numeric alongside the valid gateway Platform key.
+    runner.adapters[NumericPlatformKey()] = object()
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
     assert tid in adapter.sent[0]["text"]
 
 

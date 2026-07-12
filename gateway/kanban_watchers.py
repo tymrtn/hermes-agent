@@ -198,10 +198,22 @@ class GatewayKanbanWatchersMixin:
             try:
                 def _collect():
                     deliveries: list[dict] = []
-                    active_platforms = {
-                        getattr(platform, "value", str(platform)).lower()
-                        for platform in self.adapters.keys()
-                    }
+                    active_platforms: set[str] = set()
+                    for platform_key, adapter in self.adapters.items():
+                        raw_platform = getattr(platform_key, "value", platform_key)
+                        if not isinstance(raw_platform, str):
+                            # Adapter registries normally use gateway.config.Platform
+                            # keys, whose values are strings.  Some compatibility/plugin
+                            # paths can expose enum-like keys with numeric ``.value``
+                            # fields.  Do not let one such key crash the notifier every
+                            # five seconds; recover the canonical platform from the
+                            # adapter itself when possible.
+                            adapter_platform = getattr(adapter, "platform", None)
+                            raw_platform = getattr(
+                                adapter_platform, "value", adapter_platform,
+                            )
+                        if raw_platform is not None:
+                            active_platforms.add(str(raw_platform).strip().lower())
                     if not active_platforms:
                         logger.debug("kanban notifier: no connected adapters; skipping tick")
                         return deliveries
