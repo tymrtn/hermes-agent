@@ -49,7 +49,11 @@ def finalize_turn(
     Lifted verbatim from ``run_conversation`` (the region after the main agent
     loop). See module docstring.
     """
-    from agent.conversation_loop import logger
+    from agent.conversation_loop import (
+        _redact_secure_markers,
+        _redact_secure_markers_in_messages,
+        logger,
+    )
 
     budget_exhausted = (
         api_call_count >= agent.max_iterations
@@ -169,6 +173,11 @@ def finalize_turn(
     # killing the turn.
     _cleanup_errors = []
 
+    # Secure-message payloads are for the live delivery surface only. Redact
+    # assistant transcript content before durable sinks while keeping the raw
+    # ``final_response`` untouched for the caller/platform response.
+    _redact_secure_markers_in_messages(messages)
+
     # Save trajectory if enabled.  ``user_message`` may be a multimodal
     # list of parts; the trajectory format wants a plain string.
     try:
@@ -228,6 +237,18 @@ def finalize_turn(
             if _tail_role != "assistant":
                 messages.append({"role": "assistant", "content": final_response})
 
+        # The model has completed its request, so replace API-local
+        # voice/model/skill guidance with the clean user input before writing the
+        # final durable snapshot and returning the continuation history. Earlier
+        # turn-start flushes use the DB-only override because their messages are
+        # still needed for the API request; this finalizer runs after that request
+        # is complete (#48677 / #63766).
+        _apply_override = getattr(agent, "_apply_persist_user_message_override", None)
+        if callable(_apply_override):
+            _apply_override(messages)
+        # Recovery paths may append the raw final response after the earlier
+        # trajectory redaction, so re-run at the session boundary.
+        _redact_secure_markers_in_messages(messages)
         agent._persist_session(messages, conversation_history)
     except Exception as _persist_err:
         _cleanup_errors.append(f"persist_session: {_persist_err}")
@@ -396,7 +417,7 @@ def finalize_turn(
                 task_id=effective_task_id,
                 turn_id=turn_id,
                 user_message=original_user_message,
-                assistant_response=final_response,
+                assistant_response=_redact_secure_markers(final_response),
                 conversation_history=list(messages),
                 model=agent.model,
                 platform=getattr(agent, "platform", None) or "",
@@ -492,7 +513,7 @@ def finalize_turn(
     # External memory provider: sync the completed turn + queue next prefetch.
     agent._sync_external_memory_for_turn(
         original_user_message=original_user_message,
-        final_response=final_response,
+        final_response=_redact_secure_markers(final_response),
         interrupted=interrupted,
         messages=messages,
     )

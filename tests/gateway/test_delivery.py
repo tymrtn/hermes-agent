@@ -310,6 +310,13 @@ class NonChunkingAdapter:
         return {"success": True}
 
 
+def test_telegram_declares_markdown_and_native_chunking_capabilities():
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+
+    assert TelegramAdapter.supports_code_blocks is True
+    assert TelegramAdapter.splits_long_messages is True
+
+
 @pytest.mark.asyncio
 async def test_long_output_truncated_for_non_chunking_adapter(tmp_path, monkeypatch):
     """Non-chunking adapters receive truncated content with a footer + file save."""
@@ -419,5 +426,4 @@ async def test_save_failure_during_truncation_raises_for_non_chunking_adapter(tm
     # retry (footer needs the path) re-raises.
     with pytest.raises(OSError, match="No space left on device"):
         await router._deliver_to_platform(target, long_content, metadata={"job_id": "job7"})
-
 
