@@ -879,6 +879,7 @@ async def test_messaging_branch_chain_materializes_wake_record(tmp_path,
     limit."""
     from types import SimpleNamespace
     from gateway.continuity_wake import load_wake_state_for_session
+    from gateway.session import AsyncSessionStore
     from gateway.slash_commands import GatewaySlashCommandsMixin
     from hermes_state import AsyncSessionDB
 
@@ -898,6 +899,9 @@ async def test_messaging_branch_chain_materializes_wake_record(tmp_path,
     gw = SimpleNamespace(
         _session_db=AsyncSessionDB(db),
         session_store=store,
+        # tyler/live migrated the branch handler to the async session-store
+        # facade; the mock must expose it the way gateway.run.py does.
+        async_session_store=AsyncSessionStore(store),
         config={},
         _session_key_for_source=lambda s: entry.session_key,
         _clear_session_boundary_security_state=lambda key: None,

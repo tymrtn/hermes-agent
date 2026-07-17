@@ -29,7 +29,8 @@ import logging
 from pathlib import Path
 
 from hermes_constants import get_hermes_home
-from tools.registry import registry, tool_error, tool_result
+from tools.registry import (invalidate_check_fn, registry, tool_error,
+                            tool_result)
 
 logger = logging.getLogger(__name__)
 
@@ -111,16 +112,40 @@ def check_continuity_requirements() -> bool:
         return False
 
 
+# Per-home memory of the last continuity store fingerprint observed here.
+# When a store appears, changes, or is removed under a profile home, the
+# cached ``check_continuity_requirements`` verdict for that home is stale;
+# dropping it lets the very next definitions build re-probe instead of
+# serving the pre-change availability for up to the 30s check_fn TTL. Keyed
+# by resolved home so one profile's store lifecycle never forces another's
+# to re-probe on every call.
+_UNSEEN = object()
+_last_store_fp_by_home: "dict[str | None, object]" = {}
+
+
 def continuity_store_fingerprint(home: Path | None = None):
     """Cheap availability fingerprint for the tool-definitions cache: the
     outer definitions memo must not pin a stale continuity verdict after a
-    store is created or removed (the 30s check_fn TTL below it then
-    re-evaluates). Never raises."""
+    store is created or removed. When the fingerprint changes for this
+    profile home, the continuity check_fn's TTL entry is dropped so the 30s
+    check_fn cache one level below the memo re-evaluates on the next build —
+    this covers both provisioning and the rollback unlink, neither of which
+    routes through a store method that could invalidate on its own. Never
+    raises."""
     try:
-        st = continuity_store_path(home).stat()
-        return (st.st_mtime_ns, st.st_size)
-    except FileNotFoundError:
-        return None
+        try:
+            st = continuity_store_path(home).stat()
+            fp = (st.st_mtime_ns, st.st_size)
+        except FileNotFoundError:
+            fp = None
+        try:
+            key = str(resolved_profile_home(home))
+        except Exception:
+            key = None
+        if _last_store_fp_by_home.get(key, _UNSEEN) != fp:
+            _last_store_fp_by_home[key] = fp
+            invalidate_check_fn(check_continuity_requirements)
+        return fp
     except Exception:
         return None
 
