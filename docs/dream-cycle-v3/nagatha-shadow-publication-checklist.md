@@ -27,12 +27,14 @@ Companion artifacts (tracked in this repo):
    re-verify the store, job ids, execution profiles, and schedules with
    `hermes -p nagatha cron list --all` at publication time rather than
    trusting this document.
-2. Cutover requires the `cutover-gate` subcommand to pass, and the gate
-   refuses until seven distinct elapsed shadow days are evidenced in the
-   shadow store (successful `runtime_cycle_completed` events on seven
-   wall-clock dates). `shadow-replay` / `historical-replay` output is
-   accelerated historical evidence and is NOT a substitute for those
-   seven days.
+2. Cutover requires the `cutover-gate` subcommand to pass. Same-day
+   controlled cutover: the gate refuses until at least ONE genuine
+   current-source successful shadow run is evidenced in the shadow store
+   (a hash-verified `runtime_cycle_completed` event) with every other hard
+   invariant green. `shadow-replay` / `historical-replay` output is
+   accelerated historical evidence, contributes ZERO operational runs, and
+   is NOT a substitute for that genuine run — replay alone can never pass.
+   There is no seven-day soak and no timed wait.
 3. The v3 RUNTIME performs no destination promotion and writes only
    under `$HOME/.hermes/dream-cycle/v3-shadow`. Memory, skills,
    projects, and task trackers are never written. The SCHEDULER
@@ -122,12 +124,15 @@ Companion artifacts (tracked in this repo):
 
 ## Activation (later; still long before any cutover)
 
-7. When ready to start the shadow week, activate ONLY the new job:
+7. When ready to start shadow operation, activate ONLY the new job:
    `hermes -p nagatha cron resume <job id>`. This begins nightly
    shadow cycles; nothing live changes.
-8. Let it run for at least seven distinct elapsed shadow days, checking
-   `$HOME/.hermes/dream-cycle/v3-shadow/reports/` for the daily cycle
-   reports.
+8. Run at least ONE genuine shadow cycle from current sources and confirm
+   it succeeded, checking `$HOME/.hermes/dream-cycle/v3-shadow/reports/`
+   for the cycle report. Same-day cutover needs one genuine successful
+   run with every hard invariant green — no multi-day soak is required.
+   An operator may choose to observe additional runs before cutting over,
+   but the gate does not impose a timed wait.
 9. Produce the replay evidence and evaluate the gate (both exit nonzero
    on failure):
 

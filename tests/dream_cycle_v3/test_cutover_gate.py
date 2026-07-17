@@ -1,12 +1,13 @@
-"""Phase 4 cutover gate.
+"""Phase 4 cutover gate — same-day controlled cutover.
 
 Consumes the seven-window historical replay summary plus one current shadow
-cycle report and returns pass/fail for the hard invariants. The gate MUST
-refuse cutover until seven distinct successful operational dates are
-evidenced in durable state (runtime_cycle_completed events stamped with the
-runtime's own wall clock) — a same-day historical replay never satisfies
-that by itself. The seven-day minimum cannot be lowered by CLI or
-programmatic callers.
+cycle report and returns pass/fail for the hard invariants. Same-day cutover
+(authoritative product policy, 2026-07-17): ONE genuine, current-source,
+successful shadow run is sufficient operational evidence when every other
+hard invariant is green. Historical replay never counts as an operational
+run, so replay alone can never pass; the floor of one genuine run cannot be
+lowered, and there is no replay-equivalence bypass. The obsolete
+seven-elapsed-day soak is gone — no timed wait is imposed.
 """
 import copy
 import json
@@ -30,9 +31,9 @@ def _mtime(day: str) -> int:
     return int(datetime.fromisoformat(day + "T12:00:00+00:00").timestamp())
 
 
-@pytest.fixture
-def gated(tmp_path):
-    """One replay (7 windows) plus one current shadow cycle in one store."""
+def _prepare_inputs(tmp_path):
+    """Operator-reviewed read roots, registry, threads, and tracker inputs
+    shared by a cycle and its replay (all read-only)."""
     sources = tmp_path / "sources" / "profile"
     sources.mkdir(parents=True)
     for day in DAY_DATES:
@@ -50,11 +51,9 @@ def gated(tmp_path):
         encoding="utf-8")
     kanban_db = _build_sample_kanban_db(
         tmp_path / "trackers" / "kanban" / "kanban.db")
-    v3_root = tmp_path / "v3-shadow"
-
-    shared = dict(
+    return dict(
         profile="nagatha-test", owner="nagatha",
-        read_roots={"profile": sources}, v3_root=v3_root,
+        read_roots={"profile": sources}, v3_root=tmp_path / "v3-shadow",
         registry_path=registry, threads_path=threads,
         kanban_db=kanban_db, kanban_board="sample-board",
         todoist_export=SAMPLE_DATA / "todoist_export.json",
@@ -63,12 +62,19 @@ def gated(tmp_path):
         smoke_expected_project="hermes-continuity",
         smoke_require_thread=True,
     )
+
+
+@pytest.fixture
+def gated(tmp_path):
+    """One replay (7 windows) plus one genuine current shadow cycle in one
+    store — the same-day cutover PASS scenario."""
+    shared = _prepare_inputs(tmp_path)
     replay = run_historical_replay(start_date=START, end_date=END, **shared)
     assert replay.ok, "fixture replay must pass"
 
     # A distinct current shadow cycle. Replay-owned runs remain permanently
     # labeled as replay evidence; rerunning one through run_cycle must never
-    # launder it into elapsed operational evidence.
+    # launder it into a genuine operational run.
     shadow = run_cycle(RuntimeConfig(
         mode="shadow",
         window_start=datetime(2026, 7, 12, tzinfo=timezone.utc),
@@ -80,7 +86,7 @@ def gated(tmp_path):
 
     return {
         "tmp": tmp_path,
-        "db": v3_root / "continuity.db",
+        "db": shared["v3_root"] / "continuity.db",
         "summary": replay.summary,
         "summary_path": Path(replay.summary_path),
         "shadow_report": shadow.report,
@@ -89,25 +95,114 @@ def gated(tmp_path):
     }
 
 
-def test_gate_refuses_same_day_replay_by_default(gated):
+@pytest.fixture
+def replay_only(tmp_path):
+    """A store with a valid 7-window replay but NO genuine current shadow
+    run — the 'replay alone' scenario that must never pass cutover."""
+    shared = _prepare_inputs(tmp_path)
+    replay = run_historical_replay(start_date=START, end_date=END, **shared)
+    assert replay.ok, "fixture replay must pass"
+    db = shared["v3_root"] / "continuity.db"
+    # The only report a replay-alone operator could offer is a replay
+    # window's own report, which is permanently marked historical_replay.
+    replay_run_id = replay.summary["windows"][0]["run_id"]
+    replay_report = json.loads(
+        (db.parent / "reports" / f"{replay_run_id}.json")
+        .read_text(encoding="utf-8"))
+    return {
+        "tmp": tmp_path,
+        "db": db,
+        "summary": replay.summary,
+        "summary_path": Path(replay.summary_path),
+        "replay_report": replay_report,
+        "shared": shared,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Same-day cutover: one genuine current shadow run is sufficient
+# ---------------------------------------------------------------------------
+
+def test_gate_passes_with_one_genuine_current_shadow_run(gated):
+    """One genuine current shadow run + a clean replay and every hard
+    invariant green passes cutover the same day — no seven-day soak."""
     verdict = evaluate_cutover_gate(
         store_path=gated["db"], replay_store_path=gated["db"],
         replay_summary=gated["summary"],
         shadow_report=gated["shadow_report"])
     assert verdict["kind"] == "dream-cycle-v3-cutover-gate"
-    assert verdict["pass"] is False
-    assert verdict["checks"]["operational_days"]["ok"] is False
-    # everything ran today: exactly one distinct operational date
-    assert verdict["operational_days_evidenced"] == 1
-    assert verdict["required_operational_days"] == 7
+    assert verdict["operational_runs_evidenced"] == 1
+    assert verdict["required_operational_runs"] == 1
+    assert verdict["checks"]["operational_runs"]["ok"] is True
     assert verdict["replay_equivalence_override"] is False
-    assert "does not by itself satisfy" in verdict["statement"]
-    assert "seven elapsed daily operational cycles" in verdict["statement"]
+    assert verdict["pass"] is True
+    # Every check must be green for the same-day pass.
+    assert all(c["ok"] for c in verdict["checks"].values())
+    # No seven-day framing survives in the schema or the statement.
+    assert "operational_days_evidenced" not in verdict
+    assert "required_operational_days" not in verdict
+    assert "operational_days" not in verdict["checks"]
+    assert "seven" not in verdict["statement"].lower()
+    assert "operational run" in verdict["statement"].lower()
 
 
-def test_historical_replay_events_never_count_as_operational_days(gated):
+def test_gate_refuses_replay_alone(replay_only):
+    """Replay is accelerated historical evidence, never an operational run:
+    a store with only replay runs evidences zero operational runs, and a
+    replay report (historical_replay=True) is not a current shadow run."""
+    verdict = evaluate_cutover_gate(
+        store_path=replay_only["db"], replay_store_path=replay_only["db"],
+        replay_summary=replay_only["summary"],
+        shadow_report=replay_only["replay_report"])
+    assert verdict["operational_runs_evidenced"] == 0
+    assert verdict["checks"]["operational_runs"]["ok"] is False
+    assert verdict["checks"]["shadow_cycle_report"]["ok"] is False
+    assert verdict["pass"] is False
+
+
+def test_gate_floor_is_one_run_and_cannot_be_lowered_below_one(gated):
+    """No seven-day clamp remains: the floor is exactly ONE genuine run. A
+    caller cannot lower it to zero (which would let replay alone pass)."""
+    verdict = evaluate_cutover_gate(
+        store_path=gated["db"], replay_store_path=gated["db"],
+        replay_summary=gated["summary"],
+        shadow_report=gated["shadow_report"], required_operational_runs=0)
+    assert verdict["required_operational_runs"] == 1   # floored to 1, not 7
+    assert verdict["checks"]["operational_runs"]["ok"] is True  # 1 >= 1
+    assert verdict["pass"] is True
+
+
+def test_gate_operator_may_raise_required_runs(gated):
+    """A caller may demand MORE than one genuine run; one is then not
+    enough (proves the run count is real, not a rubber stamp)."""
+    verdict = evaluate_cutover_gate(
+        store_path=gated["db"], replay_store_path=gated["db"],
+        replay_summary=gated["summary"],
+        shadow_report=gated["shadow_report"], required_operational_runs=2)
+    assert verdict["required_operational_runs"] == 2
+    assert verdict["operational_runs_evidenced"] == 1
+    assert verdict["checks"]["operational_runs"]["ok"] is False
+    assert verdict["pass"] is False
+
+
+def test_gate_has_no_accept_replay_bypass(gated):
+    """The dishonest --accept-replay-as-operational bypass was not revived:
+    the keyword no longer exists on the gate at all."""
+    with pytest.raises(TypeError):
+        evaluate_cutover_gate(
+            store_path=gated["db"], replay_store_path=gated["db"],
+            replay_summary=gated["summary"],
+            shadow_report=gated["shadow_report"],
+            accept_replay_as_operational=True)
+
+
+# ---------------------------------------------------------------------------
+# Genuine-run accounting: replay/fabricated events never count
+# ---------------------------------------------------------------------------
+
+def test_historical_replay_events_never_count_as_operational(gated):
     """Authenticated replay reports/events prove the pipeline, not elapsed
-    operations; only the fixture's separate current cycle may count."""
+    operation; only the fixture's separate current cycle counts as a run."""
     import dream_cycle_v3.runtime as runtime_mod
 
     replay_run_ids = {row["run_id"] for row in gated["summary"]["windows"]}
@@ -126,30 +221,8 @@ def test_historical_replay_events_never_count_as_operational_days(gated):
             .read_text(encoding="utf-8"))
         assert report["historical_replay"] is True
 
-    assert runtime_mod._distinct_operational_dates(
+    assert runtime_mod._distinct_operational_runs(
         gated["db"], profile="nagatha-test") == 1
-
-
-def test_gate_ignores_replay_equivalence_override(gated):
-    verdict = evaluate_cutover_gate(
-        store_path=gated["db"], replay_store_path=gated["db"],
-        replay_summary=gated["summary"],
-        shadow_report=gated["shadow_report"],
-        accept_replay_as_operational=True)
-    assert verdict["pass"] is False
-    assert verdict["replay_equivalence_override"] is False
-    assert verdict["checks"]["operational_days"]["ok"] is False
-    assert "does not by itself satisfy" in verdict["statement"]
-
-
-def test_gate_cannot_lower_required_operational_days(gated):
-    verdict = evaluate_cutover_gate(
-        store_path=gated["db"], replay_store_path=gated["db"],
-        replay_summary=gated["summary"],
-        shadow_report=gated["shadow_report"], required_operational_days=1)
-    assert verdict["pass"] is False
-    assert verdict["required_operational_days"] == 7
-    assert verdict["checks"]["operational_days"]["ok"] is False
 
 
 def _emit_cycle_events(db, days, *, run_ids=None, mode="shadow",
@@ -175,25 +248,23 @@ def _emit_cycle_events(db, days, *, run_ids=None, mode="shadow",
 def test_gate_never_counts_hashless_fabricated_linked_events(gated):
     """A fabricated payload-only event linked to a real recorded run_id, but
     carrying no report_sha256 (or one that does not authenticate against the
-    real published report), must not count as an elapsed operational day —
-    only genuine hash-verified completion evidence may (codex phase-4 fourth
+    real published report), must not count as an operational run — only
+    genuine hash-verified completion evidence may (codex phase-4 fourth
     review finding 1)."""
     _emit_cycle_events(gated["db"], DAY_DATES, run_ids="recorded")
     verdict = evaluate_cutover_gate(
         store_path=gated["db"], replay_store_path=gated["db"],
         replay_summary=gated["summary"],
         shadow_report=gated["shadow_report"])
-    assert verdict["operational_days_evidenced"] == 1  # today's real cycles
-    assert verdict["checks"]["operational_days"]["ok"] is False
-    assert verdict["pass"] is False
+    # The fabrications add zero: only the one genuine current cycle counts.
+    assert verdict["operational_runs_evidenced"] == 1
 
 
-def test_distinct_operational_dates_counts_genuine_backdated_hash_events(
-        gated, monkeypatch):
-    """Seven distinct wall-clock dates of GENUINE hash-verified shadow runs
-    (real reports, real report_sha256, only the completion event's wall
-    clock is simulated to stand in for seven real elapsed days) satisfy the
-    operational-days requirement; fabricated payload-only events never do."""
+def test_genuine_backdated_runs_each_count_once(gated, monkeypatch):
+    """Seven GENUINE hash-verified shadow runs (real reports, real
+    report_sha256, only the completion event's wall clock simulated) count
+    as seven distinct operational runs; fabricated payload-only events never
+    do."""
     import dream_cycle_v3.runtime as runtime_mod
 
     def backdated_record(store, *, run_id, payload):
@@ -206,7 +277,7 @@ def test_distinct_operational_dates_counts_genuine_backdated_hash_events(
     monkeypatch.setattr(runtime_mod, "_record_success_event",
                         backdated_record)
 
-    # smoke is irrelevant to operational-day accounting, and the broker
+    # smoke is irrelevant to operational-run accounting, and the broker
     # abstains as stale this far past the fixture's registry timestamps;
     # disable it so only the hash-authentication path is under test.
     shared = dict(gated["shared"], smoke_message=None,
@@ -221,7 +292,7 @@ def test_distinct_operational_dates_counts_genuine_backdated_hash_events(
             **shared))
         assert result.ok, f"backdated fixture cycle {i} must succeed"
 
-    evidenced = runtime_mod._distinct_operational_dates(
+    evidenced = runtime_mod._distinct_operational_runs(
         gated["db"], profile="nagatha-test")
     assert evidenced >= 7
 
@@ -229,21 +300,18 @@ def test_distinct_operational_dates_counts_genuine_backdated_hash_events(
         store_path=gated["db"], replay_store_path=gated["db"],
         replay_summary=gated["summary"],
         shadow_report=gated["shadow_report"])
-    assert verdict["required_operational_days"] == 7
-    assert verdict["checks"]["operational_days"]["ok"] is True
+    assert verdict["required_operational_runs"] == 1
+    assert verdict["checks"]["operational_runs"]["ok"] is True
     assert verdict["pass"] is True
 
 
-# -- codex phase-4 fifth review finding 2: one run/hash evidencing 7 days ----
-
-def test_distinct_operational_dates_never_lets_one_run_evidence_seven_days(
-        gated):
-    """One genuine run/report can evidence at most ONE operational day, no
+def test_forged_events_never_inflate_run_count(gated):
+    """One genuine run/report can evidence at most ONE operational run, no
     matter how many completion events reference it. A forged extra event
     that replays the SAME already-attested run_id/report_sha256 payload
     under distinct entity_ids and backdated wall clocks (the read-only
-    probe's technique — seven events, one real run/report hash) must not
-    inflate the distinct-date count (codex phase-4 fifth review finding 2)."""
+    probe's technique) must not inflate the count (codex phase-4 fifth
+    review finding 2), even when a caller has raised the bar."""
     import dream_cycle_v3.runtime as runtime_mod
 
     run_id = gated["shadow_report"]["run_id"]
@@ -259,28 +327,41 @@ def test_distinct_operational_dates_never_lets_one_run_evidence_seven_days(
                     event_type=runtime_mod.CYCLE_EVENT_TYPE, payload=payload,
                     run_id=run_id, now=f"{day}T03:00:00+00:00")
 
-    evidenced = runtime_mod._distinct_operational_dates(
+    evidenced = runtime_mod._distinct_operational_runs(
         gated["db"], profile="nagatha-test")
     assert evidenced == 1, \
-        "one genuine run/report hash must never evidence seven days"
+        "one genuine run/report hash must never count as many runs"
 
+    # The single genuine run still legitimately satisfies the one-run floor;
+    # the forgeries simply add nothing.
     verdict = evaluate_cutover_gate(
         store_path=gated["db"], replay_store_path=gated["db"],
         replay_summary=gated["summary"], shadow_report=gated["shadow_report"])
-    assert verdict["checks"]["operational_days"]["ok"] is False
-    assert verdict["pass"] is False
+    assert verdict["operational_runs_evidenced"] == 1
+    assert verdict["pass"] is True
+
+    # Raising the bar exposes the forgeries as worthless: seven fake events
+    # cannot manufacture a second genuine run.
+    raised = evaluate_cutover_gate(
+        store_path=gated["db"], replay_store_path=gated["db"],
+        replay_summary=gated["summary"], shadow_report=gated["shadow_report"],
+        required_operational_runs=2)
+    assert raised["operational_runs_evidenced"] == 1
+    assert raised["checks"]["operational_runs"]["ok"] is False
+    assert raised["pass"] is False
 
 
 def test_gate_never_counts_unlinked_synthetic_events(gated):
     """run_id=None events (or events whose run was never recorded) are
-    fabrications, not operational evidence (codex phase-4 finding 3)."""
+    fabrications, not operational evidence (codex phase-4 finding 3): they
+    cannot manufacture runs even against a raised bar."""
     _emit_cycle_events(gated["db"], DAY_DATES, run_ids=None)
     verdict = evaluate_cutover_gate(
         store_path=gated["db"], replay_store_path=gated["db"],
         replay_summary=gated["summary"],
-        shadow_report=gated["shadow_report"])
-    assert verdict["operational_days_evidenced"] == 1  # today's real cycles
-    assert verdict["checks"]["operational_days"]["ok"] is False
+        shadow_report=gated["shadow_report"], required_operational_runs=3)
+    assert verdict["operational_runs_evidenced"] == 1  # only today's real cycle
+    assert verdict["checks"]["operational_runs"]["ok"] is False  # 1 < 3
     assert verdict["pass"] is False
 
 
@@ -293,9 +374,7 @@ def test_gate_never_counts_wrong_mode_or_profile_events(gated):
         store_path=gated["db"], replay_store_path=gated["db"],
         replay_summary=gated["summary"],
         shadow_report=gated["shadow_report"])
-    assert verdict["operational_days_evidenced"] == 1
-    assert verdict["checks"]["operational_days"]["ok"] is False
-    assert verdict["pass"] is False
+    assert verdict["operational_runs_evidenced"] == 1
 
 
 def test_gate_fails_on_profile_disagreement(gated):
@@ -304,8 +383,7 @@ def test_gate_fails_on_profile_disagreement(gated):
     verdict = evaluate_cutover_gate(
         store_path=gated["db"], replay_store_path=gated["db"],
         replay_summary=gated["summary"],
-        shadow_report=tampered,
-        accept_replay_as_operational=True)
+        shadow_report=tampered)
     assert verdict["checks"]["profile_agreement"]["ok"] is False
     assert verdict["pass"] is False
 
@@ -318,8 +396,7 @@ def test_gate_fails_when_shadow_report_run_is_not_recorded(gated):
     verdict = evaluate_cutover_gate(
         store_path=gated["db"], replay_store_path=gated["db"],
         replay_summary=gated["summary"],
-        shadow_report=tampered,
-        accept_replay_as_operational=True)
+        shadow_report=tampered)
     assert verdict["checks"]["shadow_cycle_report"]["ok"] is False
     assert verdict["pass"] is False
 
@@ -336,7 +413,7 @@ def test_gate_links_shadow_report_to_recorded_manifest_and_window(
     verdict = evaluate_cutover_gate(
         store_path=gated["db"], replay_store_path=gated["db"],
         replay_summary=gated["summary"],
-        shadow_report=tampered, accept_replay_as_operational=True)
+        shadow_report=tampered)
     assert verdict["checks"]["shadow_cycle_report"]["ok"] is False
     assert verdict["pass"] is False
 
@@ -347,8 +424,7 @@ def test_gate_rejects_empty_assertion_only_replay_windows(gated):
     verdict = evaluate_cutover_gate(
         store_path=gated["db"], replay_store_path=gated["db"],
         replay_summary=tampered,
-        shadow_report=gated["shadow_report"],
-        accept_replay_as_operational=True)
+        shadow_report=gated["shadow_report"])
     assert verdict["checks"]["replay_summary_shape"]["ok"] is False
     assert verdict["pass"] is False
 
@@ -375,18 +451,16 @@ def test_gate_does_not_trust_payload_profile_over_recorded_run_profile(gated):
         store_path=gated["db"], replay_store_path=gated["db"],
         replay_summary=gated["summary"],
         shadow_report=gated["shadow_report"])
-    assert verdict["operational_days_evidenced"] == 1
-    assert verdict["checks"]["operational_days"]["ok"] is False
+    assert verdict["operational_runs_evidenced"] == 1
 
 
-def test_gate_fails_on_broken_replay_invariants_even_with_override(gated):
+def test_gate_fails_on_broken_replay_invariants(gated):
     tampered = copy.deepcopy(gated["summary"])
     tampered["invariants"]["all_reruns_zero_delta"] = False
     verdict = evaluate_cutover_gate(
         store_path=gated["db"], replay_store_path=gated["db"],
         replay_summary=tampered,
-        shadow_report=gated["shadow_report"],
-        accept_replay_as_operational=True)
+        shadow_report=gated["shadow_report"])
     assert verdict["pass"] is False
     assert verdict["checks"]["replay_invariants"]["ok"] is False
 
@@ -397,8 +471,7 @@ def test_gate_fails_on_low_retrieval_rate(gated):
     verdict = evaluate_cutover_gate(
         store_path=gated["db"], replay_store_path=gated["db"],
         replay_summary=tampered,
-        shadow_report=gated["shadow_report"],
-        accept_replay_as_operational=True)
+        shadow_report=gated["shadow_report"])
     assert verdict["pass"] is False
     assert verdict["checks"]["retrieval_success_rate"]["ok"] is False
 
@@ -407,21 +480,21 @@ def test_gate_fails_on_wrong_document_shapes(gated):
     verdict = evaluate_cutover_gate(
         store_path=gated["db"], replay_store_path=gated["db"],
         replay_summary={"kind": "something-else"},
-        shadow_report=gated["shadow_report"],
-        accept_replay_as_operational=True)
+        shadow_report=gated["shadow_report"])
     assert verdict["pass"] is False
     assert verdict["checks"]["replay_summary_shape"]["ok"] is False
 
     verdict = evaluate_cutover_gate(
         store_path=gated["db"], replay_store_path=gated["db"],
         replay_summary=gated["summary"],
-        shadow_report={"kind": "not-a-cycle-report"},
-        accept_replay_as_operational=True)
+        shadow_report={"kind": "not-a-cycle-report"})
     assert verdict["pass"] is False
     assert verdict["checks"]["shadow_cycle_report"]["ok"] is False
 
 
 def test_cli_cutover_gate(gated, capsys):
+    """The CLI passes the same-day gate for a genuine current shadow run and
+    exposes no replay-equivalence bypass flag."""
     from dream_cycle_v3.cli import main
     args = ["cutover-gate",
             "--db", str(gated["db"]),
@@ -430,8 +503,9 @@ def test_cli_cutover_gate(gated, capsys):
     rc = main(args)
     out = capsys.readouterr().out
     verdict = json.loads(out)
-    assert rc == 1
-    assert verdict["pass"] is False
+    assert rc == 0
+    assert verdict["pass"] is True
+    assert verdict["required_operational_runs"] == 1
 
     with pytest.raises(SystemExit) as exc:
         main(args + ["--accept-replay-as-operational"])
@@ -453,9 +527,8 @@ def test_gate_rejects_fabricated_replay_window_run_id(gated):
     verdict = evaluate_cutover_gate(
         store_path=gated["db"], replay_store_path=gated["db"],
         replay_summary=tampered,
-        shadow_report=gated["shadow_report"],
-        accept_replay_as_operational=True)
-    # the OLD shape-only check still finds seven distinct, well-typed rows
+        shadow_report=gated["shadow_report"])
+    # the shape-only check still finds seven distinct, well-typed rows
     assert verdict["checks"]["replay_summary_shape"]["ok"] is True
     assert verdict["checks"]["replay_windows_linked_to_store"]["ok"] is False
     assert verdict["pass"] is False
@@ -470,8 +543,7 @@ def test_gate_rejects_replay_window_claim_mismatch_for_a_real_run(gated):
     verdict = evaluate_cutover_gate(
         store_path=gated["db"], replay_store_path=gated["db"],
         replay_summary=tampered,
-        shadow_report=gated["shadow_report"],
-        accept_replay_as_operational=True)
+        shadow_report=gated["shadow_report"])
     assert verdict["checks"]["replay_windows_linked_to_store"]["ok"] is False
     assert verdict["pass"] is False
 
@@ -482,8 +554,7 @@ def test_gate_fails_closed_on_missing_replay_store(gated):
         store_path=gated["db"],
         replay_store_path=gated["tmp"] / "no-such-root" / "continuity.db",
         replay_summary=gated["summary"],
-        shadow_report=gated["shadow_report"],
-        accept_replay_as_operational=True)
+        shadow_report=gated["shadow_report"])
     assert verdict["checks"]["replay_windows_linked_to_store"]["ok"] is False
     assert verdict["checks"]["replay_store_current_invariants"]["ok"] is False
     assert verdict["pass"] is False
@@ -514,8 +585,7 @@ def test_gate_rejects_edited_shadow_report_dict_claiming_false_smoke(gated):
     verdict = evaluate_cutover_gate(
         store_path=off_root / "continuity.db", replay_store_path=gated["db"],
         replay_summary=gated["summary"],
-        shadow_report=lie,
-        accept_replay_as_operational=True)
+        shadow_report=lie)
     assert verdict["checks"]["shadow_report_authenticity"]["ok"] is True
     assert verdict["checks"]["shadow_cycle_report"]["ok"] is False
     assert verdict["pass"] is False
@@ -534,8 +604,7 @@ def test_gate_rejects_report_file_tampered_after_publication(gated):
     verdict = evaluate_cutover_gate(
         store_path=gated["db"], replay_store_path=gated["db"],
         replay_summary=gated["summary"],
-        shadow_report=gated["shadow_report"],  # untouched, originally-correct
-        accept_replay_as_operational=True)
+        shadow_report=gated["shadow_report"])  # untouched, originally-correct
     assert verdict["checks"]["shadow_report_authenticity"]["ok"] is False
     assert verdict["checks"]["shadow_cycle_report"]["ok"] is False
     assert verdict["pass"] is False
@@ -569,15 +638,14 @@ def test_cli_cutover_gate_refuses_symlinked_replay_store(gated, tmp_path):
 def test_gate_rejects_edited_replay_summary_dict(gated):
     """A caller-supplied replay_summary dict can re-use every genuinely
     linked per-window run_id and still lie about a rerun/read-roots claim;
-    that must fail the new authenticity check even though the per-window
+    that must fail the authenticity check even though the per-window
     linked-to-store check has nothing to compare it against."""
     tampered = copy.deepcopy(gated["summary"])
     tampered["windows"][0]["rerun_zero_delta"] = False
     verdict = evaluate_cutover_gate(
         store_path=gated["db"], replay_store_path=gated["db"],
         replay_summary=tampered,
-        shadow_report=gated["shadow_report"],
-        accept_replay_as_operational=True)
+        shadow_report=gated["shadow_report"])
     assert verdict["checks"]["replay_summary_authenticity"]["ok"] is False
     assert verdict["pass"] is False
 
@@ -595,8 +663,7 @@ def test_gate_rejects_replay_summary_file_tampered_after_publication(gated):
     verdict = evaluate_cutover_gate(
         store_path=gated["db"], replay_store_path=gated["db"],
         replay_summary=gated["summary"],  # untouched, originally-correct
-        shadow_report=gated["shadow_report"],
-        accept_replay_as_operational=True)
+        shadow_report=gated["shadow_report"])
     assert verdict["checks"]["replay_summary_authenticity"]["ok"] is False
     assert verdict["pass"] is False
 
@@ -607,8 +674,7 @@ def test_gate_accepts_genuine_unmodified_replay_summary(gated):
     verdict = evaluate_cutover_gate(
         store_path=gated["db"], replay_store_path=gated["db"],
         replay_summary=gated["summary"],
-        shadow_report=gated["shadow_report"],
-        accept_replay_as_operational=True)
+        shadow_report=gated["shadow_report"])
     assert verdict["checks"]["replay_summary_authenticity"]["ok"] is True
     assert verdict["checks"]["replay_invariants"]["ok"] is True
 
@@ -624,8 +690,7 @@ def test_gate_handles_non_dict_replay_window_rows_without_crashing(gated):
     verdict = evaluate_cutover_gate(
         store_path=gated["db"], replay_store_path=gated["db"],
         replay_summary=tampered,
-        shadow_report=gated["shadow_report"],
-        accept_replay_as_operational=True)
+        shadow_report=gated["shadow_report"])
     assert verdict["checks"]["replay_summary_shape"]["ok"] is False
     assert verdict["pass"] is False
 
@@ -638,7 +703,6 @@ def test_gate_handles_mixed_non_dict_replay_window_rows_without_crashing(
     verdict = evaluate_cutover_gate(
         store_path=gated["db"], replay_store_path=gated["db"],
         replay_summary=tampered,
-        shadow_report=gated["shadow_report"],
-        accept_replay_as_operational=True)
+        shadow_report=gated["shadow_report"])
     assert verdict["checks"]["replay_summary_shape"]["ok"] is False
     assert verdict["pass"] is False

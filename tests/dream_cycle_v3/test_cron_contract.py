@@ -147,12 +147,19 @@ def checklist_text():
     return " ".join(CHECKLIST.read_text(encoding="utf-8").split())
 
 
-def test_checklist_preserves_v2_and_requires_seven_shadow_days():
+def test_checklist_preserves_v2_and_documents_same_day_cutover():
     text = checklist_text()
     assert "legacy v2" in text
     assert "MUST NOT be paused, removed, or modified" in text
-    assert "seven distinct elapsed shadow days" in text
     assert "cutover-gate" in text
+    # Same-day controlled cutover: one genuine current shadow run, replay
+    # alone never passes, and the obsolete seven-day soak is gone.
+    assert "ONE genuine" in text
+    assert "replay alone can never pass" in text
+    assert "no seven-day soak and no timed wait" in text
+    # The removed policy must not linger anywhere in the checklist.
+    assert "seven distinct elapsed shadow days" not in text
+    assert "shadow week" not in text
 
 
 def test_checklist_identifies_the_live_legacy_and_productivity_jobs():

@@ -21,9 +21,9 @@ Principles carried over from Phases 0-3:
 Operational-evidence honesty: a successful cycle records one idempotent
 `runtime_cycle_completed` event whose `created_at` is the RUNTIME's own wall
 clock — deliberately never the caller's pinned `as_of` — so the cutover gate
-can count distinct elapsed operational dates in durable state. Historical
-replay reports/events are explicitly marked and contribute zero operational
-dates, regardless of when replay executes.
+can count distinct genuine operational runs in durable state (same-day
+cutover needs one). Historical replay reports/events are explicitly marked
+and contribute zero operational runs, regardless of when replay executes.
 """
 from __future__ import annotations
 
@@ -57,7 +57,13 @@ CUTOVER_GATE_KIND = "dream-cycle-v3-cutover-gate"
 CYCLE_EVENT_TYPE = "runtime_cycle_completed"
 REPLAY_SUMMARY_EVENT_TYPE = "historical_replay_summary_completed"
 REPLAY_WINDOW_COUNT = 7
-REQUIRED_OPERATIONAL_DAYS = 7
+# Same-day controlled cutover (authoritative product policy, 2026-07-17): a
+# single genuine, current-source, successful shadow run is sufficient
+# operational evidence when every hard invariant is green. The old immutable
+# seven-elapsed-operational-dates minimum is removed. The floor stays at ONE
+# genuine run so historical replay alone can never satisfy cutover; callers
+# may raise it (operator discretion) but never lower it below one.
+REQUIRED_OPERATIONAL_RUNS = 1
 MIN_RETRIEVAL_SUCCESS_RATE = 0.95
 LOCK_FILENAME = "runtime.lock"
 V2_MIGRATION_CLASSIFIER_VERSION = "v2-migration-1"
@@ -1119,9 +1125,13 @@ def run_historical_replay(*, start_date: str, end_date: str,
 # Cutover gate
 # ---------------------------------------------------------------------------
 
-def _distinct_operational_dates(store_path: Path, *, profile: str | None
-                                ) -> int:
-    """Distinct wall-clock dates evidenced by real successful SHADOW cycles.
+def _distinct_operational_runs(store_path: Path, *, profile: str | None
+                               ) -> int:
+    """Count of distinct GENUINE successful SHADOW cycle runs in this store.
+
+    Same-day cutover needs one; the count is still fraud-resistant so a
+    caller that raises the bar above one cannot be spoofed. Each genuine run
+    is credited exactly once, and fabricated/replay/foreign events add zero.
 
     `runtime_cycle_completed` events are stamped with the runtime's own
     clock at execution time, and historical-replay reports/events are
@@ -1135,11 +1145,11 @@ def _distinct_operational_dates(store_path: Path, *, profile: str | None
     payload-only event, even one linked to a genuinely recorded run, proves
     nothing and is never counted.
 
-    Two further bindings close the "one run/report evidences seven days"
+    Two further bindings close the "one run/report inflates the count"
     gap (codex phase-4 fifth review finding 2), where a probe replayed the
     SAME already-attested run_id/report_sha256 under several fabricated
     events (distinct entity_ids, distinct backdated wall clocks) and had
-    each one counted as its own elapsed day:
+    each one counted as its own run:
 
     - EVERY event field that claims something about the run is checked
       against the canonical report's OWN fields and the joined `runs` row:
@@ -1149,7 +1159,7 @@ def _distinct_operational_dates(store_path: Path, *, profile: str | None
       that varies any of these away from what the run's one immutable,
       hash-verified report actually says is rejected outright.
     - Even a payload that reproduces every bound field exactly can only
-      count ONCE per run_id: at most one distinct date is credited per
+      count ONCE per run_id: at most one run is credited per
       genuinely-evidenced run, no matter how many completion events (real
       or fabricated) reference it.
     """
@@ -1166,7 +1176,6 @@ def _distinct_operational_dates(store_path: Path, *, profile: str | None
             "r.window_end AS run_window_end "
             "FROM events e JOIN runs r ON e.run_id = r.run_id "
             "WHERE e.event_type = ?", (CYCLE_EVENT_TYPE,)).fetchall()
-    dates: set[str] = set()
     counted_runs: set[str] = set()
     for row in rows:
         try:
@@ -1218,8 +1227,7 @@ def _distinct_operational_dates(store_path: Path, *, profile: str | None
                 or report["window"].get("end") != row["run_window_end"]):
             continue
         counted_runs.add(run_id)
-        dates.add(str(row["created_at"])[:10])
-    return len(dates)
+    return len(counted_runs)
 
 
 def _canonical_report_for_run(conn, reports_dir: Path, *, run_id: str,
@@ -1410,18 +1418,20 @@ def evaluate_cutover_gate(*, store_path: Path | str,
                           replay_summary: dict[str, Any],
                           replay_store_path: Path | str,
                           shadow_report: dict[str, Any],
-                          accept_replay_as_operational: bool = False,
-                          required_operational_days: int =
-                          REQUIRED_OPERATIONAL_DAYS,
+                          required_operational_runs: int =
+                          REQUIRED_OPERATIONAL_RUNS,
                           min_retrieval_rate: float =
                           MIN_RETRIEVAL_SUCCESS_RATE) -> dict[str, Any]:
-    """Pass/fail for the Phase 4 hard invariants.
+    """Pass/fail for the Phase 4 hard invariants (same-day cutover).
 
-    Cutover is always refused until at least seven distinct successful
-    operational dates are evidenced in durable state. Historical replay
-    never satisfies elapsed operational days. The legacy keyword arguments
-    remain source-compatible, but replay equivalence is ignored and a caller
-    cannot lower the immutable seven-day minimum.
+    Cutover requires at least one GENUINE current-source successful shadow
+    run evidenced in durable state, on top of every other hard invariant.
+    Historical replay never counts as an operational run, so replay alone
+    can never pass. `required_operational_runs` defaults to one and is
+    floored at one (a caller may raise the bar but never lower it below the
+    single genuine run — there is no replay-equivalence bypass). This is the
+    same-day controlled cutover gate; the obsolete seven-elapsed-day soak is
+    gone and no timed wait is imposed here.
 
     `replay_store_path` is the confined continuity store the seven-window
     replay actually ran against (see `run_historical_replay`): every window
@@ -1432,9 +1442,8 @@ def evaluate_cutover_gate(*, store_path: Path | str,
     an edited file or dict can neither fabricate a run nor fake a passing
     outcome (codex phase-4 finding 1).
     """
-    del accept_replay_as_operational
-    required_operational_days = max(REQUIRED_OPERATIONAL_DAYS,
-                                    required_operational_days)
+    required_operational_runs = max(REQUIRED_OPERATIONAL_RUNS,
+                                    required_operational_runs)
     checks: dict[str, dict[str, Any]] = {}
 
     def check(name: str, ok: bool, detail: str) -> None:
@@ -1627,29 +1636,29 @@ def evaluate_cutover_gate(*, store_path: Path | str,
           else f"current store violates invariants: receipts="
           f"{current_receipts}, {current_leakage}")
 
-    evidenced = _distinct_operational_dates(Path(store_path),
-                                            profile=profile)
-    days_ok = evidenced >= required_operational_days
+    evidenced = _distinct_operational_runs(Path(store_path),
+                                           profile=profile)
+    runs_ok = evidenced >= required_operational_runs
     operational = {
-        "ok": days_ok,
-        "detail": (f"{evidenced} distinct successful operational date(s) "
-                   f"evidenced in durable state; {required_operational_days} "
+        "ok": runs_ok,
+        "detail": (f"{evidenced} genuine successful operational run(s) "
+                   f"evidenced in durable state; {required_operational_runs} "
                    "required"),
     }
-    checks["operational_days"] = operational
+    checks["operational_runs"] = operational
 
     statement = (
-        "Historical replay does not by itself satisfy the design's seven "
-        f"elapsed daily operational cycles; {evidenced} distinct successful "
-        "operational date(s) are evidenced in durable state.")
+        "Historical replay does not by itself satisfy the same-day cutover "
+        f"requirement; {evidenced} genuine successful operational run(s) are "
+        f"evidenced in durable state ({required_operational_runs} required).")
 
     return {
         "schema_version": RUNTIME_SCHEMA_VERSION,
         "kind": CUTOVER_GATE_KIND,
         "pass": all(c["ok"] for c in checks.values()),
         "checks": checks,
-        "operational_days_evidenced": evidenced,
-        "required_operational_days": required_operational_days,
+        "operational_runs_evidenced": evidenced,
+        "required_operational_runs": required_operational_runs,
         "replay_equivalence_override": False,
         "statement": statement,
     }
