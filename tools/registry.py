@@ -136,14 +136,27 @@ _CHECK_FN_TTL_SECONDS = 30.0
 # as a flake (last-good True is served) rather than a real outage. Kept short
 # so a genuinely-down backend is reflected within a couple of turns.
 _CHECK_FN_FAILURE_GRACE_SECONDS = 60.0
-_check_fn_cache: Dict[Callable, tuple[float, bool]] = {}
-# Monotonic timestamp of the most recent True result per check_fn.
-_check_fn_last_good: Dict[Callable, float] = {}
+# Keyed by (check_fn, active HERMES_HOME): check_fns probe profile-scoped
+# state (an owned continuity store, per-profile credential files), so a
+# multiplexed gateway serving several profiles must not let one profile's
+# verdict advertise or suppress a tool for another. Single-profile processes
+# see one home => identical behavior to the plain per-fn cache.
+_check_fn_cache: Dict[tuple, tuple[float, bool]] = {}
+# Monotonic timestamp of the most recent True result per (check_fn, home).
+_check_fn_last_good: Dict[tuple, float] = {}
 _check_fn_cache_lock = threading.Lock()
 
 
+def _check_fn_scope_key(fn: Callable) -> tuple:
+    try:
+        from hermes_constants import get_hermes_home
+        return (fn, str(get_hermes_home()))
+    except Exception:
+        return (fn, None)
+
+
 def _check_fn_cached(fn: Callable) -> bool:
-    """Return bool(fn()), TTL-cached across calls.
+    """Return bool(fn()), TTL-cached across calls per active profile home.
 
     Exceptions are swallowed as False. A transient False/exception within
     ``_CHECK_FN_FAILURE_GRACE_SECONDS`` of the last True is suppressed (the
@@ -151,9 +164,10 @@ def _check_fn_cached(fn: Callable) -> bool:
     re-probes) to keep flaky external checks (Docker daemon busy, socket
     contention, probe timeout) from silently stripping tools mid-session.
     """
+    key = _check_fn_scope_key(fn)
     now = time.monotonic()
     with _check_fn_cache_lock:
-        cached = _check_fn_cache.get(fn)
+        cached = _check_fn_cache.get(key)
         if cached is not None:
             ts, value = cached
             if now - ts < _CHECK_FN_TTL_SECONDS:
@@ -168,11 +182,11 @@ def _check_fn_cached(fn: Callable) -> bool:
 
     with _check_fn_cache_lock:
         if value:
-            _check_fn_last_good[fn] = now
-            _check_fn_cache[fn] = (now, True)
+            _check_fn_last_good[key] = now
+            _check_fn_cache[key] = (now, True)
             return True
 
-        last_good = _check_fn_last_good.get(fn)
+        last_good = _check_fn_last_good.get(key)
         if last_good is not None and now - last_good < _CHECK_FN_FAILURE_GRACE_SECONDS:
             # Recent success → treat this failure as a flake. Serve last-good
             # True and do NOT cache the failure, so the next call re-probes
@@ -193,7 +207,7 @@ def _check_fn_cached(fn: Callable) -> bool:
             getattr(fn, "__qualname__", fn),
             "raised" if raised else "returned False",
         )
-        _check_fn_cache[fn] = (now, False)
+        _check_fn_cache[key] = (now, False)
         return False
 
 
@@ -203,6 +217,18 @@ def invalidate_check_fn_cache() -> None:
     with _check_fn_cache_lock:
         _check_fn_cache.clear()
         _check_fn_last_good.clear()
+
+
+def invalidate_check_fn(fn: Callable) -> None:
+    """Drop one check_fn's cached results (every profile home), including
+    its last-good grace record — a caller that observed the underlying
+    state change (e.g. a continuity store created/removed) needs the next
+    probe honored, not a flake-suppressed stale verdict."""
+    with _check_fn_cache_lock:
+        for key in [k for k in _check_fn_cache if k[0] is fn]:
+            del _check_fn_cache[key]
+        for key in [k for k in _check_fn_last_good if k[0] is fn]:
+            del _check_fn_last_good[key]
 
 
 class ToolRegistry:

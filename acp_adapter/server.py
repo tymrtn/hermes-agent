@@ -1384,6 +1384,12 @@ class HermesACPAgent(acp.Agent):
             state.is_running = True
             state.current_prompt_text = user_text or "[Image attachment]"
 
+        # First model-bound user prompt of a new session: bind the wake
+        # packet now, with the real message text as activation evidence
+        # (deferred from create_session; pre-model slash traffic above never
+        # consumes the marker). No-op for restored/forked/bound sessions.
+        self.session_manager.ensure_wake_for_prompt(state, user_text)
+
         logger.info("Prompt on session %s: %s", session_id, user_text[:100])
 
         conn = self._conn

@@ -1,0 +1,175 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.hermes/dream-cycle/v3/schemas.json",
+  "title": "Dream Cycle v3 continuity contracts",
+  "type": "object",
+  "$defs": {
+    "evidenceRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_type", "source_id", "observed_at", "fingerprint"],
+      "properties": {
+        "source_type": {"enum": ["session", "task", "git", "cron", "log", "file", "user_confirmation", "live_probe"]},
+        "source_id": {"type": "string", "minLength": 1},
+        "location": {"type": ["string", "null"]},
+        "observed_at": {"type": "string", "format": "date-time"},
+        "fingerprint": {"type": "string", "minLength": 16},
+        "excerpt": {"type": ["string", "null"], "maxLength": 1000}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"source_type": {"const": "session"}}, "required": ["source_type"]},
+          "then": {"properties": {"excerpt": {"const": null}}}
+        }
+      ]
+    },
+    "projectRegistryEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "project_id", "canonical_name", "aliases", "status", "owner", "task_ssot", "context_skill_id", "memory_policy", "sensitivity_policy", "registry_version", "last_verified_at"],
+      "properties": {
+        "schema_version": {"const": 1},
+        "project_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9_-]{1,63}(?![\\s\\S])"},
+        "canonical_name": {"type": "string", "minLength": 1, "maxLength": 160},
+        "aliases": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
+        "scope_keywords": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+        "canonical_paths": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+        "repositories": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+        "status": {"enum": ["active", "dormant", "archived"]},
+        "owner": {"type": "string", "minLength": 1},
+        "task_ssot": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["provider", "locator"],
+          "properties": {
+            "provider": {"enum": ["kanban", "github", "todoist", "project_tracker", "none"]},
+            "locator": {"type": ["string", "null"]},
+            "write_policy": {"enum": ["read_only", "preauthorized", "approval_required"]}
+          }
+        },
+        "context_skill_id": {"type": ["string", "null"]},
+        "memory_policy": {"enum": ["hot_allowed", "warm_only", "project_only", "no_memory"]},
+        "sensitivity_policy": {"enum": ["normal", "sensitive", "legal", "medical", "financial", "credentials"]},
+        "retrieval_terms": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+        "registry_version": {"type": "integer", "minimum": 1},
+        "last_verified_at": {"type": "string", "format": "date-time"}
+      }
+    },
+    "knowledgeCandidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "candidate_id", "content_revision", "class", "destination", "normalized_claim", "canonical_subject", "evidence_refs", "confidence", "freshness_class", "sensitivity_class", "dedupe_key", "status", "validation_requirements", "conflict_set", "provenance"],
+      "properties": {
+        "schema_version": {"const": 1},
+        "candidate_id": {"type": "string", "minLength": 16, "maxLength": 128, "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*(?![\\s\\S])"},
+        "content_revision": {"type": "integer", "minimum": 1},
+        "class": {"enum": ["runtime_memory_hot", "runtime_memory_warm", "project_context", "task_thread", "reference_knowledge", "decision_record", "ephemeral", "quarantine"]},
+        "project_id": {"type": ["string", "null"]},
+        "destination": {"type": "string", "minLength": 1},
+        "normalized_claim": {"type": "string", "minLength": 1, "maxLength": 4000},
+        "canonical_subject": {"type": "string", "minLength": 1, "maxLength": 300},
+        "retrieval_terms": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+        "evidence_refs": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/evidenceRef"}},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "freshness_class": {"enum": ["ephemeral", "days", "weeks", "months", "durable", "live_verify_each_use"]},
+        "sensitivity_class": {"enum": ["normal", "personal", "sensitive", "legal", "medical", "financial", "credential_forbidden"]},
+        "dedupe_key": {"type": "string", "minLength": 16, "maxLength": 128, "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*(?![\\s\\S])"},
+        "semantic_cluster_id": {"type": ["string", "null"]},
+        "status": {"enum": ["observed", "classified", "routed", "validated", "promoted", "rejected", "superseded", "quarantined", "expired"]},
+        "validation_requirements": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+        "conflict_set": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+        "provenance": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["run_id", "collector_version", "classifier_kind", "classifier_version"],
+          "properties": {
+            "run_id": {"type": "string", "minLength": 16, "maxLength": 128, "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*(?![\\s\\S])"},
+            "collector_version": {"type": "string"},
+            "classifier_kind": {"enum": ["deterministic", "llm"]},
+            "classifier_version": {"type": "string"},
+            "model": {"type": ["string", "null"]},
+            "prompt_hash": {"type": ["string", "null"]}
+          },
+          "allOf": [
+            {
+              "if": {"properties": {"classifier_kind": {"const": "llm"}}, "required": ["classifier_kind"]},
+              "then": {"required": ["model", "prompt_hash"], "properties": {"model": {"type": "string", "minLength": 1}, "prompt_hash": {"type": "string", "minLength": 1}}}
+            }
+          ]
+        }
+      }
+    },
+    "openThread": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "thread_id", "project_id", "title", "normalized_next_action", "owner", "state", "link_disposition", "opened_from", "evidence_refs", "last_disposition_date", "idempotency_key"],
+      "properties": {
+        "schema_version": {"const": 1},
+        "thread_id": {"type": "string", "minLength": 16, "maxLength": 128, "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*(?![\\s\\S])"},
+        "project_id": {"type": "string", "minLength": 1},
+        "external_task_ref": {"type": ["string", "null"]},
+        "link_disposition": {"enum": ["linked", "needs_link", "not_actionable", "ephemeral", "quarantined"]},
+        "title": {"type": "string", "minLength": 1, "maxLength": 300},
+        "normalized_next_action": {"type": "string", "minLength": 1, "maxLength": 1000},
+        "owner": {"type": "string", "minLength": 1},
+        "state": {"enum": ["observed", "triaged", "queued", "active", "blocked", "waiting", "done", "dismissed", "stale"]},
+        "opened_from": {"type": "string", "minLength": 1},
+        "evidence_refs": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/evidenceRef"}},
+        "last_disposition_date": {"type": "string", "format": "date"},
+        "disposition_reason": {"type": ["string", "null"]},
+        "blocked_by": {"type": ["string", "null"]},
+        "due_hint": {"type": ["string", "null"], "format": "date-time"},
+        "follow_up_after": {"type": ["string", "null"], "format": "date-time"},
+        "closure_proof": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["kind", "reference", "verified_at"],
+          "properties": {
+            "kind": {"enum": ["task_event", "commit", "pull_request", "decision", "user_confirmation", "verified_evidence"]},
+            "reference": {"type": "string", "minLength": 1},
+            "verified_at": {"type": "string", "format": "date-time"}
+          }
+        },
+        "supersedes_thread_id": {"type": ["string", "null"]},
+        "idempotency_key": {"type": "string", "minLength": 16, "maxLength": 128, "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*(?![\\s\\S])"}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"state": {"const": "done"}}},
+          "then": {"required": ["closure_proof"], "properties": {"closure_proof": {"type": "object"}}}
+        },
+        {
+          "if": {"properties": {"link_disposition": {"const": "linked"}}},
+          "then": {"required": ["external_task_ref"], "properties": {"external_task_ref": {"type": "string", "minLength": 1}}}
+        }
+      ]
+    },
+    "writeReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["receipt_id", "candidate_id", "destination", "adapter", "target_revision_before", "target_revision_after", "backup_ref", "written_at", "read_back_verified", "retrieval_verified", "idempotency_key"],
+      "properties": {
+        "receipt_id": {"type": "string", "minLength": 16, "maxLength": 128, "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*(?![\\s\\S])"},
+        "candidate_id": {"type": "string", "minLength": 16, "maxLength": 128, "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*(?![\\s\\S])"},
+        "destination": {"type": "string", "minLength": 1},
+        "adapter": {"type": "string", "minLength": 1},
+        "target_revision_before": {"type": ["string", "null"]},
+        "target_revision_after": {"type": "string", "minLength": 1},
+        "backup_ref": {"type": "string", "minLength": 1},
+        "written_at": {"type": "string", "format": "date-time"},
+        "read_back_verified": {"const": true},
+        "retrieval_verified": {"const": true},
+        "retrieval_proof": {"type": "string", "minLength": 1},
+        "rollback_command": {"type": ["string", "null"]},
+        "rollback_metadata": {"type": "object"},
+        "idempotency_key": {"type": "string", "minLength": 16, "maxLength": 128, "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*(?![\\s\\S])"}
+      }
+    }
+  },
+  "properties": {
+    "project": {"$ref": "#/$defs/projectRegistryEntry"},
+    "candidate": {"$ref": "#/$defs/knowledgeCandidate"},
+    "thread": {"$ref": "#/$defs/openThread"},
+    "receipt": {"$ref": "#/$defs/writeReceipt"}
+  }
+}

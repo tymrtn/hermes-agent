@@ -226,6 +226,11 @@ class CodexAppServerSession:
 
         self._client: Optional[CodexAppServerClient] = None
         self._thread_id: Optional[str] = None
+        # Which codex thread has already received the per-session context
+        # block (gateway context prompt + Dream Cycle wake packet). The
+        # app-server thread is stateful, so the context is delivered exactly
+        # once per thread — a respawned thread gets it again.
+        self._context_sent_thread: Optional[str] = None
         self._interrupt_event = threading.Event()
         # Pending file-change items, keyed by item id. Populated on
         # item/started for fileChange items; consumed by the approval
@@ -370,6 +375,7 @@ class CodexAppServerSession:
         turn_timeout: float = 600.0,
         notification_poll_timeout: float = 0.25,
         post_tool_quiet_timeout: float = 90.0,
+        session_context: Optional[str] = None,
     ) -> TurnResult:
         """Send a user message and block until turn/completed, while
         forwarding server-initiated approval requests and projecting items
@@ -405,6 +411,21 @@ class CodexAppServerSession:
 
         user_input_text = _coerce_turn_input_text(user_input)
 
+        # Session context (gateway context prompt + Dream Cycle wake packet)
+        # is delivered exactly once per codex thread, as a separate text item
+        # ahead of the user message — the thread is stateful, so re-sending
+        # every turn would duplicate it in the conversation. It is never
+        # persisted into Hermes' transcript: only projected assistant/tool
+        # items are (see codex_runtime message splicing).
+        turn_input = []
+        if session_context and self._context_sent_thread != self._thread_id:
+            turn_input.append({
+                "type": "text",
+                "text": f"<session_context>\n{session_context}\n"
+                        "</session_context>",
+            })
+        turn_input.append({"type": "text", "text": user_input_text})
+
         # Send turn/start with the user input. Text-only for now (codex
         # supports rich content but Hermes' text path is the common case).
         try:
@@ -412,10 +433,12 @@ class CodexAppServerSession:
                 "turn/start",
                 {
                     "threadId": self._thread_id,
-                    "input": [{"type": "text", "text": user_input_text}],
+                    "input": turn_input,
                 },
                 timeout=10,
             )
+            if len(turn_input) > 1:
+                self._context_sent_thread = self._thread_id
         except CodexAppServerError as exc:
             # Classify auth/refresh failures so the user gets a clear
             # `codex login` pointer instead of a raw RPC error string.

@@ -181,6 +181,16 @@ class SessionState:
     runtime_lock: Any = field(default_factory=Lock)
     current_prompt_text: str = ""
     interrupted_prompt_text: str = ""
+    # Wake packet construction is deferred from session creation to the
+    # first model-bound user prompt (ensure_wake_for_prompt), so explicit
+    # task/project evidence in that message can activate a project.
+    wake_pending: bool = False
+    # Whether the deferred attempt may attest is_new_session. Only
+    # create_session sets it (the creation intent is the one trustworthy
+    # newness verdict); a restore-time rearm never does — a restored
+    # transcript binds only through its durable pending sentinel, so a
+    # history-bearing row with no record can never become eligible here.
+    wake_is_new: bool = False
 
 
 class SessionManager:
@@ -225,6 +235,17 @@ class SessionManager:
             self._sessions[session_id] = state
         _register_task_cwd(session_id, cwd)
         self._persist(state)
+        # Wake binding is deferred to the first prompt: binding here would
+        # use an empty first message, so explicit task/project evidence in
+        # the user's actual first message could never activate a project.
+        state.wake_pending = True
+        state.wake_is_new = True
+        # The in-memory marker dies with the process, but the empty row just
+        # persisted survives — so the deferral must be durable too, or a
+        # restart between creation and first prompt permanently skips wake
+        # binding (_restore classifies every row as not-new). The pending
+        # sentinel is that durable marker; _restore rearms from it.
+        self._mark_wake_pending(state)
         logger.info("Created ACP session %s (cwd=%s)", session_id, cwd)
         return state
 
@@ -277,6 +298,12 @@ class SessionManager:
             self._sessions[new_id] = state
         _register_task_cwd(new_id, cwd)
         self._persist(state)
+        # A fork continues its parent's transcript: inherit the parent's
+        # durable wake record — valid binding, terminal attempted-none or
+        # corrupt, or pre-first-call pending — verbatim (never rebuild
+        # fresh continuity into copied history).
+        self._attach_wake_packet(state, is_new_session=False,
+                                 inherit_from=session_id)
         logger.info("Forked ACP session %s -> %s", session_id, new_id)
         return state
 
@@ -576,8 +603,141 @@ class SessionManager:
         with self._lock:
             self._sessions[session_id] = state
         _register_task_cwd(session_id, cwd)
+        # Restore-only: an existing transcript keeps its original wake
+        # binding (or none) — never rebuilt against current continuity
+        # state. Two states rearm the deferred bind instead of attaching
+        # here: the durable pre-first-call pending sentinel (create_session
+        # persisted the row before any prompt), and 'unavailable' (the read
+        # failed, so the durable record — possibly that same sentinel — is
+        # unknown). Either way the first real prompt retries with THAT
+        # message as evidence; a restore-time attempt would run with an
+        # empty first message and, for pending, consume the one bind with
+        # empty evidence — while discarding its retryable outcome would
+        # strand durable pending until another restart. The rearm never
+        # attests newness (wake_is_new stays False), so rows without the
+        # sentinel — every history-bearing transcript — settle as absent at
+        # the retry and can never become bind-eligible through restore.
+        if self._wake_state_for(session_id) in ("pending", "unavailable"):
+            state.wake_pending = True
+        else:
+            self._attach_wake_packet(state, is_new_session=False)
         logger.info("Restored ACP session %s from DB (%d messages)", session_id, len(history))
         return state
+
+    def ensure_wake_for_prompt(self, state: "SessionState",
+                               first_message: str) -> None:
+        """Bind the wake packet at the session's first model-bound user
+        prompt (deferred from create_session). Once per session: the entry
+        marker is consumed only when the durable lifecycle settled — on a
+        retryable failure it survives, so the in-memory deferral and the
+        durable pending sentinel stay in agreement (a consumed marker over
+        durable pending would let a restart rearm a history-bearing
+        transcript). Durable once-only/attempted-none semantics live in
+        state.db (gateway.continuity_wake). Never raises."""
+        if not getattr(state, "wake_pending", False):
+            return
+        # is_new_session only from the creation-time verdict: a marker
+        # rearmed by restore attests nothing, so binding then requires the
+        # durable pending sentinel.
+        concluded = self._attach_wake_packet(
+            state, is_new_session=getattr(state, "wake_is_new", False),
+            first_message=first_message)
+        if concluded:
+            state.wake_pending = False
+
+    def _attach_wake_packet(self, state: "SessionState", *,
+                            is_new_session: bool,
+                            first_message: str = "",
+                            inherit_from: str | None = None) -> bool:
+        """Dream Cycle v3 wake packet (Phase 3), keyed by durable session id.
+
+        Bound once at a new session's first user prompt (the message is the
+        activation evidence), restored verbatim for restored sessions,
+        inherited for forks. Rides the agent's ephemeral system prompt
+        (API-call time only; also carried into the codex runtime, never
+        persisted into the transcript). Fail closed: any problem means no
+        packet and an unchanged session.
+
+        Returns True when the durable lifecycle settled (bound, terminal, or
+        confirmed-ineligible), False when the attempt is retryable — the
+        caller keeps its deferral marker in that case.
+        """
+        try:
+            from gateway.continuity_wake import (
+                ensure_wake_state_for_session_id, load_wake_record_for_session,
+                wake_attempt_concluded)
+            db = self._get_db()
+            if db is None:
+                return False
+            text = None
+            if inherit_from:
+                # A fork continues its parent's transcript, so it inherits
+                # the parent's durable wake record VERBATIM — not just a
+                # valid binding. attempted-none and corrupt are terminal
+                # states of that transcript; copying the exact record onto
+                # the child row means no other surface can later attest the
+                # child "new" and rebind it, and corrupt stays corrupt
+                # (never laundered into absent, never rebuilt over). A
+                # pending parent (forked before its own first prompt) hands
+                # the child the same pre-first-call eligibility.
+                p_state, p_raw, p_binding = load_wake_record_for_session(
+                    db, inherit_from)
+                if p_state != "absent" and p_raw is not None:
+                    db.set_session_wake_packet(state.session_id, p_raw,
+                                               create_source="acp")
+                if p_state == "bound":
+                    text = p_binding["text"]
+                elif p_state == "pending":
+                    state.wake_pending = True
+                    return False
+                elif p_state in ("none", "corrupt"):
+                    return True
+            state_name = "bound"
+            if text is None:
+                state_name, binding = ensure_wake_state_for_session_id(
+                    db, state.session_id,
+                    is_new_session=is_new_session,
+                    first_message=first_message or "",
+                    workspace_path=state.cwd,
+                    create_source="acp",
+                )
+                text = binding["text"] if state_name == "bound" else None
+            if text:
+                state.agent._wake_packet_text = text
+                prev = getattr(state.agent, "ephemeral_system_prompt", None)
+                state.agent.ephemeral_system_prompt = (
+                    prev + "\n\n" + text if prev else text)
+            return wake_attempt_concluded(state_name)
+        except Exception:
+            logger.debug("wake packet skipped for ACP session %s (marker "
+                         "kept for retry)", state.session_id, exc_info=True)
+            return False
+
+    def _mark_wake_pending(self, state: "SessionState") -> None:
+        """Persist the pre-first-call pending sentinel for a just-created
+        session (see create_session). Never raises."""
+        try:
+            from gateway.continuity_wake import mark_wake_pending_for_session_id
+            mark_wake_pending_for_session_id(self._get_db(), state.session_id,
+                                             create_source="acp")
+        except Exception:
+            logger.debug("wake pending marker skipped for ACP session %s",
+                         state.session_id, exc_info=True)
+
+    def _wake_state_for(self, session_id: str) -> str:
+        """The durable wake state for *session_id*. A failure to READ is
+        'unavailable' (retryable unknown, mirroring
+        load_wake_record_for_session), never 'absent' — absence is an
+        attestation the caller may settle on; only a missing db (no durable
+        layer to retry against) reads as absent."""
+        try:
+            from gateway.continuity_wake import load_wake_state_for_session
+            db = self._get_db()
+            if db is None:
+                return "absent"
+            return load_wake_state_for_session(db, session_id)[0]
+        except Exception:
+            return "unavailable"
 
     def _delete_persisted(self, session_id: str) -> bool:
         """Delete a session from the database. Returns True if it existed."""

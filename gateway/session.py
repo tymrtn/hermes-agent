@@ -719,6 +719,28 @@ class SessionEntry:
     # (see sanitize_model_override / SessionStore.set_model_override).
     model_override: Optional[Dict[str, str]] = None
 
+    # Dream Cycle v3 wake packet binding (gateway/continuity_wake.py).
+    # Set once when a genuinely new session gets a packet; the stored text is
+    # re-appended verbatim on every later turn so the session prompt stays
+    # byte-stable even while the continuity store changes underneath. Cleared
+    # implicitly by reset paths because those mint a brand-new SessionEntry.
+    # Also persisted durably by session_id (state.db sessions.wake_packet_json)
+    # so /resume, /branch, compression rotation, and crash recovery restore
+    # the same binding instead of rebuilding against an old transcript.
+    wake_packet_id: Optional[str] = None
+    wake_packet_hash: Optional[str] = None
+    wake_packet_project_id: Optional[str] = None
+    wake_packet_text: Optional[str] = None
+
+    # True until this durable session's first model call is dispatched.
+    # This is the EXPLICIT new-session signal for wake-packet binding —
+    # timestamp equality is not: slash commands touch updated_at without
+    # calling the model. Constructor default True (a freshly minted entry is
+    # pre-first-call); from_dict defaults to False so entries persisted by
+    # older builds — and every reconstructed continuing entry (resume/
+    # switch/recovery) — can never rebuild a packet into old history.
+    first_model_call_pending: bool = True
+
     def to_dict(self) -> Dict[str, Any]:
         result = {
             "session_key": self.session_key,
@@ -755,6 +777,11 @@ class SessionEntry:
                 if self.parent_updated_at
                 else None
             ),
+            "wake_packet_id": self.wake_packet_id,
+            "wake_packet_hash": self.wake_packet_hash,
+            "wake_packet_project_id": self.wake_packet_project_id,
+            "wake_packet_text": self.wake_packet_text,
+            "first_model_call_pending": self.first_model_call_pending,
         }
         if self.model_override:
             # Defence-in-depth: strip credentials even if a caller stored an
@@ -841,7 +868,49 @@ class SessionEntry:
             parent_session_id=data.get("parent_session_id"),
             parent_updated_at=parent_updated_at,
             model_override=sanitize_model_override(data.get("model_override")),
+            **_validated_wake_fields(data),
+            # Absent key (older builds / reconstructed entries) => False:
+            # never treat a session of unknown age as pre-first-model-call.
+            first_model_call_pending=bool(
+                data.get("first_model_call_pending", False)),
         )
+
+
+def _validated_wake_fields(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Fail-closed deserialization of a persisted wake packet binding.
+
+    Wrong types, an oversize text, or a hash that does not match the text
+    mean the persisted metadata is corrupt — the whole binding is dropped
+    (no injection) rather than trusted.
+    """
+    empty = {
+        "wake_packet_id": None,
+        "wake_packet_hash": None,
+        "wake_packet_project_id": None,
+        "wake_packet_text": None,
+    }
+    packet_id = data.get("wake_packet_id")
+    content_hash = data.get("wake_packet_hash")
+    project_id = data.get("wake_packet_project_id")
+    text = data.get("wake_packet_text")
+    if packet_id is None and content_hash is None and text is None:
+        return empty
+    try:
+        from gateway.continuity_wake import validate_wake_binding
+        if validate_wake_binding(packet_id, content_hash, project_id, text):
+            return {
+                "wake_packet_id": packet_id,
+                "wake_packet_hash": content_hash,
+                "wake_packet_project_id": project_id,
+                "wake_packet_text": text,
+            }
+    except Exception:
+        pass
+    logger.warning(
+        "Dropping corrupt persisted wake packet binding for session %s",
+        data.get("session_id", "?"),
+    )
+    return empty
 
 
 def is_shared_multi_user_session(
@@ -1352,7 +1421,7 @@ class SessionStore:
             created_at = datetime.fromtimestamp(float(started_at)) if started_at else now
         except (TypeError, ValueError, OSError):
             created_at = now
-        return SessionEntry(
+        entry = SessionEntry(
             session_key=session_key,
             session_id=str(row["id"]),
             created_at=created_at,
@@ -1361,7 +1430,11 @@ class SessionStore:
             display_name=source.chat_name,
             platform=source.platform,
             chat_type=source.chat_type,
+            # A recovered row has an existing transcript: continuing session.
+            first_model_call_pending=False,
         )
+        self.restore_wake_packet(entry)
+        return entry
 
     def _recover_session_from_db(
         self,
@@ -1681,6 +1754,9 @@ class SessionStore:
             canonical_session_id,
         )
         entry.session_id = canonical_session_id
+        # Re-key the durable wake binding under the healed child id so a
+        # crash inside the compression publication window cannot orphan it.
+        self.persist_wake_packet(entry)
         return True
 
     def has_any_sessions(self) -> bool:
@@ -2142,6 +2218,36 @@ class SessionStore:
 
         return new_entry
 
+    def persist_wake_packet(self, entry: SessionEntry) -> None:
+        """Persist the entry's validated wake binding under its durable
+        session_id (state.db). Called after binding and after compression
+        publication moves the entry to a child session_id. Never raises."""
+        if not self._db:
+            return
+        try:
+            from gateway.continuity_wake import wake_binding_to_json
+            packet_json = wake_binding_to_json(entry)
+            if packet_json is not None:
+                self._db.set_session_wake_packet(entry.session_id, packet_json)
+        except Exception as e:
+            logger.debug("Wake packet persist failed for %s: %s",
+                         entry.session_id, e)
+
+    def restore_wake_packet(self, entry: SessionEntry) -> None:
+        """Restore a reconstructed entry's wake binding from state.db,
+        walking the parent chain (compression children / branches inherit
+        the binding their transcript started with). Never raises."""
+        if not self._db or getattr(entry, "wake_packet_id", None):
+            return
+        try:
+            from gateway.continuity_wake import (apply_wake_binding,
+                                                 load_wake_binding_for_session)
+            binding = load_wake_binding_for_session(self._db, entry.session_id)
+            apply_wake_binding(entry, binding)
+        except Exception as e:
+            logger.debug("Wake packet restore failed for %s: %s",
+                         entry.session_id, e)
+
     def switch_session(self, session_key: str, target_session_id: str) -> Optional[SessionEntry]:
         """Switch a session key to point at an existing session ID.
 
@@ -2178,7 +2284,13 @@ class SessionStore:
                 display_name=old_entry.display_name,
                 platform=old_entry.platform,
                 chat_type=old_entry.chat_type,
+                # The target transcript already exists (resume/branch/switch):
+                # this is a continuing session, never a wake-rebuild target.
+                first_model_call_pending=False,
             )
+            # Restore the wake binding this transcript started with (branch
+            # children inherit their parent's via the durable chain walk).
+            self.restore_wake_packet(new_entry)
 
             self._entries[session_key] = new_entry
             self._save()

@@ -948,6 +948,14 @@ class CLICommandsMixin:
             except Exception:
                 pass  # Best-effort copy
 
+        # Dream Cycle v3: copy the parent chain's terminating wake record
+        # verbatim onto the branch child, so inheritance holds by direct
+        # record instead of a parent-chain walk that a deep branch lineage
+        # would exhaust (fail-closed = lost binding). Never raises.
+        from gateway.continuity_wake import materialize_wake_record_for_child
+        materialize_wake_record_for_child(self._session_db, new_session_id,
+                                          parent_session_id)
+
         # Set title on the branch
         try:
             self._session_db.set_session_title(new_session_id, branch_title)

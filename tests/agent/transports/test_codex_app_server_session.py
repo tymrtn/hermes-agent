@@ -1221,3 +1221,58 @@ class TestClassifyOAuthFailure:
             "[stderr] token has expired, run codex login",
         )
         assert hint is not None
+
+
+class TestSessionContextDelivery:
+    """Phase 3 wake-packet carriage: the per-session ephemeral context is
+    delivered exactly once per stateful codex thread, ahead of the user
+    message, and never re-sent on later turns of the same thread."""
+
+    @staticmethod
+    def _drive_turn(client, session, text, **kwargs):
+        client.queue_notification("turn/started", threadId="t",
+                                  turn={"id": "tu"})
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "tu", "status": "completed", "error": None})
+        return session.run_turn(text, turn_timeout=2.0, **kwargs)
+
+    def test_context_sent_once_per_thread(self):
+        client = FakeClient()
+        s = make_session(client)
+        ctx = "## Current Session Context\n\n[Continuity wake packet — x]"
+
+        self._drive_turn(client, s, "first", session_context=ctx)
+        self._drive_turn(client, s, "second", session_context=ctx)
+
+        turn_starts = [p for m, p in client.requests if m == "turn/start"]
+        assert len(turn_starts) == 2
+        first_texts = [i["text"] for i in turn_starts[0]["input"]]
+        second_texts = [i["text"] for i in turn_starts[1]["input"]]
+        # Exactly one context block on the wire, on the first turn only.
+        assert any("Continuity wake packet" in t for t in first_texts)
+        assert first_texts[-1] == "first"
+        assert second_texts == ["second"]
+
+    def test_no_context_means_plain_input(self):
+        client = FakeClient()
+        s = make_session(client)
+        self._drive_turn(client, s, "hello")
+        turn_starts = [p for m, p in client.requests if m == "turn/start"]
+        assert turn_starts[0]["input"] == [{"type": "text", "text": "hello"}]
+
+    def test_context_resent_after_thread_respawn(self):
+        client = FakeClient()
+        s = make_session(client)
+        ctx = "[Continuity wake packet — y]"
+        self._drive_turn(client, s, "first", session_context=ctx)
+        # Retire the thread (crash path drops the session); a new thread
+        # must receive the stable context again.
+        s.close()
+        client2 = FakeClient()
+        s2 = CodexAppServerSession(cwd="/tmp",
+                                   client_factory=lambda **kw: client2)
+        self._drive_turn(client2, s2, "after respawn", session_context=ctx)
+        turn_starts = [p for m, p in client2.requests if m == "turn/start"]
+        assert any("Continuity wake packet" in i["text"]
+                   for i in turn_starts[0]["input"])
