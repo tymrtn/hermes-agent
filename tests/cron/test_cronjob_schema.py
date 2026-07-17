@@ -39,3 +39,32 @@ def test_cronjob_schema_required_array_unchanged():
     from tools.cronjob_tools import CRONJOB_SCHEMA
 
     assert CRONJOB_SCHEMA["parameters"]["required"] == ["action"]
+
+
+def test_cronjob_schema_exposes_attach_to_session():
+    """The model can opt a recurring delivery into session continuity."""
+    from tools.cronjob_tools import CRONJOB_SCHEMA
+
+    attach = CRONJOB_SCHEMA["parameters"]["properties"]["attach_to_session"]
+    assert attach["type"] == "boolean"
+    assert "CONTINUABLE" in attach["description"]
+
+
+def test_registered_cronjob_handler_forwards_attach_to_session(monkeypatch):
+    """The registry/model-tool shim must not drop the schema argument."""
+    import tools.cronjob_tools as cronjob_tools
+
+    captured = {}
+
+    def fake_cronjob(**kwargs):
+        captured.update(kwargs)
+        return '{"success": true}'
+
+    monkeypatch.setattr(cronjob_tools, "cronjob", fake_cronjob)
+
+    result = cronjob_tools.registry.dispatch(
+        "cronjob", {"action": "create", "attach_to_session": True}
+    )
+
+    assert result == '{"success": true}'
+    assert captured["attach_to_session"] is True

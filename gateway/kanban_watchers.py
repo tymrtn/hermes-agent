@@ -112,6 +112,74 @@ def _release_singleton_lock(handle) -> None:
 class GatewayKanbanWatchersMixin:
     """Kanban watcher / notifier / dispatcher loops for GatewayRunner."""
 
+    @staticmethod
+    def _kanban_configured_board_slugs(raw: Any, _kb: Any) -> list[str] | None:
+        """Normalize a board scope; ``None`` represents an explicit wildcard."""
+        if raw is None or raw == "":
+            return []
+        if isinstance(raw, str):
+            parts = [part.strip() for part in raw.split(",")]
+        elif isinstance(raw, (list, tuple, set)):
+            parts = [str(part).strip() for part in raw]
+        else:
+            logger.warning(
+                "kanban dispatcher: invalid board scope %r; using profile default board",
+                raw,
+            )
+            return []
+
+        slugs: list[str] = []
+        seen: set[str] = set()
+        for part in parts:
+            if not part:
+                continue
+            if part == "*":
+                return None
+            try:
+                slug = _kb._normalize_board_slug(part)  # type: ignore[attr-defined]
+            except Exception:
+                logger.warning(
+                    "kanban dispatcher: ignoring invalid board scope entry %r", part
+                )
+                continue
+            if slug and slug not in seen:
+                seen.add(slug)
+                slugs.append(slug)
+        return slugs
+
+    @classmethod
+    def _kanban_scoped_board_slugs(
+        cls, kanban_cfg: dict, key: str, _kb: Any
+    ) -> list[str]:
+        """Resolve a profile-owned board scope without scanning other profiles."""
+        configured = cls._kanban_configured_board_slugs(kanban_cfg.get(key), _kb)
+        if configured is None:
+            try:
+                return [
+                    board.get("slug") or _kb.DEFAULT_BOARD
+                    for board in _kb.list_boards(include_archived=False)
+                ]
+            except Exception:
+                return [_kb.DEFAULT_BOARD]
+        if configured:
+            return configured
+
+        default_raw = kanban_cfg.get("default_board") or os.environ.get(
+            "HERMES_KANBAN_BOARD"
+        )
+        try:
+            return [
+                _kb._normalize_board_slug(default_raw)  # type: ignore[attr-defined]
+                or _kb.DEFAULT_BOARD
+            ]
+        except Exception:
+            logger.warning(
+                "kanban dispatcher: invalid kanban.default_board=%r; using %s",
+                default_raw,
+                _kb.DEFAULT_BOARD,
+            )
+            return [_kb.DEFAULT_BOARD]
+
     async def _kanban_notifier_watcher(self, interval: float = 5.0) -> None:
         """Poll ``kanban_notify_subs`` and deliver terminal events to users.
 
@@ -847,6 +915,12 @@ class GatewayKanbanWatchersMixin:
             )
             interval = 60.0
         interval = max(interval, 1.0)  # sanity floor — tighter than this is a footgun
+        dispatch_boards = self._kanban_scoped_board_slugs(
+            kanban_cfg, "dispatch_boards", _kb
+        )
+        if not dispatch_boards:
+            logger.warning("kanban dispatcher: no boards configured; dispatcher disabled")
+            return
 
         # Read max_spawn config to limit concurrent kanban tasks
         max_spawn = kanban_cfg.get("max_spawn", None)
@@ -1083,19 +1157,9 @@ class GatewayKanbanWatchersMixin:
                         pass
 
         def _tick_once() -> "list[tuple[str, Optional[object]]]":
-            """Run one dispatch_once per board. Returns (slug, result) pairs.
-
-            Enumerating boards on every tick keeps the dispatcher honest
-            when users create a new board mid-run: no restart required,
-            the next tick picks it up automatically.
-            """
-            try:
-                boards = _kb.list_boards(include_archived=False)
-            except Exception:
-                boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+            """Run one dispatch_once per configured/profile-owned board."""
             out: list[tuple[str, "Optional[object]"]] = []
-            for b in boards:
-                slug = b.get("slug") or _kb.DEFAULT_BOARD
+            for slug in dispatch_boards:
                 out.append((slug, _tick_once_for_board(slug)))
             return out
 
@@ -1111,12 +1175,7 @@ class GatewayKanbanWatchersMixin:
             here keeps the stuck-warn fire only on real failures (broken
             PATH, missing venv, credential loss for a real Hermes profile).
             """
-            try:
-                boards = _kb.list_boards(include_archived=False)
-            except Exception:
-                boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
-            for b in boards:
-                slug = b.get("slug") or _kb.DEFAULT_BOARD
+            for slug in dispatch_boards:
                 conn = None
                 try:
                     conn = _kb.connect(board=slug)
@@ -1165,14 +1224,9 @@ class GatewayKanbanWatchersMixin:
                     "kanban auto-decompose: import failed (%s); skipping", exc,
                 )
                 return 0
-            try:
-                boards = _kb.list_boards(include_archived=False)
-            except Exception:
-                boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
             attempted = 0
             successes = 0
-            for b in boards:
-                slug = b.get("slug") or _kb.DEFAULT_BOARD
+            for slug in dispatch_boards:
                 if attempted >= auto_decompose_per_tick:
                     break
                 # Pin this board for the duration of the call — same

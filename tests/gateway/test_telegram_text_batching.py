@@ -53,6 +53,24 @@ def _make_event(text: str, chat_id: str = "12345") -> MessageEvent:
     )
 
 
+def test_fatal_error_drops_delayed_deliveries():
+    adapter = _make_adapter()
+
+    adapter._set_fatal_error("telegram_conflict", "stopping", retryable=False)
+
+    assert adapter._drop_delayed_deliveries is True
+    assert adapter._should_drop_delayed_delivery() is True
+
+
+def test_adapter_factory_applies_notification_mode(monkeypatch):
+    from plugins.platforms.telegram.adapter import _build_adapter
+
+    monkeypatch.setenv("HERMES_TELEGRAM_NOTIFICATIONS", "all")
+    config = PlatformConfig(enabled=True, token="test-token")
+
+    assert _build_adapter(config)._notifications_mode == "all"
+
+
 class TestTextBatching:
     @pytest.mark.asyncio
     async def test_single_message_dispatched_after_delay(self):

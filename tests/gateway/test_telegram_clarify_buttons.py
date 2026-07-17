@@ -743,4 +743,3 @@ class TestTelegramEditMessageBusyControls:
         kwargs = adapter._bot.edit_message_text.call_args.kwargs
         assert kwargs["reply_markup"] is keyboard
         adapter._build_busy_session_keyboard.assert_called_once_with("sk1")
-
