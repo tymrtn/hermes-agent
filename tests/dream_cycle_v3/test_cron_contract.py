@@ -14,6 +14,7 @@ import os
 import re
 import stat
 import subprocess
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -26,6 +27,7 @@ from dream_cycle_v3.dry_run import SAMPLE_DATA
 REPO = Path(__file__).resolve().parents[2]
 ARTIFACT = REPO / "docs" / "dream-cycle-v3" / "nagatha-shadow-cron.job.json"
 SHIM = REPO / "scripts" / "dream_cycle_v3_shadow_cron.sh"
+LIVE_SHIM = REPO / "scripts" / "dream_cycle_v3_live_cron.sh"
 WRAPPER = REPO / "scripts" / "dream_cycle_v3_run.sh"
 CHECKLIST = (REPO / "docs" / "dream-cycle-v3" /
              "nagatha-shadow-publication-checklist.md")
@@ -92,6 +94,40 @@ def test_shim_is_shadow_mode_only(shim_text):
     assert "DC3_SHADOW_ROOT" in shim_text
     assert "DC3_V3_ROOT" not in shim_text
     assert "--v3-root" not in shim_text
+
+
+def test_live_shim_targets_the_profile_consumer_store_only():
+    text = LIVE_SHIM.read_text(encoding="utf-8")
+    assert LIVE_SHIM.stat().st_mode & stat.S_IXUSR
+    assert ('export DC3_V3_ROOT="$HOME/.hermes/profiles/nagatha/'
+            'dream-cycle-v3"') in text
+    assert "unset DC3_SHADOW_ROOT" in text
+    assert "export DC3_SHADOW_ROOT" not in text
+    for line in shim_commands(text):
+        lowered = line.lower()
+        assert "promot" not in lowered, line
+        assert not contains_gateway_lifecycle_command(line), line
+
+
+def test_live_shim_clears_inherited_shadow_destination(tmp_path):
+    repo = tmp_path / ".hermes" / "hermes-agent"
+    (repo / ".venv" / "bin").mkdir(parents=True)
+    (repo / ".venv" / "bin" / "python").symlink_to(sys.executable)
+    wrapper = repo / "scripts" / "dream_cycle_v3_run.sh"
+    wrapper.parent.mkdir(parents=True)
+    wrapper.write_text(
+        "#!/usr/bin/env bash\n"
+        "test -n \"${DC3_V3_ROOT:-}\"\n"
+        "test -z \"${DC3_SHADOW_ROOT:-}\"\n",
+        encoding="utf-8")
+    wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
+
+    env = {"HOME": str(tmp_path),
+           "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+           "DC3_SHADOW_ROOT": str(tmp_path / "stale-shadow")}
+    proc = subprocess.run(["bash", str(LIVE_SHIM)], env=env,
+                          capture_output=True, text=True, timeout=30)
+    assert proc.returncode == 0, proc.stderr
 
 
 def test_no_legacy_job_or_gateway_mutation(job, shim_text):
