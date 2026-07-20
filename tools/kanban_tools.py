@@ -677,6 +677,12 @@ def _handle_complete(args: dict, **kw) -> str:
                 verdict = "done"
                 reason = ""
                 try:
+                    # judge_goal returns (verdict, reason, parse_failed,
+                    # wait_directive, transport_failed) — see hermes_cli/goals.py.
+                    # Star-unpack so the gate survives the judge contract
+                    # growing more trailing fields; a fixed-arity unpack would
+                    # raise ValueError, get swallowed by the handler below, and
+                    # silently disable the gate (verdict stays "done").
                     verdict, reason, *_ = judge_goal(
                         goal=f"{task.title}\n\n{task.body or ''}".strip(),
                         last_response=(summary or result or "").strip(),
@@ -1354,7 +1360,7 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
 
 
 def _handle_unblock(args: dict, **kw) -> str:
-    """Transition a blocked task back to ready."""
+    """Transition a blocked task to ready, or todo while parents remain open."""
     guard = _require_orchestrator_tool("kanban_unblock")
     if guard:
         return guard
@@ -1371,7 +1377,8 @@ def _handle_unblock(args: dict, **kw) -> str:
             ok = kb.unblock_task(conn, str(tid))
             if not ok:
                 return tool_error(f"could not unblock {tid} (not blocked or unknown)")
-            return _ok(task_id=str(tid), status="ready")
+            task = kb.get_task(conn, str(tid))
+            return _ok(task_id=str(tid), status=task.status if task else None)
         finally:
             conn.close()
     except ValueError as e:
@@ -2004,7 +2011,8 @@ KANBAN_CREATE_SCHEMA = {
 KANBAN_UNBLOCK_SCHEMA = {
     "name": "kanban_unblock",
     "description": (
-        "Move a blocked Kanban task back to ready. Orchestrator-only — only "
+        "Unblock a Kanban task. It moves to ready when all parents are done, "
+        "or todo while any parent remains open. Orchestrator-only — only "
         "profiles with the kanban toolset can unblock routed work; "
         "dispatcher-spawned task workers never see this tool."
     ),
@@ -2013,7 +2021,7 @@ KANBAN_UNBLOCK_SCHEMA = {
         "properties": {
             "task_id": {
                 "type": "string",
-                "description": "Blocked task id to return to ready.",
+                "description": "Blocked task id to move to ready or parent-gated todo.",
             },
             "board": _board_schema_prop(),
         },
