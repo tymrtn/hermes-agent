@@ -28,7 +28,7 @@ jobs:
           MERGE_BASE=$(git merge-base origin/main HEAD)
 
           # Find any new author emails in this PR's commits
-          NEW_EMAILS=$(git log ${MERGE_BASE}..HEAD --format='%ae' --no-merges | sort -u)
+          NEW_EMAILS=$(git log "${MERGE_BASE}"..HEAD --format='%ae' --no-merges | sort -u)
 
           if [ -z "$NEW_EMAILS" ]; then
             echo "No new commits to check."
@@ -78,12 +78,9 @@ jobs:
 
             # Emit review_status for unmapped emails
             DETAIL=$(echo -e "$MISSING" | sed '/^$/d; s/^  //')
-            HOW_TO_FIX=$'Add mappings to scripts/release.py AUTHOR_MAP:\n```\n"<email>": "<github-username>",\n```\nTo find the GitHub username for an email:\n```\ngh api \'search/users?q=EMAIL+in:email\' --jq \'.items[0].login\'\n```\n'
-            REVIEW_STATUS=$(jq -nc \
-              --arg detail "$DETAIL" \
-              --arg how_to_fix "$HOW_TO_FIX" \
-              '[{"source":"contributor attribution","results":[{"kind":"action_required","title":"Unmapped contributor email(s)","summary":"New contributor email(s) are not in AUTHOR_MAP.","detail":$detail,"how_to_fix":$how_to_fix}]}]')
-            echo "review_status=$REVIEW_STATUS" >> "$GITHUB_OUTPUT"
+            python3 scripts/ci/contributor_review_status.py \
+              --detail "$DETAIL" \
+              --output "$GITHUB_OUTPUT"
 
             exit 1
           else

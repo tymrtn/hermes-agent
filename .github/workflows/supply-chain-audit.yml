@@ -43,7 +43,7 @@ on:
         value: ${{ jobs.aggregate.outputs.review_status }}
 
 permissions:
-  pull-requests: write
+  pull-requests: read
   contents: read
 
 jobs:
@@ -55,22 +55,29 @@ jobs:
     outputs:
       review_status: ${{ steps.emit-status.outputs.review_status }}
     steps:
+      - name: Check ci-reviewed label
+        id: label-check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          LABELS=$(gh pr view "$PR_NUMBER" --repo "$REPOSITORY" \
+            --json labels --jq '.labels[].name')
+          if grep -Fxq 'ci-reviewed' <<< "$LABELS"; then
+            echo "ci_reviewed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ci_reviewed=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
 
-      - name: Get GitHub App token
-        id: app-token
-        uses: ./.github/actions/get-app-token
-        with:
-          client-id: ${{ secrets.APP_CLIENT_ID }}
-          private-key: ${{ secrets.APP_PRIVATE_KEY }}
-
       - name: Scan diff for critical patterns
         id: scan
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           set -euo pipefail
 
@@ -161,34 +168,20 @@ jobs:
         if: always()
         env:
           FOUND: ${{ steps.scan.outputs.found }}
+          REVIEWED: ${{ steps.label-check.outputs.ci_reviewed }}
         run: |
-          python3 - <<'PYEOF'
-          import json, os
-
-          found = os.environ.get("FOUND", "") == "true"
-
-          if found:
-              with open("/tmp/findings.md", encoding="utf-8") as f:
-                  detail = f.read()
-              status = [{
-                  "source": "supply chain",
-                  "results": [{
-                      "kind": "error",
-                      "title": "Critical supply chain risk",
-                      "summary": "Critical supply chain risk patterns detected in this PR.",
-                      "detail": detail,
-                      "how_to_fix": "Review the flagged code carefully. If intentional, add the `ci-reviewed` label."
-                  }]
-              }]
-          else:
-              status = []
-
-          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
-              f.write(f"review_status={json.dumps(status)}\n")
-          PYEOF
+          set -euo pipefail
+          ARGS=(--output "$GITHUB_OUTPUT")
+          if [ "$FOUND" = "true" ]; then
+            ARGS+=(--found --detail-file /tmp/findings.md)
+          fi
+          if [ "$REVIEWED" = "true" ]; then
+            ARGS+=(--reviewed)
+          fi
+          python3 scripts/ci/supply_chain_status.py "${ARGS[@]}"
 
       - name: Fail on critical findings
-        if: steps.scan.outputs.found == 'true'
+        if: steps.emit-status.outputs.blocking == 'true'
         run: |
           echo "::error::CRITICAL supply chain risk patterns detected in this PR. See the review comment for details."
           exit 1

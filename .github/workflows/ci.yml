@@ -36,6 +36,11 @@ jobs:
     name: Detect affected areas
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # This job executes the PR-controlled local classifier after checkout.
+    # Give it only the built-in read token; never mint or forward App credentials.
+    permissions:
+      contents: read
+      pull-requests: read
     outputs:
       python: ${{ steps.classify.outputs.python }}
       frontend: ${{ steps.classify.outputs.frontend }}
@@ -49,19 +54,11 @@ jobs:
       event_name: ${{ github.event_name }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - name: Get GitHub App token
-        id: app-token
-        uses: ./.github/actions/get-app-token
-        with:
-          client-id: ${{ secrets.APP_CLIENT_ID }}
-          private-key: ${{ secrets.APP_PRIVATE_KEY }}
       - name: Detect affected areas
         id: classify
         uses: ./.github/actions/detect-changes
         with:
-          # The get-app-token composite action falls back to GITHUB_TOKEN
-          # on fork PRs where APP_ID is unavailable.
-          github-token: ${{ steps.app-token.outputs.token }}
+          github-token: ${{ github.token }}
 
   # ─────────────────────────────────────────────────────────────────────
   # Lane-gated sub-workflows. Each runs in parallel after detect finishes.
@@ -321,16 +318,14 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # The checked-out timings script only performs repository and Actions API reads.
+    # Keep the token read-only and never expose App credentials to PR-controlled code.
+    permissions:
+      contents: read
+      actions: read
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Get GitHub App token
-        id: app-token
-        uses: ./.github/actions/get-app-token
-        with:
-          client-id: ${{ secrets.APP_CLIENT_ID }}
-          private-key: ${{ secrets.APP_PRIVATE_KEY }}
 
       - name: Restore baseline cache (PR only)
         if: github.event_name == 'pull_request'
@@ -345,12 +340,7 @@ jobs:
 
       - name: Collect timings and generate report
         env:
-          # Forks get no repo secrets (AUTOFIX_BOT_PAT is empty); fall back to
-          # the built-in read-only token so the timings API read still works
-          # there instead of hard-failing this advisory job on every fork PR.
-          # The get-app-token composite action falls back to GITHUB_TOKEN
-          # on fork PRs where APP_ID is unavailable.
-          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           python3 scripts/ci/timings_report.py \
             --baseline ci-timings-baseline.json \
