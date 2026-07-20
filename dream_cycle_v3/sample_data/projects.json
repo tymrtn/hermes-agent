@@ -1,0 +1,46 @@
+[
+  {
+    "schema_version": 1,
+    "project_id": "hermes-continuity",
+    "canonical_name": "Hermes continuity architecture",
+    "aliases": ["dream cycle", "continuity"],
+    "scope_keywords": ["manifest", "carry-forward", "ledger"],
+    "canonical_paths": ["profile:sessions/", "profile:state/"],
+    "repositories": [],
+    "status": "active",
+    "owner": "nagatha",
+    "task_ssot": {
+      "provider": "kanban",
+      "locator": "sample-board",
+      "write_policy": "read_only"
+    },
+    "context_skill_id": null,
+    "memory_policy": "warm_only",
+    "sensitivity_policy": "normal",
+    "retrieval_terms": ["dream cycle", "continuity store"],
+    "registry_version": 1,
+    "last_verified_at": "2026-07-10T21:00:00+00:00"
+  },
+  {
+    "schema_version": 1,
+    "project_id": "klas-sample",
+    "canonical_name": "Marketplace sample project",
+    "aliases": ["klas"],
+    "scope_keywords": ["listings", "onboarding"],
+    "canonical_paths": [],
+    "repositories": ["octocat/hello-world"],
+    "status": "active",
+    "owner": "nagatha",
+    "task_ssot": {
+      "provider": "todoist",
+      "locator": "sample_data/todoist_export.json",
+      "write_policy": "approval_required"
+    },
+    "context_skill_id": null,
+    "memory_policy": "project_only",
+    "sensitivity_policy": "normal",
+    "retrieval_terms": ["marketplace"],
+    "registry_version": 1,
+    "last_verified_at": "2026-07-10T21:00:00+00:00"
+  }
+]

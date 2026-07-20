@@ -254,15 +254,19 @@ def _normalize_multimodal_content(content: Any) -> Any:
 
     Callers translate the ValueError into a 400 response.
     """
-    # Scalar passthrough mirrors ``_normalize_chat_content``.
+    # None/str passthrough mirrors ``_normalize_chat_content``.
     if content is None:
         return ""
     if isinstance(content, str):
         return content[:MAX_NORMALIZED_TEXT_LENGTH] if len(content) > MAX_NORMALIZED_TEXT_LENGTH else content
     if not isinstance(content, list):
-        # Mirror the legacy text-normalizer's fallback so callers that
-        # pre-existed image support still get a string back.
-        return _normalize_chat_content(content)
+        # Never coerce a top-level dict/number/bool: its str() repr would
+        # become canonical message content AND durable wake activation
+        # evidence (the same reason non-string nested text values reject).
+        raise ValueError(
+            "invalid_content_part:Message content must be a string or an "
+            "array of content parts."
+        )
 
     items = content[:MAX_CONTENT_LIST_SIZE] if len(content) > MAX_CONTENT_LIST_SIZE else content
     normalized_parts: List[Dict[str, Any]] = []
@@ -290,7 +294,12 @@ def _normalize_multimodal_content(content: Any) -> Any:
             if text is None:
                 continue
             if not isinstance(text, str):
-                text = str(text)
+                # Never coerce: a dict/number repr would become canonical
+                # message content AND durable wake activation evidence.
+                raise ValueError(
+                    "invalid_content_part:Text parts must carry a string "
+                    "'text' value."
+                )
             if text:
                 trimmed = text[:MAX_NORMALIZED_TEXT_LENGTH]
                 normalized_parts.append({"type": "text", "text": trimmed})
@@ -353,6 +362,53 @@ def _normalize_multimodal_content(content: Any) -> Any:
         return "\n".join(p["text"] for p in normalized_parts if p.get("text"))
 
     return normalized_parts
+
+
+# Hard cap on the first-message text handed to the wake broker as project/
+# task activation evidence.  Conservative: task refs, project ids, and
+# aliases live in the leading text; the broker only regex-matches them.
+MAX_WAKE_EVIDENCE_LENGTH = 8_192
+
+
+def _wake_evidence_text(user_message: Any) -> str:
+    """Textual first-message evidence for the Dream Cycle v3 wake broker.
+
+    Accepts exactly the shapes ``_normalize_multimodal_content`` emits — a
+    plain string, or a list of canonical
+    ``{"type": "text"|"image_url", ...}`` parts — and returns only the text
+    parts, in input order, hard-capped at ``MAX_WAKE_EVIDENCE_LENGTH``
+    (scalar strings included: a scalar can be 64 KB, far past the bound).
+    Image URLs/data payloads are never stringified into the evidence, and
+    any shape the normalizer cannot have produced — ANYWHERE in the list,
+    including after the cap is reached — yields empty evidence without
+    raising: the wake binding this evidence feeds is permanently durable,
+    so wrong evidence is worse than none. Only the accumulation is capped;
+    structural validation always covers the entire list.
+    """
+    try:
+        if isinstance(user_message, str):
+            return user_message[:MAX_WAKE_EVIDENCE_LENGTH]
+        if not isinstance(user_message, list):
+            return ""
+        parts: List[str] = []
+        total = 0
+        for part in user_message:
+            if not isinstance(part, dict):
+                return ""
+            part_type = part.get("type")
+            if part_type == "text":
+                text = part.get("text")
+                if not isinstance(text, str):
+                    return ""
+                if total < MAX_WAKE_EVIDENCE_LENGTH:
+                    take = text[:MAX_WAKE_EVIDENCE_LENGTH - total]
+                    parts.append(take)
+                    total += len(take)
+            elif part_type != "image_url":
+                return ""
+        return "\n".join(parts)[:MAX_WAKE_EVIDENCE_LENGTH]
+    except Exception:
+        return ""
 
 
 def _content_has_visible_payload(content: Any) -> bool:
@@ -2220,15 +2276,25 @@ class APIServerAdapter(BasePlatformAdapter):
             return None, web.json_response(_openai_error(f"Session not found: {session_id}", code="session_not_found"), status=404)
         return session, None
 
-    async def _conversation_history_for_session(self, session_id: str) -> List[Dict[str, Any]]:
+    async def _conversation_history_for_session(
+        self, session_id: str
+    ) -> tuple[List[Dict[str, Any]], bool]:
+        """(history, ok). ``ok=False`` means the read FAILED — the empty
+        list is a degraded stand-in, never an attestation that the session
+        has no messages. Wake eligibility must key off ``ok``: treating a
+        failed read as an empty history would falsely attest first-message
+        eligibility for an existing transcript."""
         db = await self._ensure_session_db_async()
         if db is None:
-            return []
+            return [], False
         try:
-            return await asyncio.to_thread(db.get_messages_as_conversation, session_id)
+            history = await asyncio.to_thread(
+                db.get_messages_as_conversation, session_id
+            )
+            return history, True
         except Exception as exc:
             logger.warning("Failed to load session history for %s: %s", session_id, exc)
-            return []
+            return [], False
 
     async def _handle_list_sessions(self, request: "web.Request") -> "web.Response":
         """GET /api/sessions — list persisted Hermes sessions."""
@@ -2452,6 +2518,14 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         messages = await asyncio.to_thread(db.get_messages, source_id)
         await asyncio.to_thread(db.replace_messages, fork_id, messages)
+        # Dream Cycle v3: copy the parent chain's terminating wake record
+        # verbatim onto the fork child, so inheritance holds by direct
+        # record instead of a parent-chain walk that a deep fork lineage
+        # would exhaust (fail-closed = lost binding). Never raises.
+        from gateway.continuity_wake import materialize_wake_record_for_child
+        await asyncio.to_thread(
+            materialize_wake_record_for_child, db, fork_id, source_id
+        )
         title = body.get("title")
         if title is None:
             base = source.get("title") or "fork"
@@ -2465,6 +2539,63 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response(_openai_error(str(exc), code="invalid_title"), status=400)
         fork = await asyncio.to_thread(db.get_session, fork_id) or {"id": fork_id, "parent_session_id": source_id}
         return web.json_response({"object": "hermes.session", "session": self._session_response(fork)}, status=201)
+
+    async def _wake_ephemeral_prompt(self, session_id: str,
+                                     system_prompt: Optional[str], *,
+                                     is_new_session: bool,
+                                     user_message: Any) -> Optional[str]:
+        """Dream Cycle v3 wake packet (Phase 3), shared by every durable-
+        session first-message endpoint (/v1/chat/completions,
+        /api/sessions/{id}/chat and its /stream variant, /v1/responses) so
+        their lifecycles cannot drift.
+
+        The API server is the authoritative agent host in proxy topologies,
+        so the packet is bound HERE, keyed by durable session_id in state.db
+        — once per new session, restored verbatim on every later request
+        (never rebuilt), and appended to the ephemeral system prompt only.
+        *is_new_session* is only the surface's first-call attestation; the
+        durable record the shared lifecycle persists on call one (a binding
+        OR the attempted-none sentinel; present-but-corrupt state is
+        terminal) is the real once-per-session marker, so a later
+        empty-history replay of the same session can never opportunistically
+        bind. Fail closed: any failure returns *system_prompt* unchanged.
+
+        Multiplex boundary (fail closed): the API surface registers only
+        unprefixed routes, so a request carries no per-profile identity —
+        there is no /p/<profile>/ API routing. Rather than borrow the
+        primary process's ambient profile for a request whose profile is
+        unknowable, wake binding is disabled entirely while
+        gateway.multiplex_profiles is on — or when the guard itself cannot
+        be evaluated. Single-profile gateways are unaffected.
+        """
+        try:
+            from agent.secret_scope import is_multiplex_active
+            multiplexed = is_multiplex_active()
+        except Exception:
+            logger.warning("wake: multiplex guard unavailable; disabling "
+                           "wake binding for this request", exc_info=True)
+            multiplexed = True
+        if multiplexed:
+            return system_prompt
+        try:
+            from gateway.continuity_wake import ensure_wake_text_for_session_id
+            db = self._ensure_session_db()
+            if db is None:
+                return system_prompt
+            wake_text = await asyncio.to_thread(
+                ensure_wake_text_for_session_id,
+                db, session_id,
+                is_new_session=is_new_session,
+                first_message=_wake_evidence_text(user_message),
+                create_source="api",
+            )
+            if wake_text:
+                return (system_prompt + "\n\n" + wake_text
+                        if system_prompt else wake_text)
+        except Exception:
+            logger.debug("wake packet skipped for API session %s",
+                         session_id, exc_info=True)
+        return system_prompt
 
     @_admit_api_agent_request
     async def _handle_session_chat(self, request: "web.Request") -> "web.Response":
@@ -2485,7 +2616,17 @@ class APIServerAdapter(BasePlatformAdapter):
         system_prompt = body.get("system_message") or body.get("instructions")
         if system_prompt is not None and not isinstance(system_prompt, str):
             return web.json_response(_openai_error("system_message must be a string", code="invalid_system_message"), status=400)
-        history = await self._conversation_history_for_session(session_id)
+        history, history_ok = await self._conversation_history_for_session(
+            session_id
+        )
+        # Once-per-session wake packet on the ephemeral prompt (empty
+        # history is only this surface's first-call attestation, and only
+        # when the read actually succeeded — a failed read attests nothing).
+        system_prompt = await self._wake_ephemeral_prompt(
+            session_id, system_prompt,
+            is_new_session=history_ok and not history,
+            user_message=user_message)
+
         result, usage = await self._run_agent(
             user_message=user_message,
             conversation_history=history,
@@ -2572,11 +2713,21 @@ class APIServerAdapter(BasePlatformAdapter):
             try:
                 await queue.put(_event_payload("run.started", {"user_message": {"role": "user", "content": user_message}}))
                 await queue.put(_event_payload("message.started", {"message": {"id": message_id, "role": "assistant"}}))
-                history = await self._conversation_history_for_session(session_id)
+                history, history_ok = await self._conversation_history_for_session(
+                    session_id)
+                # Same once-per-session wake lifecycle as the sync endpoint;
+                # applied to this run's prompt only, never mutating the
+                # caller-supplied system_prompt. A failed history read never
+                # attests first-message eligibility.
+                wake_system_prompt = await self._wake_ephemeral_prompt(
+                    session_id, system_prompt,
+                    is_new_session=history_ok and not history,
+                    user_message=user_message)
+
                 result, usage = await self._run_agent(
                     user_message=user_message,
                     conversation_history=history,
-                    ephemeral_system_prompt=system_prompt,
+                    ephemeral_system_prompt=wake_system_prompt,
                     session_id=session_id,
                     stream_delta_callback=_delta,
                     tool_progress_callback=_tool_progress,
@@ -2753,10 +2904,14 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=400,
                 )
             session_id = provided_session_id
+            history_ok = False
             try:
                 db = await self._ensure_session_db_async()
                 if db is not None:
-                    history = await asyncio.to_thread(db.get_messages_as_conversation, session_id)
+                    history = await asyncio.to_thread(
+                        db.get_messages_as_conversation, session_id
+                    )
+                    history_ok = True
             except Exception as e:
                 logger.warning("Failed to load session history for %s: %s", session_id, e)
                 history = []
@@ -2772,6 +2927,16 @@ class APIServerAdapter(BasePlatformAdapter):
                     break
             session_id = _derive_chat_session_id(system_prompt, first_user)
             # history already set from request body above
+            history_ok = True
+
+        # Once-per-session wake packet on the ephemeral prompt (empty
+        # history is only this surface's first-call attestation, and only
+        # when the read actually succeeded — a failed durable-history read
+        # attests nothing); shared lifecycle in _wake_ephemeral_prompt.
+        system_prompt = await self._wake_ephemeral_prompt(
+            session_id, system_prompt,
+            is_new_session=history_ok and not history,
+            user_message=user_message)
 
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
         model_name = body.get("model", self._model_name)
@@ -3892,6 +4057,17 @@ class APIServerAdapter(BasePlatformAdapter):
         # groups the entire conversation under one session entry.
         session_id = stored_session_id or str(uuid.uuid4())
 
+        # Once-per-session wake packet (shared lifecycle in
+        # _wake_ephemeral_prompt), bound to this durable session — fresh or
+        # inherited from the previous_response_id chain. It rides only this
+        # run's ephemeral prompt: the stored/carried-forward `instructions`
+        # stay clean, so response chaining can never carry the packet
+        # forward and double-append it.
+        wake_instructions = await self._wake_ephemeral_prompt(
+            session_id, instructions,
+            is_new_session=not conversation_history,
+            user_message=user_message)
+
         # Per-client model routing for /v1/responses (see model_routes).
         route = self._resolve_route(body.get("model"))
 
@@ -3940,7 +4116,7 @@ class APIServerAdapter(BasePlatformAdapter):
             agent_task = asyncio.ensure_future(self._run_agent(
                 user_message=user_message,
                 conversation_history=conversation_history,
-                ephemeral_system_prompt=instructions,
+                ephemeral_system_prompt=wake_instructions,
                 session_id=session_id,
                 stream_delta_callback=_on_delta,
                 tool_progress_callback=_on_tool_progress,
@@ -3979,7 +4155,7 @@ class APIServerAdapter(BasePlatformAdapter):
             return await self._run_agent(
                 user_message=user_message,
                 conversation_history=conversation_history,
-                ephemeral_system_prompt=instructions,
+                ephemeral_system_prompt=wake_instructions,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
                 route=route,

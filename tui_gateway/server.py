@@ -1546,6 +1546,22 @@ def _wait_agent(session: dict, rid: str, timeout: float = 30.0) -> dict | None:
     return _err(rid, 5032, err) if err else None
 
 
+def _arm_deferred_wake(session: dict) -> None:
+    """Arm the deferred wake attach for a freshly built agent.
+
+    The new/continuing verdict itself is decided at creation time, while
+    the creation intent is authoritative (session.create's empty-parentless
+    check, _init_session's always-continuing stance). The build step may
+    only ever NARROW that verdict — resume/branch metadata discovered here
+    strips newness, but a session already judged not-new (seeded history, a
+    resume, a branch) is never re-widened into a bindable draft."""
+    session["wake_pending"] = True
+    session["wake_is_new_session"] = bool(
+        session.get("wake_is_new_session", True)
+        and not session.get("resume_session_id")
+        and not session.get("parent_session_id"))
+
+
 def _start_agent_build(sid: str, session: dict) -> None:
     """Start building the real AIAgent for a TUI session, once.
 
@@ -1629,6 +1645,17 @@ def _start_agent_build(sid: str, session: dict) -> None:
                     if (tier := current.get("create_service_tier_override")) is not None:
                         kw["service_tier_override"] = tier
                 agent = _make_agent(sid, key, **kw)
+
+                # Dream Cycle v3 wake packet (Phase 3): construction is
+                # DEFERRED to the first model-bound user prompt (see
+                # _attach_wake_for_prompt). Binding here — the TUI prewarms
+                # agents before any prompt — would (a) bind with an empty
+                # first message, so explicit task/project evidence in the
+                # real first message could never activate a project, and
+                # (b) lazily insert a durable state.db row for a session the
+                # user may never speak to, regressing the documented
+                # no-empty-session behavior.
+                _arm_deferred_wake(current)
             finally:
                 _clear_session_context(tokens)
 
@@ -2027,6 +2054,34 @@ def _ensure_session_db_row(session: dict) -> None:
             parent_session_id=parent_session_id,
             cwd=_session_cwd(session) if session.get("explicit_cwd") else None,
         )
+        # This row can exist before the session's first model-bound prompt
+        # (/title, handoff, model-switch marker all persist eagerly), and a
+        # gateway restart between row creation and that prompt resumes it
+        # as not-new — the in-memory wake_pending/wake_is_new_session
+        # markers die with the process. Persist the pre-first-call pending
+        # sentinel with the row so the first real prompt after a restart
+        # still binds the wake packet exactly once, with that message as
+        # evidence. Only brand-new drafts qualify (the explicit verdict set
+        # at session.create); resumed/branch rows and any row that already
+        # carries wake state (the CAS refuses) are never marked — a
+        # history-bearing session can never become bind-eligible here.
+        if (session.get("wake_is_new_session")
+                and not session.get("resume_session_id")
+                and not parent_session_id):
+            from gateway.continuity_wake import mark_wake_pending_for_session_id
+            mark_wake_pending_for_session_id(db, key)
+        # Dream Cycle v3: the desktop branch path is session.create with
+        # parent_session_id (not the session.branch RPC), and this row
+        # persist is where its child row is born — copy the parent's
+        # durable wake record verbatim onto it, exactly like the explicit
+        # branch and compression rotation, so inheritance holds by direct
+        # record instead of a parent-chain walk that a deep branch lineage
+        # would exhaust (fail-closed = lost binding). Only-if-absent CAS,
+        # so the idempotent re-calls of this function are no-ops. Never
+        # raises.
+        if parent_session_id:
+            from gateway.continuity_wake import materialize_wake_record_for_child
+            materialize_wake_record_for_child(db, key, parent_session_id)
     except Exception:
         logger.debug("failed to persist desktop session row", exc_info=True)
     finally:
@@ -4565,7 +4620,9 @@ def _apply_personality_to_session(
 
     agent = session.get("agent")
     if agent:
-        agent.ephemeral_system_prompt = new_prompt or None
+        # Preserves a bound wake packet: personality replaces the base
+        # ephemeral prompt only, never the session's continuity binding.
+        _compose_ephemeral_prompt(agent, new_prompt)
         # Inject a pivot marker into history so the model sees the change point.
         # This prevents it from pattern-matching its prior style.
         if new_prompt:
@@ -5196,6 +5253,13 @@ def _init_session(
             # Honored on rebuild (/new, resume) so a switch in THIS session
             # never leaks into siblings via process-global env vars.
             "model_override": None,
+            # Every _init_session caller continues an existing transcript
+            # (eager resume, branch), so the wake verdict is never "new":
+            # the first prompt reattaches a durable binding (or inherits
+            # the parent's via the chain), and only a durable pre-first-
+            # call pending sentinel can make it bind fresh.
+            "wake_pending": True,
+            "wake_is_new_session": False,
             # Pin async event emissions to whichever transport created the
             # session (stdio for Ink, JSON-RPC WS for the dashboard sidebar).
             "transport": current_transport() or _stdio_transport,
@@ -5529,6 +5593,24 @@ def _coerce_seed_history(value: Any) -> list[dict]:
     return history
 
 
+def _seed_history_present(value: Any) -> bool:
+    """Does a session.create ``messages`` param carry any seed entry?
+
+    The wake new-session verdict keys off the PRESENCE of seeded history
+    rows, never their content: a supported role row (user/assistant/system)
+    is a past turn even with empty/whitespace/null/empty-container or
+    image-only content (_coerce_seed_history keeps only string transcripts
+    for display, but the transcript still has a past), and an unsupported/
+    malformed entry — or a non-list messages param — fails closed to
+    history-present rather than rearming a wake bind. Only a genuinely
+    absent or empty messages collection is a zero-message eligible draft."""
+    if value is None:
+        return False
+    if isinstance(value, list):
+        return bool(value)
+    return True
+
+
 def _content_display_text(content: Any) -> str:
     if content is None:
         return ""
@@ -5786,6 +5868,10 @@ def _(rid, params: dict) -> dict:
     key = _new_session_key()
     cols = int(params.get("cols", 80))
     history = _coerce_seed_history(params.get("messages"))
+    # Seed row PRESENCE, not coerced text: a multimodal-only or empty-content
+    # seed coerces to an empty display history but is still a history-bearing
+    # transcript, so it must disqualify the wake new-session verdict below.
+    seeded_history = _seed_history_present(params.get("messages"))
     title = str(params.get("title") or "").strip()
     # When set, this is a branch: the new chat copies an existing conversation's
     # history and links back to it so list_sessions_rich keeps it visible and the
@@ -5870,6 +5956,17 @@ def _(rid, params: dict) -> dict:
             "create_reasoning_override": create_reasoning_override,
             "create_service_tier_override": create_service_tier_override,
             "parent_session_id": parent_session_id,
+            # The wake new-session verdict, decided here while the creation
+            # intent is authoritative (not at agent build, which may run
+            # after a pre-prompt /title already needs it): only a genuinely
+            # empty, parentless draft is wake-new. A branch continues its
+            # parent, and seeded history — string or multimodal — means the
+            # transcript already has a past that a fresh continuity binding
+            # must never be spliced into. Consumed by _ensure_session_db_row
+            # (durable pending sentinel) and _arm_deferred_wake/
+            # _attach_wake_for_prompt; the build step never re-widens it.
+            "wake_is_new_session": parent_session_id is None
+            and not seeded_history,
             "pending_title": title or None,
             "profile_home": str(profile_home) if profile_home is not None else None,
             "running": False,
@@ -9046,6 +9143,12 @@ def _(rid, params: dict) -> dict:
                 content=msg.get("content"),
             )
         db.set_session_title(new_key, title)
+        # Dream Cycle v3: copy the parent's durable wake record verbatim
+        # onto the branch child, so inheritance holds by direct record
+        # instead of a parent-chain walk that a deep branch/compression
+        # lineage would exhaust (fail-closed = lost binding). Never raises.
+        from gateway.continuity_wake import materialize_wake_record_for_child
+        materialize_wake_record_for_child(db, new_key, old_key)
     except Exception as e:
         if lease is not None:
             lease.release()
@@ -9929,6 +10032,98 @@ def _start_notification_poller(sid: str, session: dict) -> threading.Event:
     return stop
 
 
+def _attach_wake_for_prompt(session: dict, agent, first_message: Any) -> None:
+    """Dream Cycle v3 wake packet (Phase 3), bound at the session's first
+    model-bound user prompt — never at prewarm/agent-build time.
+
+    Deferring to here means the packet sees the actual first message (so
+    explicit task/project evidence can activate a project) and no durable
+    state.db row is created for a session the user never speaks to. Once
+    per session: the entry marker is consumed here and the durable
+    once-only/attempted-none semantics live in state.db
+    (gateway.continuity_wake). Resumed/branched sessions reattach their
+    original binding verbatim; the wake text is recorded on the agent so
+    later full-prompt rewrites (/personality, /prompt) can preserve it.
+    Fail closed: any problem means no packet. A model-bound prompt consumes
+    the in-memory marker even when its durable read is retryable: retrying
+    after that prompt would change system-prompt bytes mid-conversation and
+    invalidate prompt caching. Restore paths only rearm durable pending for
+    transcript-empty sessions.
+    """
+    if not session.get("wake_pending"):
+        return
+    try:
+        from gateway.continuity_wake import (
+            ensure_wake_state_for_session_id,
+            finalize_pending_wake_as_none,
+            load_wake_record_for_session,
+            load_wake_state_for_session,
+            wake_attempt_concluded,
+        )
+        wake_db = getattr(agent, "_session_db", None) or _get_db()
+        wake_sid = session.get("resume_session_id") or session["session_key"]
+        # A pending record after history exists means an earlier first-turn
+        # read was unavailable. It may never bind late; settle it durably.
+        if session.get("history"):
+            prior_state = load_wake_state_for_session(wake_db, wake_sid)[0]
+            if prior_state == "pending":
+                finalize_pending_wake_as_none(
+                    wake_db, wake_sid,
+                    create_source=_session_source(session) or "tui")
+                session.pop("wake_pending", None)
+                return
+            if prior_state == "unavailable":
+                # Retry a read-only load: it can reattach an old binding but
+                # must never invoke the pending->build lifecycle here.
+                retry_state, _raw, retry_binding = load_wake_record_for_session(
+                    wake_db, wake_sid)
+                if retry_state == "bound" and retry_binding:
+                    text = retry_binding["text"]
+                    agent._wake_packet_text = text
+                    previous = getattr(agent, "ephemeral_system_prompt", None)
+                    agent.ephemeral_system_prompt = (
+                        previous + "\n\n" + text if previous else text)
+                elif retry_state == "pending":
+                    finalize_pending_wake_as_none(
+                        wake_db, wake_sid,
+                        create_source=_session_source(session) or "tui")
+                session.pop("wake_pending", None)
+                return
+        profile_home = session.get("profile_home")
+        state, binding = ensure_wake_state_for_session_id(
+            wake_db, wake_sid,
+            is_new_session=bool(session.get("wake_is_new_session")),
+            first_message=first_message if isinstance(first_message, str) else "",
+            workspace_path=session.get("cwd"),
+            profile_home=(Path(profile_home) if profile_home else None),
+            create_source=_session_source(session) or "tui",
+        )
+        if wake_attempt_concluded(state) or state == "unavailable":
+            session.pop("wake_pending", None)
+        if state == "bound" and binding:
+            text = binding["text"]
+            agent._wake_packet_text = text
+            prev = getattr(agent, "ephemeral_system_prompt", None)
+            agent.ephemeral_system_prompt = (
+                prev + "\n\n" + text if prev else text)
+    except Exception:
+        session.pop("wake_pending", None)
+        logger.debug("wake packet skipped for TUI session %s",
+                     session.get("session_key"), exc_info=True)
+
+
+def _compose_ephemeral_prompt(agent, base_prompt) -> None:
+    """Replace the agent's ephemeral system prompt while preserving a bound
+    wake packet: /personality and /prompt rewrite the base prompt, they do
+    not get to silently drop the session's continuity binding."""
+    wake = getattr(agent, "_wake_packet_text", None)
+    base = base_prompt or None
+    if base and wake:
+        agent.ephemeral_system_prompt = base + "\n\n" + wake
+    else:
+        agent.ephemeral_system_prompt = base or wake or None
+
+
 def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
     with session["history_lock"]:
         history = list(session["history"])
@@ -10017,6 +10212,15 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                     )
                     return
                 prompt = ctx.message
+
+            # First model-bound user prompt: bind/reattach the wake packet
+            # with the real message text (deferred from agent build). This
+            # runs AFTER context-reference validation so a blocked prompt —
+            # which never reaches the model — cannot consume the session's
+            # one bind attempt. Evidence is the user's original text, never
+            # the ctx-expanded prompt (injected file contents are not
+            # activation evidence).
+            _attach_wake_for_prompt(session, agent, text)
 
             # Decide image routing per-turn based on active provider/model.
             # "native" → pass pixels to the main model as OpenAI-style content
@@ -14559,7 +14763,9 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
         elif name == "prompt" and agent:
             cfg = _load_cfg()
             new_prompt = _prompt_text((cfg.get("agent") or {}).get("system_prompt", ""))
-            agent.ephemeral_system_prompt = new_prompt or None
+            # Preserves a bound wake packet: /prompt replaces the base
+            # ephemeral prompt only, never the session's continuity binding.
+            _compose_ephemeral_prompt(agent, new_prompt)
             agent._cached_system_prompt = None
         elif name == "compress" and agent:
             # Mirror the session.compress RPC: build a before/after summary so

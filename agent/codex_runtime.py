@@ -692,7 +692,16 @@ def run_codex_app_server_turn(
     # return reaches us. Do NOT append again — that would duplicate.
 
     try:
-        turn = agent._codex_session.run_turn(user_input=user_message)
+        # Carry the per-session ephemeral context (gateway context prompt +
+        # Dream Cycle wake packet) into the codex thread. The transport
+        # delivers it once per stateful thread; it is never spliced into the
+        # persisted transcript — mirroring how the default provider path
+        # appends ephemeral_system_prompt at API-call time only.
+        turn = agent._codex_session.run_turn(
+            user_input=user_message,
+            session_context=getattr(agent, "ephemeral_system_prompt", None)
+            or None,
+        )
     except Exception as exc:
         logger.exception("codex app-server turn failed")
         # Crash → unconditionally drop the session so the next turn

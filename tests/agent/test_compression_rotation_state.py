@@ -161,6 +161,33 @@ class TestPlatformForwardedAtBoundary:
         assert kwargs.get("boundary_reason") == "compression"
 
 
+class TestWakeRecordMaterializesOnRotation:
+    def test_parent_wake_record_copied_to_child(self, tmp_path: Path):
+        """Dream Cycle v3 post-verification finding 9: rotation must copy
+        the parent's durable wake record verbatim onto the child row, so
+        inheritance holds by direct record instead of a parent-chain walk
+        that a deep compression lineage would exhaust (fail-closed = lost
+        binding)."""
+        import hashlib
+        import json
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        parent = "PARENT_WAKE_ROT"
+        db.create_session(parent, source="cli")
+        raw = json.dumps({
+            "schema_version": 1, "packet_id": "pkt-rotation",
+            "content_hash": "sha256:"
+            + hashlib.sha256(b"rotation packet").hexdigest(),
+            "project_id": None, "text": "rotation packet"})
+        db.set_session_wake_packet(parent, raw)
+
+        agent = _build_agent_with_db(db, parent)
+        agent._compress_context(_msgs(), "sys", approx_tokens=120_000)
+        child = agent.session_id
+        assert child != parent  # rotation happened
+        assert db.get_session_wake_packet(child) == raw
+
+
 class TestFallbackStreakFollowsRotation:
     def test_fallback_boundary_persists_on_child_session(self, tmp_path: Path):
         db = SessionDB(db_path=tmp_path / "state.db")

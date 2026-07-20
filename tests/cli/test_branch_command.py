@@ -219,6 +219,37 @@ class TestBranchCommandCLI:
         assert result is not None
         assert result.name == "branch"
 
+    def test_branch_chain_materializes_wake_record(self, cli_instance,
+                                                   session_db):
+        """Dream Cycle v3 re-review blocker 5: every child-creation path
+        copies the parent chain's terminating wake record verbatim onto the
+        child, so a 12-hop /branch chain still resolves its inherited
+        binding instead of reaching terminal 'exhausted' past the ten-hop
+        parent-chain walk limit."""
+        import hashlib
+        import json
+        from cli import HermesCLI
+        from gateway.continuity_wake import load_wake_state_for_session
+
+        text = "cli branch packet"
+        raw = json.dumps({
+            "schema_version": 1, "packet_id": "pkt-cli-branch",
+            "content_hash": "sha256:"
+            + hashlib.sha256(text.encode()).hexdigest(),
+            "project_id": None, "text": text})
+        session_db.set_session_wake_packet(cli_instance.session_id, raw)
+
+        for i in range(12):
+            parent_id = cli_instance.session_id
+            HermesCLI._handle_branch_command(cli_instance, "/branch")
+            child_id = cli_instance.session_id
+            assert child_id != parent_id, i
+            assert session_db.get_session_wake_packet(child_id) == raw, i
+
+        state, binding = load_wake_state_for_session(
+            session_db, cli_instance.session_id)
+        assert state == "bound" and binding["text"] == text
+
 
 class TestBranchCommandDef:
     """Test the CommandDef registration for /branch."""

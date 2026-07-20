@@ -337,6 +337,7 @@ locales = ["locales/*.yaml"]
 
 [tool.setuptools.package-data]
 hermes_cli = ["web_dist/**/*", "tui_dist/**/*", "scripts/install.sh", "scripts/install.ps1"]
+dream_cycle_v3 = ["sample_data/**/*", "contracts/*.json"]
 gateway = ["assets/**/*"]
 plugins = [
   "*/dashboard/manifest.json",
@@ -354,7 +355,7 @@ plugins = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["agent", "agent.*", "tools", "tools.*", "hermes_cli", "hermes_cli.*", "gateway", "gateway.*", "tui_gateway", "tui_gateway.*", "cron", "cron.*", "acp_adapter", "plugins", "plugins.*", "providers", "providers.*"]
+include = ["agent", "agent.*", "tools", "tools.*", "hermes_cli", "hermes_cli.*", "gateway", "gateway.*", "tui_gateway", "tui_gateway.*", "cron", "cron.*", "acp_adapter", "plugins", "plugins.*", "providers", "providers.*", "dream_cycle_v3", "dream_cycle_v3.*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
