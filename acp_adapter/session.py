@@ -612,7 +612,25 @@ class SessionManager:
         # attests newness (wake_is_new stays False), so rows without the
         # sentinel — every history-bearing transcript — settle as absent at
         # the retry and can never become bind-eligible through restore.
-        if self._wake_state_for(session_id) in ("pending", "unavailable"):
+        wake_state = self._wake_state_for(session_id)
+        if history and wake_state == "pending":
+            from gateway.continuity_wake import finalize_pending_wake_as_none
+            finalize_pending_wake_as_none(db, session_id, create_source="acp")
+        elif history and wake_state == "unavailable":
+            # Retry a read-only load: it may restore an existing binding, but
+            # never invokes the pending->build lifecycle on old history.
+            from gateway.continuity_wake import load_wake_record_for_session
+            retry_state, _raw, binding = load_wake_record_for_session(db, session_id)
+            if retry_state == "bound" and binding:
+                text = binding["text"]
+                state.agent._wake_packet_text = text
+                previous = getattr(state.agent, "ephemeral_system_prompt", None)
+                state.agent.ephemeral_system_prompt = (
+                    previous + "\n\n" + text if previous else text)
+            elif retry_state == "pending":
+                from gateway.continuity_wake import finalize_pending_wake_as_none
+                finalize_pending_wake_as_none(db, session_id, create_source="acp")
+        elif not history and wake_state in ("pending", "unavailable"):
             state.wake_pending = True
         else:
             self._attach_wake_packet(state, is_new_session=False)
@@ -622,23 +640,21 @@ class SessionManager:
     def ensure_wake_for_prompt(self, state: "SessionState",
                                first_message: str) -> None:
         """Bind the wake packet at the session's first model-bound user
-        prompt (deferred from create_session). Once per session: the entry
-        marker is consumed only when the durable lifecycle settled — on a
-        retryable failure it survives, so the in-memory deferral and the
-        durable pending sentinel stay in agreement (a consumed marker over
-        durable pending would let a restart rearm a history-bearing
-        transcript). Durable once-only/attempted-none semantics live in
-        state.db (gateway.continuity_wake). Never raises."""
+        prompt (deferred from create_session). Once per session: a
+        model-bound prompt consumes the in-memory marker even when the
+        durable lifecycle read is retryable, because a later injection would
+        mutate system-prompt bytes mid-conversation. Durable once-only/
+        attempted-none semantics live in state.db (gateway.continuity_wake).
+        Never raises."""
         if not getattr(state, "wake_pending", False):
             return
         # is_new_session only from the creation-time verdict: a marker
         # rearmed by restore attests nothing, so binding then requires the
         # durable pending sentinel.
-        concluded = self._attach_wake_packet(
+        self._attach_wake_packet(
             state, is_new_session=getattr(state, "wake_is_new", False),
             first_message=first_message)
-        if concluded:
-            state.wake_pending = False
+        state.wake_pending = False
 
     def _attach_wake_packet(self, state: "SessionState", *,
                             is_new_session: bool,

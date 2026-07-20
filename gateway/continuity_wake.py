@@ -531,6 +531,34 @@ def ensure_wake_state_for_session_id(session_db, session_id: str, *,
         return "unavailable", None
 
 
+def finalize_pending_wake_as_none(session_db, session_id: str, *,
+                                  create_source: str | None = None) -> str:
+    """Consume an obsolete pending sentinel without building a packet.
+
+    A pending record is valid only before a session's first model-bound
+    prompt. If a surface discovers transcript history after an unavailable
+    first-turn read, settle it as ``none`` rather than allow a later restore
+    to inject new system-prompt bytes into that conversation. The CAS keeps a
+    concurrent binding or terminal result authoritative.
+    """
+    try:
+        state, raw, _binding = load_wake_record_for_session(session_db,
+                                                            session_id)
+        if state != WAKE_STATE_PENDING or raw is None:
+            return state
+        won = session_db.set_session_wake_packet(
+            session_id, _NONE_SENTINEL_JSON, create_source=create_source,
+            only_if_absent=True, treat_as_absent=raw)
+        if won:
+            return "none"
+        state, _raw, _binding = load_wake_record_for_session(session_db,
+                                                              session_id)
+        return state
+    except Exception:
+        logger.exception("wake: failed to finalize stale pending state")
+        return "unavailable"
+
+
 def ensure_wake_text_for_session_id(session_db, session_id: str, *,
                                     is_new_session: bool,
                                     first_message: str = "",

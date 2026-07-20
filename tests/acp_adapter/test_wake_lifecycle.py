@@ -170,6 +170,25 @@ def test_history_bearing_restored_session_never_binds(tmp_path):
     assert db.get_session_wake_packet("legacy-acp-1") is None
 
 
+def test_history_bearing_pending_record_settles_without_late_binding(tmp_path):
+    """A failed first-turn wake read cannot rebind after restart history."""
+    from gateway.continuity_wake import (mark_wake_pending_for_session_id,
+                                         wake_state_from_json)
+    seed_store()
+    mgr = make_manager(tmp_path)
+    db = mgr._get_db()
+    db.create_session(session_id="late-pending-acp", source="acp")
+    db.append_message(session_id="late-pending-acp", role="user", content="old")
+    db.append_message(session_id="late-pending-acp", role="assistant", content="answer")
+    mark_wake_pending_for_session_id(db, "late-pending-acp")
+    restored = mgr.get_session("late-pending-acp")
+    assert restored is not None
+    assert restored.wake_pending is False
+    assert restored.agent.ephemeral_system_prompt is None
+    assert wake_state_from_json(db.get_session_wake_packet("late-pending-acp")) == (
+        "none", None)
+
+
 def test_fork_inherits_attempted_none_terminally(tmp_path):
     """A fork of an attempted-none parent durably carries the sentinel:
     no other surface can later attest the child new and bind it."""
@@ -266,11 +285,8 @@ def test_no_store_first_prompt_marks_none_durably(tmp_path):
 
 # -- post-verification finding 8: failed attempts keep the deferral marker ------
 
-def test_failed_attempt_keeps_wake_pending_for_retry(tmp_path, monkeypatch):
-    """If the one bind attempt cannot durably conclude (storage failure at
-    the CAS), the in-memory marker must survive so it agrees with the
-    durable pending sentinel — consuming it while durable state stays
-    pending lets a restart rearm a history-bearing transcript."""
+def test_failed_attempt_never_retries_after_model_bound_turn(tmp_path, monkeypatch):
+    """A failed wake read must not mutate prompt bytes on a later turn."""
     from gateway.continuity_wake import load_wake_state_for_session
     seed_store()
     mgr = make_manager(tmp_path)
@@ -285,14 +301,13 @@ def test_failed_attempt_keeps_wake_pending_for_retry(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "set_session_wake_packet", _boom)
     mgr.ensure_wake_for_prompt(state, "acpproj status please")
     assert state.agent.ephemeral_system_prompt is None
-    assert state.wake_pending is True
+    assert state.wake_pending is False
     assert load_wake_state_for_session(
         db, state.session_id) == ("pending", None)
 
     monkeypatch.setattr(db, "set_session_wake_packet", original)
     mgr.ensure_wake_for_prompt(state, "acpproj status please")
-    text = state.agent.ephemeral_system_prompt
-    assert text and "Active project: ACP project" in text
+    assert state.agent.ephemeral_system_prompt is None
     assert state.wake_pending is False
 
 

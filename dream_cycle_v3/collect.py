@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,7 +34,9 @@ DEFAULT_ALLOWED_SUFFIXES = (".json", ".jsonl", ".log", ".md", ".txt", ".yaml", "
 _HASH_CHUNK = 1_048_576  # 1 MiB streaming window: memory-bounded full-file hashing
 
 
-def _read_prefix_with_full_hash(path: Path, keep_bytes: int) -> tuple[bytes, int, str]:
+def _read_prefix_with_full_hash(path: Path, keep_bytes: int,
+                               expected: os.stat_result | None = None
+                               ) -> tuple[bytes, int, str]:
     """Return (retained prefix, full byte count, full-content fingerprint).
 
     The hash streams the entire file in fixed-size chunks so a change beyond
@@ -43,15 +46,27 @@ def _read_prefix_with_full_hash(path: Path, keep_bytes: int) -> tuple[bytes, int
     digest = hashlib.sha256()
     kept = bytearray()
     total = 0
-    with open(path, "rb") as fh:
-        while True:
-            chunk = fh.read(_HASH_CHUNK)
-            if not chunk:
-                break
-            digest.update(chunk)
-            total += len(chunk)
-            if len(kept) < keep_bytes:
-                kept.extend(chunk[: keep_bytes - len(kept)])
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode):
+            raise OSError("collection candidate is not a regular file")
+        if (expected is not None and
+                (opened.st_dev, opened.st_ino) !=
+                (expected.st_dev, expected.st_ino)):
+            raise OSError("collection candidate changed after scan")
+        with os.fdopen(fd, "rb", closefd=False) as fh:
+            while True:
+                chunk = fh.read(_HASH_CHUNK)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                total += len(chunk)
+                if len(kept) < keep_bytes:
+                    kept.extend(chunk[: keep_bytes - len(kept)])
+    finally:
+        os.close(fd)
     return bytes(kept), total, "sha256:" + digest.hexdigest()
 
 
@@ -111,8 +126,8 @@ def _source_type_for(root_key: str, rel: Path, suffix: str) -> str:
 
 
 def _walk_candidates(root_key: str, root: Path, bounds: CollectionBounds,
-                     excluded: list[dict[str, str]]) -> Iterator[tuple[Path, Path, os.stat_result]]:
-    """Yield (abs_path, rel_path, stat) for regular files under `root`.
+                     excluded: list[dict[str, str]]) -> Iterator[tuple[Path, Path, Path, os.stat_result]]:
+    """Yield (read_path, alias_rel, policy_rel, stat) for regular files.
 
     Prunes secret directories and over-deep directories (each recorded once),
     never follows directory symlinks, and refuses file symlinks that resolve
@@ -136,6 +151,8 @@ def _walk_candidates(root_key: str, root: Path, bounds: CollectionBounds,
         for name in sorted(filenames):
             rel = rel_dir / name if rel_dir.parts else Path(name)
             path = dpath / name
+            read_path = path
+            policy_rel = rel
             if path.is_symlink():
                 try:
                     resolved = path.resolve(strict=True)
@@ -147,15 +164,17 @@ def _walk_candidates(root_key: str, root: Path, bounds: CollectionBounds,
                     excluded.append({"root": root_key, "location": str(rel),
                                      "reason": "symlink_escape"})
                     continue
+                read_path = resolved
+                policy_rel = resolved.relative_to(root)
             try:
-                st = path.stat()
+                st = read_path.stat()
             except OSError as exc:
                 excluded.append({"root": root_key, "location": str(rel),
                                  "reason": f"unreadable:{type(exc).__name__}"})
                 continue
-            if not path.is_file():
+            if not stat.S_ISREG(st.st_mode):
                 continue
-            yield path, rel, st
+            yield read_path, rel, policy_rel, st
 
 
 def _excerpt_for(rel: Path, data: bytes, bounds: CollectionBounds) -> str:
@@ -217,25 +236,25 @@ def collect(roots: CollectionRoots, *, window_start: datetime, window_end: datet
 
     for root_key in sorted(roots.roots):
         root = roots.roots[root_key]
-        in_window: list[tuple[float, str, Path, Path, os.stat_result]] = []
-        for path, rel, st in _walk_candidates(root_key, root, bounds, excluded):
+        in_window: list[tuple[float, str, Path, Path, Path, os.stat_result]] = []
+        for path, rel, policy_rel, st in _walk_candidates(root_key, root, bounds, excluded):
             # Secret paths are recorded regardless of suffix/window so the
             # exclusion list stays a complete safety audit trail.
-            reason = classify_path(rel)
+            reason = classify_path(policy_rel)
             if reason:
                 excluded.append({"root": root_key, "location": rel.as_posix(),
                                  "reason": reason})
                 continue
-            if rel.suffix.lower() not in bounds.allowed_suffixes:
+            if policy_rel.suffix.lower() not in bounds.allowed_suffixes:
                 continue
             mtime = datetime.fromtimestamp(st.st_mtime, timezone.utc)
-            if not (window_start <= mtime <= window_end):
+            if not (window_start <= mtime < window_end):
                 continue
             source_id = f"{root_key}:{rel.as_posix()}"
-            in_window.append((-st.st_mtime, source_id, path, rel, st))
+            in_window.append((-st.st_mtime, source_id, path, rel, policy_rel, st))
 
         in_window.sort(key=lambda t: (t[0], t[1]))
-        for i, (_, source_id, path, rel, st) in enumerate(in_window):
+        for i, (_, source_id, path, rel, policy_rel, st) in enumerate(in_window):
             if i >= bounds.max_files_per_root:
                 excluded.append({"root": root_key, "location": rel.as_posix(),
                                  "reason": "max_files_per_root"})
@@ -247,14 +266,16 @@ def collect(roots: CollectionRoots, *, window_start: datetime, window_end: datet
             budget = min(bounds.max_bytes_per_file,
                          bounds.max_total_bytes - total_bytes)
             try:
-                data, full_size, fingerprint = _read_prefix_with_full_hash(path, budget)
+                data, full_size, fingerprint = _read_prefix_with_full_hash(
+                    path, budget, st)
             except OSError as exc:
                 excluded.append({"root": root_key, "location": rel.as_posix(),
                                  "reason": f"unreadable:{type(exc).__name__}"})
                 continue
             total_bytes += len(data)
             truncated = full_size > len(data)
-            source_type = _source_type_for(root_key, rel, rel.suffix.lower())
+            source_type = _source_type_for(root_key, policy_rel,
+                                           policy_rel.suffix.lower())
 
             excerpt: str | None
             suppressed: str | None = None
@@ -273,7 +294,7 @@ def collect(roots: CollectionRoots, *, window_start: datetime, window_end: datet
                     excerpt = None
                     suppressed = "binary"
                 else:
-                    excerpt = _excerpt_for(rel, data, bounds)
+                    excerpt = _excerpt_for(policy_rel, data, bounds)
 
             sources.append({
                 "source_type": source_type,

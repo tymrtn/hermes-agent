@@ -530,11 +530,8 @@ def test_blocked_context_reference_prompt_never_consumes_wake(tmp_path,
 
 # -- post-verification finding 8: failed attempts keep the deferral marker ------
 
-def test_failed_attempt_keeps_wake_pending_for_retry(tmp_path, monkeypatch):
-    """If the one bind attempt cannot durably conclude (storage failure),
-    the in-memory marker must survive so the surface and the durable
-    pending sentinel agree — consuming it lets a restart rearm a
-    history-bearing transcript."""
+def test_failed_attempt_never_retries_after_model_bound_turn(tmp_path, monkeypatch):
+    """A failed wake read must not mutate prompt bytes on a later turn."""
     from tui_gateway.server import (_attach_wake_for_prompt,
                                     _ensure_session_db_row)
     seed_store()
@@ -551,13 +548,32 @@ def test_failed_attempt_keeps_wake_pending_for_retry(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "set_session_wake_packet", _boom)
     _attach_wake_for_prompt(session, agent, "tuiproj status please")
     assert agent.ephemeral_system_prompt is None
-    assert session.get("wake_pending") is True
+    assert "wake_pending" not in session
 
     monkeypatch.setattr(db, "set_session_wake_packet", original)
     _attach_wake_for_prompt(session, agent, "tuiproj status please")
-    assert agent.ephemeral_system_prompt is not None
-    assert "Active project: TUI project" in agent.ephemeral_system_prompt
+    assert agent.ephemeral_system_prompt is None
     assert "wake_pending" not in session
+
+
+def test_history_bearing_pending_record_settles_without_late_binding(tmp_path,
+                                                                     monkeypatch):
+    """A restart after an unavailable first turn must not bind into history."""
+    from gateway.continuity_wake import wake_state_from_json
+    from tui_gateway.server import _attach_wake_for_prompt
+    seed_store()
+    db = make_db(tmp_path, monkeypatch)
+    session = make_session(history=[{"role": "user", "content": "old"}],
+                           wake_is_new_session=False)
+    db.create_session(session_id=session["session_key"], source="tui")
+    from gateway.continuity_wake import mark_wake_pending_for_session_id
+    mark_wake_pending_for_session_id(db, session["session_key"])
+    agent = FakeAgent(db)
+    _attach_wake_for_prompt(session, agent, "tuiproj status please")
+    assert agent.ephemeral_system_prompt is None
+    assert "wake_pending" not in session
+    assert wake_state_from_json(db.get_session_wake_packet(session["session_key"])) == (
+        "none", None)
 
 
 # -- post-verification finding 9: branch materializes the parent record ---------

@@ -297,6 +297,17 @@ def build_wake_packet(*, store_path: Path | str,
                     todoist_export_path=todoist_path,
                     todoist_confine_home=todoist_home,
                     candidate_limit=GLOBAL_DUE_LANE_CANDIDATES)
+            sensitive_project_ids = {
+                p["project_id"] for p in registry
+                if p.get("sensitivity_policy") != "normal"
+            }
+            # A project's task titles, refs, and next actions are project
+            # details. Sensitive projects are lookup-only in every lane,
+            # including the global due-thread fallback.
+            visible_snapshots = [s for s in snapshots
+                                 if s.row["project_id"] not in sensitive_project_ids]
+            withheld_threads = len(visible_snapshots) != len(snapshots)
+            snapshots = visible_snapshots
             thread_lines = [_thread_line(s) for s in snapshots]
     except DreamCycleError as exc:
         logger.warning("wake: continuity store read failed: %s", exc)
@@ -365,6 +376,9 @@ def build_wake_packet(*, store_path: Path | str,
     if thread_lines:
         parts.append("Open threads (owned, max 3):")
         parts.extend(line.text for line in thread_lines)
+    elif withheld_threads:
+        parts.append("Open thread details withheld (sensitivity policy); "
+                     "use continuity_lookup(project=...).")
     elif decision.project_id is not None:
         parts.append("No open project threads.")
     else:

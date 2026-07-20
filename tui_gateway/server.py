@@ -9474,20 +9474,51 @@ def _attach_wake_for_prompt(session: dict, agent, first_message: Any) -> None:
     (gateway.continuity_wake). Resumed/branched sessions reattach their
     original binding verbatim; the wake text is recorded on the agent so
     later full-prompt rewrites (/personality, /prompt) can preserve it.
-    Fail closed: any problem, no packet — and the marker is consumed only
-    when the durable lifecycle settled (bound/none/corrupt/absent/
-    exhausted). On a retryable failure the marker survives, so the
-    in-memory deferral and the durable pending sentinel stay in agreement
-    (a consumed marker over durable pending would let a restart rearm a
-    history-bearing transcript).
+    Fail closed: any problem means no packet. A model-bound prompt consumes
+    the in-memory marker even when its durable read is retryable: retrying
+    after that prompt would change system-prompt bytes mid-conversation and
+    invalidate prompt caching. Restore paths only rearm durable pending for
+    transcript-empty sessions.
     """
     if not session.get("wake_pending"):
         return
     try:
-        from gateway.continuity_wake import (ensure_wake_state_for_session_id,
-                                             wake_attempt_concluded)
+        from gateway.continuity_wake import (
+            ensure_wake_state_for_session_id,
+            finalize_pending_wake_as_none,
+            load_wake_record_for_session,
+            load_wake_state_for_session,
+            wake_attempt_concluded,
+        )
         wake_db = getattr(agent, "_session_db", None) or _get_db()
         wake_sid = session.get("resume_session_id") or session["session_key"]
+        # A pending record after history exists means an earlier first-turn
+        # read was unavailable. It may never bind late; settle it durably.
+        if session.get("history"):
+            prior_state = load_wake_state_for_session(wake_db, wake_sid)[0]
+            if prior_state == "pending":
+                finalize_pending_wake_as_none(
+                    wake_db, wake_sid,
+                    create_source=_session_source(session) or "tui")
+                session.pop("wake_pending", None)
+                return
+            if prior_state == "unavailable":
+                # Retry a read-only load: it can reattach an old binding but
+                # must never invoke the pending->build lifecycle here.
+                retry_state, _raw, retry_binding = load_wake_record_for_session(
+                    wake_db, wake_sid)
+                if retry_state == "bound" and retry_binding:
+                    text = retry_binding["text"]
+                    agent._wake_packet_text = text
+                    previous = getattr(agent, "ephemeral_system_prompt", None)
+                    agent.ephemeral_system_prompt = (
+                        previous + "\n\n" + text if previous else text)
+                elif retry_state == "pending":
+                    finalize_pending_wake_as_none(
+                        wake_db, wake_sid,
+                        create_source=_session_source(session) or "tui")
+                session.pop("wake_pending", None)
+                return
         profile_home = session.get("profile_home")
         state, binding = ensure_wake_state_for_session_id(
             wake_db, wake_sid,
@@ -9497,7 +9528,7 @@ def _attach_wake_for_prompt(session: dict, agent, first_message: Any) -> None:
             profile_home=(Path(profile_home) if profile_home else None),
             create_source=_session_source(session) or "tui",
         )
-        if wake_attempt_concluded(state):
+        if wake_attempt_concluded(state) or state == "unavailable":
             session.pop("wake_pending", None)
         if state == "bound" and binding:
             text = binding["text"]
@@ -9506,8 +9537,9 @@ def _attach_wake_for_prompt(session: dict, agent, first_message: Any) -> None:
             agent.ephemeral_system_prompt = (
                 prev + "\n\n" + text if prev else text)
     except Exception:
-        logger.debug("wake packet skipped for TUI session %s (marker kept "
-                     "for retry)", session.get("session_key"), exc_info=True)
+        session.pop("wake_pending", None)
+        logger.debug("wake packet skipped for TUI session %s",
+                     session.get("session_key"), exc_info=True)
 
 
 def _compose_ephemeral_prompt(agent, base_prompt) -> None:

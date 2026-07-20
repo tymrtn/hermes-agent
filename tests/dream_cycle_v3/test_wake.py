@@ -540,6 +540,10 @@ def test_sensitive_project_gets_no_map_excerpt(seeded, sample_projects):
     assert packet.project_id == "hermes-continuity"
     assert "withheld (sensitivity policy)" in packet.text
     assert "Purpose" not in packet.text  # map content suppressed
+    assert "Await the tracker export" not in packet.text
+    assert "Await the tracker export" not in build(seeded).text
+    assert "Open thread details withheld (sensitivity policy)" in packet.text
+    assert "No open project threads." not in packet.text
 
 
 def test_packet_identity_is_deterministic(seeded):

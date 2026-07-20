@@ -2,6 +2,7 @@ import json
 import os
 import shutil
 import stat
+from datetime import timezone
 
 import pytest
 
@@ -115,6 +116,34 @@ def test_internal_symlink_is_allowed(tmp_path):
     os.symlink(root / "notes.txt", root / "alias.txt")
     manifest = _collect(roots)
     assert "profile:alias.txt" in {s["source_id"] for s in manifest["sources"]}
+
+
+def test_internal_symlink_uses_target_path_for_privacy_policy(tmp_path):
+    """An innocuous alias cannot downgrade the target's session/secret class."""
+    roots = _roots(tmp_path)
+    root = roots.roots["profile"]
+    (root / "secrets").mkdir()
+    (root / "secrets" / "tokens.txt").write_text("secret material\n")
+    os.symlink(root / "sessions" / "a.jsonl", root / "chat-alias.jsonl")
+    os.symlink(root / "secrets" / "tokens.txt", root / "notes-alias.txt")
+    manifest = _collect(roots)
+    sources = {s["source_id"]: s for s in manifest["sources"]}
+    assert sources["profile:chat-alias.jsonl"]["source_type"] == "session"
+    assert sources["profile:chat-alias.jsonl"]["excerpt"] is None
+    assert "profile:notes-alias.txt" not in sources
+    assert any(e["location"] == "notes-alias.txt"
+               and e["reason"].startswith("secret_dir:")
+               for e in manifest["excluded"])
+
+
+def test_collection_window_end_is_exclusive(tmp_path):
+    roots = _roots(tmp_path)
+    boundary = roots.roots["profile"] / "midnight.md"
+    boundary.write_text("belongs to the following window\n")
+    boundary_ts = WINDOW_END.astimezone(timezone.utc).timestamp()
+    os.utime(boundary, (boundary_ts, boundary_ts))
+    assert "profile:midnight.md" not in {
+        s["source_id"] for s in _collect(roots)["sources"]}
 
 
 def test_bounds_truncation_and_budgets(tmp_path):
