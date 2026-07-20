@@ -92,7 +92,7 @@ class WakeInputs:
     fields default to 'no evidence' so absence can never activate a project."""
 
     profile: str
-    owner: str
+    owner: str | None
     now: str                                # ISO-8601 datetime
     first_message: str = ""
     workspace_path: str | None = None
@@ -101,8 +101,8 @@ class WakeInputs:
     def __post_init__(self) -> None:
         if not self.profile or not self.profile.strip():
             raise DreamCycleError("WakeInputs.profile is required")
-        if not self.owner or not self.owner.strip():
-            raise DreamCycleError("WakeInputs.owner is required")
+        if self.owner is not None and not self.owner.strip():
+            raise DreamCycleError("WakeInputs.owner must be non-empty when set")
         if not is_iso_datetime(self.now):
             raise DreamCycleError(f"WakeInputs.now must be ISO-8601, got {self.now!r}")
 
@@ -276,6 +276,25 @@ def build_wake_packet(*, store_path: Path | str,
                     session_project_id=inputs.session_project_id),
                 now=now,
                 kanban_root=kanban_root)
+            active_project = next(
+                (p for p in registry
+                 if p["project_id"] == decision.project_id),
+                None)
+            effective_owner = inputs.owner
+            if effective_owner is None and active_project is not None:
+                effective_owner = active_project.get("owner")
+            if effective_owner is None:
+                registry_owners = {
+                    p.get("owner") for p in registry if p.get("owner")
+                }
+                if len(registry_owners) == 1:
+                    effective_owner = next(iter(registry_owners))
+            # No explicit owner and a mixed-owner global registry is
+            # intentionally denied rather than broadening the SQL query.
+            # NUL cannot pass the continuity contract, so it is a guaranteed
+            # no-match filter for valid stored threads.
+            if effective_owner is None:
+                effective_owner = "\x00"
             kanban_root_path = Path(kanban_root) if kanban_root else None
             todoist_path = (Path(todoist_export_path)
                             if todoist_export_path else None)
@@ -283,7 +302,7 @@ def build_wake_packet(*, store_path: Path | str,
             if decision.project_id is not None:
                 # Project lane: only the activated project's threads.
                 snapshots, refresh = collect_project_threads(
-                    store, now=now, owner=inputs.owner,
+                    store, now=now, owner=effective_owner,
                     project_id=decision.project_id, limit=THREAD_LIMIT,
                     kanban_root=kanban_root_path,
                     todoist_export_path=todoist_path,
@@ -292,7 +311,7 @@ def build_wake_packet(*, store_path: Path | str,
             else:
                 # Global lane: tiny, due-threads-only window.
                 snapshots, refresh = collect_project_threads(
-                    store, now=now, owner=inputs.owner, due_only=True,
+                    store, now=now, owner=effective_owner, due_only=True,
                     limit=THREAD_LIMIT, kanban_root=kanban_root_path,
                     todoist_export_path=todoist_path,
                     todoist_confine_home=todoist_home,
@@ -333,8 +352,7 @@ def build_wake_packet(*, store_path: Path | str,
     skill_excerpt_line = ""
     project_parts: list[str] = []
     if decision.project_id is not None:
-        active = next((p for p in registry
-                       if p["project_id"] == decision.project_id), None)
+        active = active_project
         name = active["canonical_name"] if active else decision.project_id
         project_parts.append(f"Active project: {sanitize_text(name, 80)} "
                              f"({sanitize_identifier(decision.project_id)}) "

@@ -24,7 +24,6 @@ from .collect import CollectionBounds, collect_to_manifest
 from .context_health import audit_context_health, write_context_health
 from .contracts import parse_iso_datetime, require_valid
 from .dry_run import execute_dry_run
-from .dry_run_phase2 import execute_phase2_dry_run
 from .errors import DreamCycleError, RootResolutionError
 from .manifest import load_manifest, validate_manifest
 from .report import build_run_report, write_report
@@ -175,6 +174,10 @@ def cmd_dry_run(args: argparse.Namespace) -> int:
 
 
 def cmd_dry_run_phase2(args: argparse.Namespace) -> int:
+    # Phase 2 destination promotion is POSIX-only (fcntl-backed locking).
+    # Keep it off the import path for portable collect/read/runtime commands.
+    from .dry_run_phase2 import execute_phase2_dry_run
+
     workdir = args.workdir or tempfile.mkdtemp(prefix="dream-cycle-v3-phase2-")
     report = execute_phase2_dry_run(workdir, as_of=args.as_of)
     _emit(report)

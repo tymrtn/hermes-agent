@@ -7222,6 +7222,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         _sync_process_session_id(self.session_id)
 
         if self.agent:
+            self._clear_continuity_wake_from_agent(self.agent)
             self.agent.session_id = self.session_id
             self.agent.session_start = self.session_start
             self.agent.reasoning_config = self.reasoning_config
@@ -11776,6 +11777,68 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             except Exception:
                 pass
 
+    @staticmethod
+    def _clear_continuity_wake_from_agent(agent) -> None:
+        """Remove only the exact prior session wake suffix from an agent."""
+        wake = getattr(agent, "_wake_packet_text", None)
+        prompt = getattr(agent, "ephemeral_system_prompt", None)
+        if wake and prompt == wake:
+            agent.ephemeral_system_prompt = None
+        elif wake and isinstance(prompt, str) \
+                and prompt.endswith("\n\n" + wake):
+            agent.ephemeral_system_prompt = prompt[:-(len(wake) + 2)] or None
+        if hasattr(agent, "_wake_packet_text"):
+            agent._wake_packet_text = None
+
+    def _attach_continuity_wake_for_prompt(self, agent, message) -> None:
+        """Bind or restore the once-per-session Dream Cycle v3 wake packet.
+
+        Classic CLI sessions are durable SessionDB sessions just like the TUI,
+        ACP, and API surfaces. Keep this seam fail-closed and ephemeral: only
+        the wake binding is persisted; the packet is appended to the agent's
+        API-local system prompt and never to transcript history.
+        """
+        db = getattr(self, "_session_db", None)
+        session_id = getattr(self, "session_id", None) \
+            or getattr(agent, "session_id", None)
+        if db is None or not session_id:
+            return
+        try:
+            durable_history = db.get_messages(session_id)
+            is_new_session = (not self.conversation_history
+                              and not durable_history)
+            if isinstance(message, str):
+                evidence = message[:8_192]
+            elif isinstance(message, list):
+                evidence = "\n".join(
+                    str(part.get("text", ""))
+                    for part in message
+                    if isinstance(part, dict)
+                    and part.get("type") == "text"
+                    and isinstance(part.get("text"), str)
+                )[:8_192]
+            else:
+                evidence = ""
+
+            from gateway.continuity_wake import ensure_wake_text_for_session_id
+            text = ensure_wake_text_for_session_id(
+                db, session_id,
+                is_new_session=is_new_session,
+                first_message=evidence,
+                workspace_path=os.getcwd(),
+                create_source="cli")
+            if not text:
+                return
+            agent._wake_packet_text = text
+            previous = getattr(agent, "ephemeral_system_prompt", None)
+            if not previous:
+                agent.ephemeral_system_prompt = text
+            elif text not in previous:
+                agent.ephemeral_system_prompt = previous + "\n\n" + text
+        except Exception:
+            logging.debug("continuity wake skipped for CLI session %s",
+                          session_id, exc_info=True)
+
     def chat(self, message, images: list = None) -> Optional[str]:
         """
         Send a message to the agent and get a response.
@@ -11912,6 +11975,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if isinstance(message, str):
             from run_agent import _sanitize_surrogates
             message = _sanitize_surrogates(message)
+
+        # Bind on the real first prompt, after local input normalization but
+        # before staging the user row. This keeps activation evidence accurate
+        # and preserves the durable first-message attestation.
+        self._attach_continuity_wake_for_prompt(agent, message)
 
         # Keep the exact CLI input dict available until turn-start persistence.
         # Copy the completed agent transcript before appending: otherwise this

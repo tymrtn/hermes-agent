@@ -5030,7 +5030,17 @@ class APIServerAdapter(BasePlatformAdapter):
         # concurrent runs can intentionally share them, and resolving an
         # approval for one run must not unblock another run's dangerous command.
         approval_session_key = run_id
-        ephemeral_system_prompt = instructions
+        durable_history, history_ok = await self._conversation_history_for_session(
+            session_id)
+        # /v1/runs is a durable-session first-message surface too. Bind the
+        # same once-only wake record before the background task creates its
+        # agent; explicit/request history and persisted history both make the
+        # run ineligible for a first-message build.
+        ephemeral_system_prompt = await self._wake_ephemeral_prompt(
+            session_id, instructions,
+            is_new_session=(history_ok and not durable_history
+                            and not conversation_history),
+            user_message=user_message)
         loop = asyncio.get_running_loop()
         q: "asyncio.Queue[Optional[Dict]]" = asyncio.Queue()
         created_at = time.time()

@@ -48,6 +48,17 @@ print("READ-MODULES-OK")
     assert "READ-MODULES-OK" in proc.stdout
 
 
+def test_cli_import_and_parser_work_without_fcntl():
+    proc = run_sim_windows("""
+from dream_cycle_v3.cli import build_parser
+parser = build_parser()
+assert parser.prog == "dream-cycle-v3"
+print("CLI-OK")
+""")
+    assert proc.returncode == 0, proc.stderr
+    assert "CLI-OK" in proc.stdout
+
+
 def test_wake_builds_packet_without_fcntl(tmp_path):
     """Full wake construction — including the confined project-doc read —
     on the simulated-Windows interpreter."""

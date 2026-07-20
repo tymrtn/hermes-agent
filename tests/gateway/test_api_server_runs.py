@@ -11,7 +11,7 @@ Covers:
 import asyncio
 import threading
 import time
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from aiohttp import web
@@ -144,6 +144,37 @@ class TestStartRun:
                 assert status["run_id"] == data["run_id"]
                 assert status["status"] in {"queued", "running", "completed"}
                 assert status["object"] == "hermes.run"
+
+    @pytest.mark.asyncio
+    async def test_start_routes_first_message_through_wake_binding(self, adapter):
+        app = _create_runs_app(adapter)
+        mock_agent = MagicMock()
+        mock_agent.run_conversation.return_value = {"final_response": "done"}
+        mock_agent.session_prompt_tokens = 0
+        mock_agent.session_completion_tokens = 0
+        mock_agent.session_total_tokens = 0
+        wake = AsyncMock(return_value="base instructions\n\nWAKE-BOUND")
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_wake_ephemeral_prompt", wake), \
+                    patch.object(adapter, "_create_agent",
+                                 return_value=mock_agent) as create:
+                resp = await cli.post("/v1/runs", json={
+                    "input": "continuity status",
+                    "instructions": "base instructions",
+                    "session_id": "runs-wake-session",
+                })
+                assert resp.status == 202
+                for _ in range(100):
+                    if create.called:
+                        break
+                    await asyncio.sleep(0.01)
+
+        wake.assert_awaited_once_with(
+            "runs-wake-session", "base instructions",
+            is_new_session=True, user_message="continuity status")
+        assert create.call_args.kwargs["ephemeral_system_prompt"] == \
+            "base instructions\n\nWAKE-BOUND"
 
     @pytest.mark.asyncio
     async def test_start_invalid_json_returns_400(self, adapter):

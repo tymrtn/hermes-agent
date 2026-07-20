@@ -90,6 +90,31 @@ def test_profile_name_from_hermes_home(monkeypatch, tmp_path):
     assert _active_profile_name() == "default"
 
 
+def test_profile_name_does_not_filter_a_different_continuity_owner(tmp_path):
+    home = tmp_path / "profiles" / "nagatha-test"
+    project = dict(PROJECT, owner="nagatha")
+    thread = dict(make_thread("wake-owner-mismatch-0001", "Owner survives"),
+                  owner="nagatha")
+    store_path = home / "dream-cycle-v3" / "continuity.db"
+    store_path.parent.mkdir(parents=True)
+    with ContinuityStore(store_path) as store:
+        store.migrate(NOW_ISO)
+        store.upsert_project(project, NOW_ISO)
+        store.open_thread(thread, NOW_ISO)
+        store.open_thread(
+            dict(make_thread("wake-owner-foreign-0001", "Must not leak"),
+                 owner="someone-else"),
+            NOW_ISO)
+
+    packet = build_wake_packet_for_session(
+        "dream cycle status", profile_home=home)
+    assert packet is not None
+    assert packet.profile == "nagatha-test"
+    assert packet.project_id == "hermes-continuity"
+    assert "wake-owner-mismatch-0001" in packet.thread_ids
+    assert "wake-owner-foreign-0001" not in packet.thread_ids
+
+
 # -- new-session binding ------------------------------------------------------
 
 def test_no_store_no_packet_no_binding():

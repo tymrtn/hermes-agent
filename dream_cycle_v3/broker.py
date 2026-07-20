@@ -79,6 +79,7 @@ def project_rows_to_registry(rows: list[Any]) -> list[dict[str, Any]]:
             "canonical_paths": _parse_json_column(row["canonical_paths"]),
             "repositories": _parse_json_column(row["repositories"]),
             "status": row["status"],
+            "owner": _row_get(row, "owner"),
             "last_verified_at": row["last_verified_at"],
             "context_skill_id": _row_get(row, "context_skill_id"),
             "task_ssot": {"provider": row["task_provider"],

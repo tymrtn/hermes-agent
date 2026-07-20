@@ -175,6 +175,17 @@ def test_new_command_creates_real_fresh_session_and_resets_agent_state(tmp_path)
     cli.agent._invalidate_system_prompt.assert_called_once()
 
 
+def test_new_command_removes_prior_session_wake_packet(tmp_path):
+    cli = _prepare_cli_with_active_session(tmp_path)
+    cli.agent._wake_packet_text = "WAKE-ONE"
+    cli.agent.ephemeral_system_prompt = "BASE\n\nWAKE-ONE"
+
+    cli.process_command("/new")
+
+    assert cli.agent._wake_packet_text is None
+    assert cli.agent.ephemeral_system_prompt == "BASE"
+
+
 def test_new_session_queues_boundary_commit_with_snapshot(tmp_path):
     """/new hands the OLD session's history + ids to the memory manager's
     serialized boundary task instead of blocking on extraction inline."""

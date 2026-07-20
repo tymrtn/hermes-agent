@@ -113,7 +113,13 @@ def build_wake_packet_for_session(first_message: str,
             confine_root=home,
             inputs=WakeInputs(
                 profile=profile,
-                owner=profile,
+                # The profile home is the isolation boundary. Profile names
+                # are not continuity owners (test/clone profiles commonly
+                # consume threads owned by their source personality), so an
+                # inferred profile-name owner filter would silently hide
+                # valid state. Callers with a configured owner can add that
+                # explicit filter in a future contract revision.
+                owner=None,
                 now=datetime.now(timezone.utc).isoformat(),
                 first_message=first_message or "",
                 workspace_path=workspace_path,
