@@ -41,6 +41,7 @@ Environment variables:
     MATRIX_RECOVERY_KEY         Recovery key for cross-signing verification after device key rotation
     MATRIX_DM_MENTION_THREADS   Create a thread when bot is @mentioned in a DM (default: false)
     MATRIX_ALLOW_PUBLIC_ROOMS   Allow Matrix tools to create public rooms (default: false)
+    MATRIX_MAX_MESSAGE_LENGTH   Outbound message chunk size in characters (default: 16000)
     MATRIX_APPROVAL_REQUIRE_SENDER
                               Require reaction controls to come from the original requester
                               when requester metadata is available (default: true)
@@ -52,6 +53,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import logging
 import mimetypes
 import os
@@ -352,9 +354,60 @@ class _MatrixChoicePickerPrompt:
     bot_reaction_events: dict[str, str] = field(default_factory=dict)
 
 
-# Matrix message size limit (4000 chars practical, spec has no hard limit
-# but clients render poorly above this).
-MAX_MESSAGE_LENGTH = 4000
+# Matrix message size limit. The spec allows large events (~65 KB), but very
+# large bodies can render poorly in some clients. The previous 4,000-char
+# default was overly conservative and split Markdown tables mid-row (#53026).
+DEFAULT_MAX_MESSAGE_LENGTH = 16000
+MATRIX_MAX_MESSAGE_LENGTH_CEILING = 65535
+
+# Matrix clients (Element, etc.) split a long *inbound* message into events of
+# roughly this size client-side. A trailing inbound chunk at/near this size is
+# almost certainly followed by a continuation, so the batcher waits the longer
+# split delay before dispatching. This is deliberately independent of the
+# *outbound* chunk size (max_message_length, default 16000): deriving it from
+# max_message_length silently broke inbound aggregation once the outbound default
+# was raised, because a ~4000-char continuation fell far below the outbound
+# threshold and was dispatched early (before its continuation arrived).
+MATRIX_INBOUND_SPLIT_THRESHOLD = 3900
+
+# Matrix caps a full event's canonical JSON at 65,536 bytes (spec "Size limits").
+# We keep the built *content* well under that ceiling: the homeserver adds an
+# event envelope (~1-2 KB) and E2EE re-wraps content as base64 ciphertext (~4/3
+# growth), so a content payload near the ceiling is rejected (M_TOO_LARGE) and the
+# reply is silently dropped. Character-count truncation alone misses this because
+# multibyte text and HTML-formatted tables serialize to far more bytes than
+# characters. After worst-case base64 expansion, a 40 KB content budget leaves
+# roughly 12 KB for the encryption wrapper and event envelope, while a normal
+# ASCII 16000-char chunk (body + formatted HTML) still fits without an extra split.
+MATRIX_EVENT_CONTENT_BYTE_BUDGET = 40000
+
+
+def _resolve_max_message_length(config) -> int:
+    """Resolve outbound chunk size from config, env, or plugin registry."""
+    extra = getattr(config, "extra", {}) or {}
+    raw = extra.get("max_message_length")
+    if raw is None:
+        raw = os.getenv("MATRIX_MAX_MESSAGE_LENGTH")
+    if raw is None:
+        try:
+            from gateway.platform_registry import platform_registry
+
+            entry = platform_registry.get("matrix")
+            if entry and entry.max_message_length:
+                raw = entry.max_message_length
+        except Exception:
+            pass
+    if raw is None:
+        return DEFAULT_MAX_MESSAGE_LENGTH
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_MESSAGE_LENGTH
+    return max(500, min(value, MATRIX_MAX_MESSAGE_LENGTH_CEILING))
+
+
+# Back-compat alias for callers/tests that import the module constant.
+MAX_MESSAGE_LENGTH = DEFAULT_MAX_MESSAGE_LENGTH
 
 # Store directory for E2EE keys and sync state.
 # Uses get_hermes_home() so each profile gets its own Matrix store.
@@ -799,20 +852,24 @@ class MatrixAdapter(BasePlatformAdapter):
     """Gateway adapter for Matrix (any homeserver)."""
 
     supports_code_blocks = True  # Matrix renders fenced code blocks (HTML/markdown)
-    splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
+    splits_long_messages = True  # send() chunks via truncate_message(max_message_length)
 
     # Matrix clients commonly reserve typed "/" for client-local commands;
     # the adapter accepts "!command" as the alias that always reaches Hermes
     # (see _normalize_matrix_bang_command), so instruction text shows "!".
     typed_command_prefix = "!"
 
-    # Threshold for detecting Matrix client-side message splits.
-    # When a chunk is near the ~4000-char practical limit, a continuation
-    # is almost certain.
-    _SPLIT_THRESHOLD = 3900
+    # Class-level defaults so partially-constructed instances (tests build
+    # adapters via object.__new__ without __init__) keep working; __init__
+    # overrides the outbound character preference only.
+    max_message_length = DEFAULT_MAX_MESSAGE_LENGTH
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.MATRIX)
+
+        self.max_message_length = _resolve_max_message_length(config)
+        # Mirror other platform adapters for tests/tooling that read MAX_MESSAGE_LENGTH.
+        self.MAX_MESSAGE_LENGTH = self.max_message_length
 
         self._homeserver: str = (
             config.extra.get("homeserver", "") or os.getenv("MATRIX_HOMESERVER", "")
@@ -1612,13 +1669,18 @@ class MatrixAdapter(BasePlatformAdapter):
             return SendResult(success=True)
 
         formatted = self.format_message(content)
-        chunks = self.truncate_message(formatted, MAX_MESSAGE_LENGTH)
+        try:
+            chunks = self._build_outbound_text_payloads(
+                formatted,
+                reply_to=reply_to,
+                metadata=metadata,
+            )
+        except ValueError as exc:
+            logger.error("Matrix: could not build byte-safe message chunks: %s", exc)
+            return SendResult(success=False, error=str(exc))
 
         last_event_id = None
-        for i, chunk in enumerate(chunks):
-            msg_content = self._build_text_message_content(chunk)
-
-            self._apply_relation_metadata(msg_content, reply_to=reply_to, metadata=metadata)
+        for msg_content in chunks:
 
             try:
                 event_id = await asyncio.wait_for(
@@ -3607,7 +3669,7 @@ class MatrixAdapter(BasePlatformAdapter):
         try:
             pending = self._pending_text_batches.get(key)
             last_len = getattr(pending, "_last_chunk_len", 0) if pending else 0
-            if last_len >= self._SPLIT_THRESHOLD:
+            if last_len >= MATRIX_INBOUND_SPLIT_THRESHOLD:
                 delay = self._text_batch_split_delay_seconds
             else:
                 delay = self._text_batch_delay_seconds
@@ -4123,6 +4185,87 @@ class MatrixAdapter(BasePlatformAdapter):
             msg_content["formatted_body"] = html
 
         return msg_content
+
+    @staticmethod
+    def _serialized_content_bytes(content: Dict[str, Any]) -> int:
+        """Return compact UTF-8 JSON bytes for one Matrix event content object."""
+        return len(
+            json.dumps(content, ensure_ascii=False, separators=(",", ":")).encode(
+                "utf-8"
+            )
+        )
+
+    def _build_outbound_text_payloads(
+        self,
+        text: str,
+        *,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> list[Dict[str, Any]]:
+        """Build chunks bounded by both the character preference and JSON bytes.
+
+        The character setting remains the first-order preference.  If Markdown
+        expansion, UTF-8, mentions, or relation metadata makes the resulting
+        content too large, progressively lower the character limit and let the
+        shared splitter retain natural line/space and fenced-code boundaries.
+        This also keeps ordinary tables intact whenever they fit the configured
+        preference and byte budget.
+        """
+
+        def build(limit: int) -> list[Dict[str, Any]]:
+            payloads: list[Dict[str, Any]] = []
+            for chunk in self.truncate_message(text, limit):
+                payload = self._build_text_message_content(chunk)
+                self._apply_relation_metadata(
+                    payload,
+                    reply_to=reply_to,
+                    metadata=metadata,
+                )
+                payloads.append(payload)
+            return payloads
+
+        # The common path requires one build only.
+        preferred = build(self.max_message_length)
+        if all(
+            self._serialized_content_bytes(payload)
+            <= MATRIX_EVENT_CONTENT_BYTE_BUDGET
+            for payload in preferred
+        ):
+            return preferred
+
+        # Find the largest usable lower character limit.  Using the shared
+        # splitter at every probe preserves its formatting behavior and ensures
+        # final chunk indicators are included in the measured payloads.
+        low = 64
+        high = max(low, self.max_message_length - 1)
+        best: list[Dict[str, Any]] | None = None
+        while low <= high:
+            candidate_limit = (low + high) // 2
+            payloads = build(candidate_limit)
+            if all(
+                self._serialized_content_bytes(payload)
+                <= MATRIX_EVENT_CONTENT_BYTE_BUDGET
+                for payload in payloads
+            ):
+                best = payloads
+                low = candidate_limit + 1
+            else:
+                high = candidate_limit - 1
+
+        if best is None:
+            # Relation metadata alone should never approach this budget, but
+            # fail explicitly rather than submitting a known-oversized event.
+            payloads = build(1)
+            if any(
+                self._serialized_content_bytes(payload)
+                > MATRIX_EVENT_CONTENT_BYTE_BUDGET
+                for payload in payloads
+            ):
+                raise ValueError(
+                    "Matrix event metadata exceeds the safe content-byte budget"
+                )
+            return payloads
+        return best
 
     def _apply_relation_metadata(
         self,
@@ -4690,6 +4833,8 @@ def _apply_yaml_config(yaml_cfg: dict, matrix_cfg: dict) -> dict | None:
         os.environ["MATRIX_AUTO_THREAD"] = str(matrix_cfg["auto_thread"]).lower()
     if "dm_mention_threads" in matrix_cfg and not os.getenv("MATRIX_DM_MENTION_THREADS"):
         os.environ["MATRIX_DM_MENTION_THREADS"] = str(matrix_cfg["dm_mention_threads"]).lower()
+    if "max_message_length" in matrix_cfg and not os.getenv("MATRIX_MAX_MESSAGE_LENGTH"):
+        os.environ["MATRIX_MAX_MESSAGE_LENGTH"] = str(matrix_cfg["max_message_length"])
     return None
 
 
@@ -4735,7 +4880,7 @@ def register(ctx) -> None:
         allow_all_env="MATRIX_ALLOW_ALL_USERS",
         cron_deliver_env_var="MATRIX_HOME_ROOM",
         standalone_sender_fn=_standalone_send,
-        max_message_length=4000,
+        max_message_length=DEFAULT_MAX_MESSAGE_LENGTH,
         emoji="🔐",
         allow_update_command=True,
     )

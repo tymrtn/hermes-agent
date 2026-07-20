@@ -15,6 +15,9 @@ and MoonshotAI/kimi-cli#1595:
 2. When ``anyOf`` is used, ``type`` must be on the ``anyOf`` children, not
    the parent.  Presence of both causes "type should be defined in anyOf
    items instead of the parent schema".
+3. Every object schema must carry a ``required`` array, even an empty one.
+   Standard JSON Schema allows omitting it; Moonshot 400s with
+   "required must be an array".
 
 The ``#/definitions/...`` → ``#/$defs/...`` rewrite for draft-07 refs is
 handled separately in ``tools/mcp_tool._normalize_mcp_input_schema`` so it
@@ -130,7 +133,130 @@ def _repair_schema(node: Any, is_schema: bool = True) -> Any:
             else:
                 repaired.pop("enum")
 
+    # Rule 4: object schemas must carry a `required` array, even when empty.
+    # Composition-aware name validation happens in a second pass once the
+    # repaired root schema (and therefore local $ref targets) is available.
+    if repaired.get("type") == "object":
+        repaired = _ensure_required_array(repaired, prune_names=False)
+
     return repaired
+
+
+def _resolve_local_ref(root: Dict[str, Any], ref: str) -> Any:
+    """Resolve a local JSON Pointer ref, returning ``None`` if unknown."""
+    if not ref.startswith("#/"):
+        return None
+    current: Any = root
+    for raw_part in ref[2:].split("/"):
+        part = raw_part.replace("~1", "/").replace("~0", "~")
+        if not isinstance(current, dict) or part not in current:
+            return None
+        current = current[part]
+    return current
+
+
+def _composed_property_names(
+    node: Dict[str, Any],
+    root: Dict[str, Any],
+    seen: set[int] | None = None,
+) -> tuple[set[str], bool]:
+    """Return property names visible through local composition.
+
+    The boolean says whether every encountered ref was resolved.  When it is
+    false, required names outside the known set remain potentially valid and
+    must not be pruned.
+    """
+    seen = set() if seen is None else seen
+    identity = id(node)
+    if identity in seen:
+        return set(), True
+    seen.add(identity)
+
+    names: set[str] = set()
+    complete = True
+    props = node.get("properties")
+    if isinstance(props, dict):
+        names.update(str(name) for name in props)
+
+    ref = node.get("$ref")
+    if isinstance(ref, str):
+        target = _resolve_local_ref(root, ref)
+        if isinstance(target, dict):
+            target_names, target_complete = _composed_property_names(target, root, seen)
+            names.update(target_names)
+            complete = complete and target_complete
+        else:
+            complete = False
+
+    for keyword in ("allOf", "anyOf", "oneOf"):
+        branches = node.get(keyword)
+        if not isinstance(branches, list):
+            continue
+        for branch in branches:
+            if not isinstance(branch, dict):
+                continue
+            branch_names, branch_complete = _composed_property_names(branch, root, seen)
+            names.update(branch_names)
+            complete = complete and branch_complete
+    return names, complete
+
+
+def _ensure_required_array(
+    node: Dict[str, Any],
+    *,
+    root: Dict[str, Any] | None = None,
+    prune_names: bool = True,
+) -> Dict[str, Any]:
+    """Guarantee an object schema carries a ``required`` array (Moonshot rule).
+
+    Standard JSON Schema lets you omit ``required`` when nothing is required;
+    Moonshot 400s on that ("required must be an array").  Ensure the key is a
+    list.  Invalid, duplicate entries are removed.  When the schema declares
+    a non-empty set of properties locally or through resolvable composition,
+    dangling names are pruned; an empty local ``properties`` map alone is not
+    proof that a name is invalid because ``allOf`` / ``$ref`` may define it.
+    Mutates and returns ``node``.
+    """
+    req = node.get("required")
+    if isinstance(req, list):
+        valid: list[str] = []
+        seen_names: set[str] = set()
+        for name in req:
+            if not isinstance(name, str) or not name or name in seen_names:
+                continue
+            seen_names.add(name)
+            valid.append(name)
+
+        if prune_names:
+            names, complete = _composed_property_names(node, root or node)
+            if names and complete:
+                valid = [name for name in valid if name in names]
+        node["required"] = valid
+    else:
+        node["required"] = []
+    return node
+
+
+def _repair_required_arrays(node: Any, root: Dict[str, Any]) -> None:
+    """Composition-aware required-array repair across a complete schema."""
+    if isinstance(node, list):
+        for item in node:
+            _repair_required_arrays(item, root)
+        return
+    if not isinstance(node, dict):
+        return
+
+    if node.get("type") == "object":
+        _ensure_required_array(node, root=root)
+
+    for key, value in node.items():
+        if key in _SCHEMA_MAP_KEYS and isinstance(value, dict):
+            for sub_schema in value.values():
+                _repair_required_arrays(sub_schema, root)
+        elif key in _SCHEMA_LIST_KEYS and isinstance(value, list):
+            _repair_required_arrays(value, root)
+        elif key in _SCHEMA_NODE_KEYS and isinstance(value, dict):
+            _repair_required_arrays(value, root)
 
 
 def _fill_missing_type(node: Dict[str, Any]) -> Dict[str, Any]:
@@ -174,17 +300,18 @@ def sanitize_moonshot_tool_parameters(parameters: Any) -> Dict[str, Any]:
     applied.  Input is not mutated.
     """
     if not isinstance(parameters, dict):
-        return {"type": "object", "properties": {}}
+        return {"type": "object", "properties": {}, "required": []}
 
     repaired = _repair_schema(copy.deepcopy(parameters), is_schema=True)
     if not isinstance(repaired, dict):
-        return {"type": "object", "properties": {}}
+        return {"type": "object", "properties": {}, "required": []}
 
     # Top-level must be an object schema
     if repaired.get("type") != "object":
         repaired["type"] = "object"
     if "properties" not in repaired:
         repaired["properties"] = {}
+    _repair_required_arrays(repaired, repaired)
 
     return repaired
 

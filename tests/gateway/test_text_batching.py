@@ -9,7 +9,7 @@ Telegram and Feishu.
 """
 
 import asyncio
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -277,16 +277,43 @@ class TestMatrixTextBatching:
         assert adapter.handle_message.call_count == 2
 
     @pytest.mark.asyncio
-    async def test_adaptive_delay_for_near_limit_chunk(self):
-        """Chunks near the 4000-char limit should trigger longer delay."""
+    @pytest.mark.parametrize("outbound_limit", [500, 16000, 65535])
+    async def test_inbound_split_delay_ignores_outbound_limit(self, outbound_limit):
+        """A practical ~4K client chunk always gets the continuation delay."""
         adapter = _make_matrix_adapter()
-        long_text = "x" * 3950
-        adapter._enqueue_text_event(_make_event(long_text, Platform.MATRIX))
+        adapter.max_message_length = outbound_limit
+        event = _make_event("x" * 3900, Platform.MATRIX)
+        event._last_chunk_len = len(event.text)
+        key = adapter._text_batch_key(event)
+        adapter._pending_text_batches[key] = event
 
-        await asyncio.sleep(0.15)
-        adapter.handle_message.assert_not_called()
+        with patch(
+            "plugins.platforms.matrix.adapter.asyncio.sleep",
+            new_callable=AsyncMock,
+        ) as sleep:
+            await adapter._flush_text_batch(key)
 
-        await asyncio.sleep(0.25)
+        sleep.assert_awaited_once_with(adapter._text_batch_split_delay_seconds)
+        adapter.handle_message.assert_called_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("outbound_limit", [500, 16000, 65535])
+    async def test_short_inbound_chunk_ignores_outbound_limit(self, outbound_limit):
+        """Changing outbound chunking cannot turn normal input into a split."""
+        adapter = _make_matrix_adapter()
+        adapter.max_message_length = outbound_limit
+        event = _make_event("x" * 3899, Platform.MATRIX)
+        event._last_chunk_len = len(event.text)
+        key = adapter._text_batch_key(event)
+        adapter._pending_text_batches[key] = event
+
+        with patch(
+            "plugins.platforms.matrix.adapter.asyncio.sleep",
+            new_callable=AsyncMock,
+        ) as sleep:
+            await adapter._flush_text_batch(key)
+
+        sleep.assert_awaited_once_with(adapter._text_batch_delay_seconds)
         adapter.handle_message.assert_called_once()
 
     @pytest.mark.asyncio
