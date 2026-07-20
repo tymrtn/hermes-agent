@@ -2392,7 +2392,8 @@ class SessionDB:
                                 packet_json: Optional[str],
                                 create_source: Optional[str] = None,
                                 only_if_absent: bool = False,
-                                treat_as_absent: Optional[str] = None) -> bool:
+                                treat_as_absent: Optional[str] = None,
+                                require_no_messages: bool = False) -> bool:
         """Persist (or clear) the Dream Cycle v3 wake packet binding for a
         durable session id. Validation lives in gateway/continuity_wake.py;
         this is plain storage.
@@ -2414,6 +2415,13 @@ class SessionDB:
         one first-call outcome; the semantics of that sentinel live in
         gateway/continuity_wake.py — this compares raw bytes only)."""
         def _do(conn) -> bool:
+            if require_no_messages:
+                history = conn.execute(
+                    "SELECT 1 FROM messages WHERE session_id = ? LIMIT 1",
+                    (session_id,),
+                ).fetchone()
+                if history is not None:
+                    return False
             if only_if_absent:
                 row = conn.execute(
                     "SELECT wake_packet_json FROM sessions WHERE id = ?",

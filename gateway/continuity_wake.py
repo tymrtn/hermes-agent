@@ -497,6 +497,17 @@ def ensure_wake_state_for_session_id(session_db, session_id: str, *,
             # Storage failed; the attempt is not consumed (retryable).
             return state, None
         pending = state == WAKE_STATE_PENDING
+        if pending and not is_new_session:
+            try:
+                if session_db.get_messages(session_id, include_inactive=True):
+                    return (finalize_pending_wake_as_none(
+                        session_db, session_id,
+                        create_source=create_source), None)
+            except Exception:
+                # Failure to prove an empty transcript is fail-closed. Keep
+                # pending retryable rather than injecting into an established
+                # conversation.
+                return "unavailable", None
         if not pending and not is_new_session:
             return "absent", None
         packet = build_wake_packet_for_session(first_message, workspace_path,
@@ -523,9 +534,13 @@ def ensure_wake_state_for_session_id(session_db, session_id: str, *,
         won = session_db.set_session_wake_packet(
             session_id, value, create_source=create_source,
             only_if_absent=True,
-            treat_as_absent=raw if pending else None)
+            treat_as_absent=raw if pending else None,
+            require_no_messages=pending)
         if won:
             return outcome
+        if pending:
+            finalize_pending_wake_as_none(
+                session_db, session_id, create_source=create_source)
         # A concurrent first call won the compare-and-set: discard our
         # build and serve the persisted winner so every in-flight request
         # injects the same bytes (or nothing, if the winner was none/

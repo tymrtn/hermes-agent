@@ -39,6 +39,21 @@ def test_migration_timestamp_is_parameterized(tmp_path):
             ContinuityStore(tmp_path / "db2.sqlite").migrate("not a datetime")
 
 
+def test_read_only_store_query_creates_no_wal_sidecars(tmp_path):
+    path = tmp_path / "continuity.db"
+    with ContinuityStore(path) as store:
+        store.migrate(NOW_ISO)
+    for suffix in ("-wal", "-shm"):
+        sidecar = tmp_path / (path.name + suffix)
+        if sidecar.exists():
+            sidecar.unlink()
+
+    with ContinuityStore(path, read_only=True) as store:
+        assert store.schema_version() == 4
+    assert not (tmp_path / "continuity.db-wal").exists()
+    assert not (tmp_path / "continuity.db-shm").exists()
+
+
 def test_record_run_validates_manifest_before_persistence(store):
     manifest = make_manifest_for_run()
     assert store.record_run(manifest, "/tmp/m.json", NOW_ISO) == "inserted"

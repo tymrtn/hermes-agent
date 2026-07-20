@@ -640,6 +640,23 @@ def test_pending_sentinel_binds_on_first_prompt_despite_not_new(tmp_path,
         db, "pend-1", is_new_session=True, first_message="other") == text
 
 
+def test_pending_sentinel_with_history_is_settled_without_binding(
+        tmp_path, monkeypatch):
+    from gateway.continuity_wake import (load_wake_state_for_session,
+                                         mark_wake_pending_for_session_id)
+    _seed_continuity_store()
+    store = make_store(tmp_path, monkeypatch)
+    db = store._db
+    db.create_session(session_id="pend-history", source="acp")
+    assert mark_wake_pending_for_session_id(db, "pend-history")
+    db.append_message("pend-history", "user", "already persisted")
+
+    assert ensure_wake_text_for_session_id(
+        db, "pend-history", is_new_session=False,
+        first_message="late retry") is None
+    assert load_wake_state_for_session(db, "pend-history") == ("none", None)
+
+
 def test_pending_attempt_without_store_becomes_terminal_none(tmp_path,
                                                              monkeypatch):
     """The pending session's one attempt with no store persists the
