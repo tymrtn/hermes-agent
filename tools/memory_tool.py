@@ -121,6 +121,8 @@ class MemoryStore:
         Tool responses always reflect this live state.
     """
 
+    _MAX_CONSOLIDATION_FAILURES_PER_TURN = 3
+
     def __init__(
         self,
         memory_char_limit: int = 2200,
@@ -430,19 +432,20 @@ class MemoryStore:
                             "replacement_candidates": self._replacement_candidates(target, len(content)),
                         })
                         return warm_result
-                return {
+                return self._consolidation_failure({
                     "success": False,
                     "error": (
                         f"Memory at {current:,}/{limit:,} chars. "
                         f"Adding this entry ({len(content)} chars) would exceed the limit. "
                         f"Replace or remove existing entries first, or add with tier='warm'. "
                         f"For hot-memory cleanup, prefer one batch 'operations' call that "
-                        f"removes/replaces stale entries and adds the new fact atomically, then retry."
+                        f"removes/replaces stale entries and adds the new fact atomically, "
+                        f"then retry this add."
                     ),
                     "current_entries": entries,
                     "usage": f"{current:,}/{limit:,}",
                     "replacement_candidates": self._replacement_candidates(target, len(content)) if tier == "hot" else [],
-                }
+                })
 
             entries.append(content)
             self._set_entries(target, entries, tier=tier)
@@ -711,7 +714,15 @@ class MemoryStore:
 
     # -- Internal helpers --
 
+    @staticmethod
+    def _previews(entries: List[str], width: int = 80) -> List[str]:
+        """Truncated one-line previews of entries for error feedback."""
+        return [e[:width] + ("..." if len(e) > width else "") for e in entries]
+
     def _success_response(self, target: str, message: Optional[str] = None, tier: str = "hot") -> Dict[str, Any]:
+        # A successful write means the consolidation loop made progress, so the
+        # per-turn failure budget resets (#42405).
+        self._consolidation_failures = 0
         entries = self._entries_for(target, tier=tier)
         current = self._char_count(target, tier=tier)
         limit = self._char_limit(target, tier=tier)
