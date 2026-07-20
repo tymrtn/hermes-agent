@@ -1418,6 +1418,8 @@ def evaluate_cutover_gate(*, store_path: Path | str,
                           replay_summary: dict[str, Any],
                           replay_store_path: Path | str,
                           shadow_report: dict[str, Any],
+                          context_cwd: Path | str,
+                          context_length: int | None = None,
                           required_operational_runs: int =
                           REQUIRED_OPERATIONAL_RUNS,
                           min_retrieval_rate: float =
@@ -1426,6 +1428,10 @@ def evaluate_cutover_gate(*, store_path: Path | str,
 
     Cutover requires at least one GENUINE current-source successful shadow
     run evidenced in durable state, on top of every other hard invariant.
+    It also executes the real project-context prompt builder for
+    ``context_cwd`` and fails closed if the active context source is absent,
+    unreadable, or truncated under the effective runtime cap.  This audit is
+    part of the gate rather than optional preflight evidence.
     Historical replay never counts as an operational run, so replay alone
     can never pass. `required_operational_runs` defaults to one and is
     floored at one (a caller may raise the bar but never lower it below the
@@ -1448,6 +1454,21 @@ def evaluate_cutover_gate(*, store_path: Path | str,
 
     def check(name: str, ok: bool, detail: str) -> None:
         checks[name] = {"ok": bool(ok), "detail": detail}
+
+    # Import lazily so ordinary cycle/replay execution does not pay the prompt
+    # builder's import cost.  The cutover path itself may not bypass this.
+    from .context_health import audit_context_health
+    context_health = audit_context_health(
+        context_cwd, context_length=context_length)
+    context_ok = context_health.get("pass") is True
+    check(
+        "context_file_continuity",
+        context_ok,
+        "active project context rendered without truncation under the "
+        "effective prompt cap" if context_ok else
+        "active project context is missing, unreadable, or truncated; "
+        "cutover is blocked",
+    )
 
     windows = (replay_summary.get("windows")
                if isinstance(replay_summary, dict) else None)
@@ -1657,6 +1678,7 @@ def evaluate_cutover_gate(*, store_path: Path | str,
         "kind": CUTOVER_GATE_KIND,
         "pass": all(c["ok"] for c in checks.values()),
         "checks": checks,
+        "context_health": context_health,
         "operational_runs_evidenced": evidenced,
         "required_operational_runs": required_operational_runs,
         "replay_equivalence_override": False,

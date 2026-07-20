@@ -416,7 +416,9 @@ def cmd_cutover_gate(args: argparse.Namespace) -> int:
         replay_summary=load(args.replay_summary, "replay summary"),
         replay_store_path=_replay_store_path_from_summary(
             args.replay_summary),
-        shadow_report=load(args.shadow_report, "shadow cycle report"))
+        shadow_report=load(args.shadow_report, "shadow cycle report"),
+        context_cwd=Path(args.context_cwd),
+        context_length=args.context_length)
     _emit(verdict)
     return 0 if verdict["pass"] else 1
 
@@ -605,6 +607,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--db", required=True, help="shadow continuity.db")
     p.add_argument("--replay-summary", required=True)
     p.add_argument("--shadow-report", required=True)
+    p.add_argument("--context-cwd", required=True,
+                   help="project directory whose active context file must "
+                        "render without truncation")
+    p.add_argument("--context-length", type=int,
+                   help="effective model context window in tokens")
     p.set_defaults(func=cmd_cutover_gate)
 
     return parser

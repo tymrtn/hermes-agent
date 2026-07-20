@@ -334,6 +334,18 @@ def test_directly_rooted_session_store_is_suppressed(tmp_path):
     assert "DIRECT_ROOT_CANARY_DD44" not in canonical_json(manifest2)
 
 
+def test_session_named_file_is_suppressed_like_manifest_backstop(tmp_path):
+    roots = _roots(tmp_path, "named-session", {
+        "notes/session-audit.md": "SESSION_FILENAME_CANARY raw transcript\n",
+    })
+    manifest = _collect(roots)
+    source = manifest["sources"][0]
+    assert source["source_type"] == "session"
+    assert source["excerpt"] is None
+    assert source["excerpt_suppressed"] == "session_transcript"
+    assert "SESSION_FILENAME_CANARY" not in canonical_json(manifest)
+
+
 def test_manifest_backstop_forbids_session_excerpts(tmp_path):
     """Even a self-consistent forged manifest cannot carry session excerpts."""
     from dream_cycle_v3 import COLLECTOR_VERSION

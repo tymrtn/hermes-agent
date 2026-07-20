@@ -118,7 +118,11 @@ def _source_type_for(root_key: str, rel: Path, suffix: str) -> str:
     """
     if "session" in root_key.lower():
         return "session"
-    if any("session" in part.lower() for part in rel.parts[:-1]):
+    # Match the manifest validator's transcript backstop exactly: filenames
+    # as well as parent components can identify session material.  Otherwise
+    # a file such as ``session-audit.md`` is excerpted here and rejected only
+    # after collection, preventing an otherwise safe historical replay.
+    if any("session" in part.lower() for part in rel.parts):
         return "session"
     if suffix == ".log":
         return "log"
