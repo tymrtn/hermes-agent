@@ -69,6 +69,16 @@ _GLOBAL_DEFAULTS: dict[str, Any] = {
     # Reset/new-session trigger. When cleanup_progress is enabled, a reset
     # flushes any pending collected meta bubbles immediately by default.
     "cleanup_progress_on_reset": True,
+    # Live working-state status on platforms whose typing indicator renders
+    # text (Slack's assistant status line). Values:
+    #   "full" / true  -> verb + argument preview ("is running pytest…")
+    #   "verb"         -> verb only ("is running…") — keeps file paths and
+    #                     commands out of shared channels
+    #   "off" / false  -> static text (typing_status_text or "is thinking...")
+    # Independent of tool_progress: works even when progress bubbles are off
+    # (Slack's default), and costs no extra API calls — the existing typing
+    # refresh cadence just renders different text.
+    "live_status": "full",
 }
 
 # ---------------------------------------------------------------------------
@@ -274,9 +284,24 @@ def _normalise(setting: str, value: Any) -> Any:
         if isinstance(value, str):
             return value.lower() in {"true", "1", "yes", "on"}
         return bool(value)
+    if setting == "live_status":
+        # Tri-state: "full" (verb + preview), "verb" (verb only), "off".
+        if value is True:
+            return "full"
+        if value is False:
+            return "off"
+        val = str(value).strip().lower()
+        if val in {"true", "1", "yes", "on", "all"}:
+            return "full"
+        if val in {"false", "0", "no"}:
+            return "off"
+        return val if val in {"full", "verb", "off"} else "full"
     if setting == "tool_progress_grouping":
         val = str(value).lower()
         return val if val in ("accumulate", "separate") else "accumulate"
+    if setting == "reasoning_style":
+        val = str(value).lower()
+        return val if val in ("code", "blockquote", "subtext") else "code"
     if setting in {"tool_preview_length", "cleanup_progress_max_exchanges"}:
         try:
             return max(0, int(value))
