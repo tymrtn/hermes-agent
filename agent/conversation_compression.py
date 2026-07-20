@@ -939,6 +939,20 @@ def compress_context(
                         agent._session_db_created = True
                         raise
                     agent._session_db_created = True
+                    # Dream Cycle v3: copy the parent's durable wake record
+                    # verbatim onto the rotation child, so inheritance holds
+                    # by direct record instead of a parent-chain walk that a
+                    # deep rotation lineage would exhaust (fail-closed = lost
+                    # binding). Never raises.
+                    try:
+                        from gateway.continuity_wake import (
+                            materialize_wake_record_for_child)
+                        materialize_wake_record_for_child(
+                            agent._session_db, agent.session_id,
+                            old_session_id)
+                    except Exception as _wake_err:
+                        logger.debug("Could not materialize wake record on "
+                                     "compression: %s", _wake_err)
                     # Carry a persistent /goal onto the continuation session.
                     # Compression mints a fresh child id; load_goal does a flat
                     # per-session lookup with no parent walk, so without this an

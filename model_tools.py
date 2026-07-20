@@ -316,6 +316,25 @@ def get_tool_definitions(
             cfg_fp = (cfg_stat.st_mtime_ns, cfg_stat.st_size)
         except (FileNotFoundError, OSError, ImportError):
             cfg_fp = None
+        # Profile isolation + continuity store lifecycle. A multiplexed
+        # process serves several HERMES_HOMEs, and a tool's availability can
+        # flip when profile-scoped state appears/vanishes (the Dream Cycle v3
+        # continuity store is the motivating case). Key the memo by the active
+        # profile home so one profile's definition set is never served to
+        # another, and by the continuity store fingerprint so a store
+        # created/removed re-evaluates on the next NEW agent (the 30s check_fn
+        # TTL one level down then re-probes). Both are best-effort: a missing
+        # home or fingerprint just contributes None and never raises.
+        try:
+            from hermes_constants import get_hermes_home
+            profile_home_fp = str(get_hermes_home())
+        except Exception:
+            profile_home_fp = None
+        try:
+            from tools.continuity_tool import continuity_store_fingerprint
+            continuity_fp = continuity_store_fingerprint()
+        except Exception:
+            continuity_fp = None
         cache_key = (
             frozenset(enabled_toolsets) if enabled_toolsets is not None else None,
             frozenset(disabled_toolsets) if disabled_toolsets else None,
@@ -323,6 +342,8 @@ def get_tool_definitions(
             cfg_fp,
             bool(os.environ.get("HERMES_KANBAN_TASK")),
             bool(skip_tool_search_assembly),
+            profile_home_fp,
+            continuity_fp,
         )
         cached = _tool_defs_cache.get(cache_key)
         if cached is not None:

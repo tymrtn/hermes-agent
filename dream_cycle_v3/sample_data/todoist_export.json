@@ -1,0 +1,15 @@
+[
+  {
+    "id": "8000000001",
+    "content": "Send the seller onboarding draft",
+    "is_completed": false,
+    "url": "https://todoist.com/showTask?id=8000000001"
+  },
+  {
+    "id": "8000000002",
+    "content": "Close out the duplicate-listing follow-up",
+    "is_completed": true,
+    "completed_at": "2026-07-10T18:00:00+00:00",
+    "url": "https://todoist.com/showTask?id=8000000002"
+  }
+]

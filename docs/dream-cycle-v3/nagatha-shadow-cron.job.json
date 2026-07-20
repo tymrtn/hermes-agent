@@ -1,0 +1,41 @@
+{
+  "id": "dc3-shadow-nagatha",
+  "name": "dream-cycle-v3-shadow-nagatha",
+  "prompt": "",
+  "skills": null,
+  "skill": null,
+  "model": null,
+  "provider": null,
+  "provider_snapshot": null,
+  "model_snapshot": null,
+  "base_url": null,
+  "script": "dream_cycle_v3_shadow_cron.sh",
+  "no_agent": true,
+  "context_from": null,
+  "schedule": {
+    "kind": "cron",
+    "expr": "30 6 * * *",
+    "display": "30 6 * * *"
+  },
+  "schedule_display": "30 6 * * *",
+  "repeat": {
+    "times": null,
+    "completed": 0
+  },
+  "enabled": false,
+  "state": "paused",
+  "paused_at": null,
+  "paused_reason": "Phase 4 shadow definition tracked in the repo; publication and activation are explicit operator steps per docs/dream-cycle-v3/nagatha-shadow-publication-checklist.md. Nothing activates by this file existing. The legacy v2 dream-cycle job stays active and untouched.",
+  "created_at": null,
+  "next_run_at": null,
+  "last_run_at": null,
+  "last_status": null,
+  "last_error": null,
+  "last_delivery_error": null,
+  "deliver": "local",
+  "origin": null,
+  "enabled_toolsets": null,
+  "workdir": null,
+  "profile": null,
+  "memory_mode": "off"
+}

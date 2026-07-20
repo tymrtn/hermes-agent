@@ -794,6 +794,11 @@ CREATE TABLE IF NOT EXISTS sessions (
     profile_name TEXT,
     rewind_count INTEGER NOT NULL DEFAULT 0,
     archived INTEGER NOT NULL DEFAULT 0,
+    -- Dream Cycle v3 wake packet binding, keyed by durable session id so
+    -- /resume, /branch, compression rotation, and crash recovery restore
+    -- the exact packet this transcript started with (validated JSON:
+    -- schema_version/packet_id/content_hash/project_id/text).
+    wake_packet_json TEXT,
     FOREIGN KEY (parent_session_id) REFERENCES sessions(id)
 );
 
@@ -2369,6 +2374,79 @@ class SessionDB:
                 (session_id,),
             )
         self._execute_write(_do)
+
+    def set_session_wake_packet(self, session_id: str,
+                                packet_json: Optional[str],
+                                create_source: Optional[str] = None,
+                                only_if_absent: bool = False,
+                                treat_as_absent: Optional[str] = None) -> bool:
+        """Persist (or clear) the Dream Cycle v3 wake packet binding for a
+        durable session id. Validation lives in gateway/continuity_wake.py;
+        this is plain storage.
+
+        Surfaces that bind before their session row exists (API server / TUI
+        create rows lazily on the first turn) pass ``create_source`` so the
+        binding lands on a bare row the later create_session call enriches —
+        otherwise a missing row means the binding would silently vanish and
+        the next request would rebuild a different packet (prompt-stability
+        violation).
+
+        ``only_if_absent=True`` is the first-call compare-and-set: the value
+        lands only when no wake state exists yet for the session, decided
+        inside one BEGIN IMMEDIATE transaction so concurrent first requests
+        cannot both win. Returns True when THIS call's value is the
+        persisted one (the loser re-reads the winner). ``treat_as_absent``
+        extends the CAS: a stored value exactly equal to it also counts as
+        absent (the caller's pre-first-call sentinel is replaceable by the
+        one first-call outcome; the semantics of that sentinel live in
+        gateway/continuity_wake.py — this compares raw bytes only)."""
+        def _do(conn) -> bool:
+            if only_if_absent:
+                row = conn.execute(
+                    "SELECT wake_packet_json FROM sessions WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
+                if row is not None and row["wake_packet_json"] is not None:
+                    if (treat_as_absent is None
+                            or row["wake_packet_json"] != treat_as_absent):
+                        return False    # a competing first call already won
+                if row is None:
+                    if not (create_source and packet_json):
+                        return False
+                    conn.execute(
+                        "INSERT INTO sessions (id, source, started_at, "
+                        "wake_packet_json) VALUES (?, ?, ?, ?)",
+                        (session_id, create_source, time.time(), packet_json),
+                    )
+                    return True
+                conn.execute(
+                    "UPDATE sessions SET wake_packet_json = ? WHERE id = ?",
+                    (packet_json, session_id),
+                )
+                return True
+            cursor = conn.execute(
+                "UPDATE sessions SET wake_packet_json = ? WHERE id = ?",
+                (packet_json, session_id),
+            )
+            if cursor.rowcount == 0 and create_source and packet_json:
+                conn.execute(
+                    "INSERT INTO sessions (id, source, started_at, "
+                    "wake_packet_json) VALUES (?, ?, ?, ?) "
+                    "ON CONFLICT(id) DO UPDATE SET "
+                    "wake_packet_json = excluded.wake_packet_json",
+                    (session_id, create_source, time.time(), packet_json),
+                )
+            return True
+        return self._execute_write(_do)
+
+    def get_session_wake_packet(self, session_id: str) -> Optional[str]:
+        with self._lock:
+            cursor = self._conn.execute(
+                "SELECT wake_packet_json FROM sessions WHERE id = ?",
+                (session_id,)
+            )
+            row = cursor.fetchone()
+        return row["wake_packet_json"] if row else None
 
     def promote_to_session_reset(
         self, session_id: str, reason: str = "session_reset"

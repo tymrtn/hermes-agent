@@ -12679,6 +12679,56 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # (single source of truth); only the reset reason needs clearing here.
             session_entry.auto_reset_reason = None
 
+        # Dream Cycle v3 wake packet: built at most once, only while the
+        # durable session's first model call is still pending (explicit
+        # state — NOT timestamp equality, which pre-model slash traffic
+        # invalidates), then bound to the entry (id/hash/project/text),
+        # persisted in the routing store AND by durable session_id in
+        # state.db. The durable record (binding OR the attempted-none
+        # sentinel written by the shared lifecycle when the one first-call
+        # attempt produced no packet) is the real once-per-session marker:
+        # first_model_call_pending=False in sessions.json alone would not
+        # survive a crash/replay or a cross-surface retry of the same
+        # session_id. Later turns re-append the stored text verbatim after
+        # strict validation — never rebuilt from the continuity store, so
+        # the session prompt stays byte-stable across turns, compression,
+        # and store mutations. Profile isolation: paths bind to the source
+        # profile's resolved home, not to whatever HERMES_HOME is ambient
+        # at build time. Proxy mode skips entirely: the canonical continuity
+        # store lives with the remote agent (the files/memory/sessions
+        # host), which builds and injects its own packet — the relay never
+        # does, so the wire carries exactly one packet. Fail closed: no
+        # packet, no change.
+        if not self._get_proxy_url():
+            try:
+                from gateway.continuity_wake import ensure_wake_packet
+                _wake_profile_home = None
+                if getattr(getattr(self, "config", None),
+                           "multiplex_profiles", False):
+                    _wake_profile_home = \
+                        self._resolve_profile_home_for_source(source)
+                _wake_bound = await asyncio.to_thread(
+                    ensure_wake_packet, session_entry,
+                    is_new_session=bool(getattr(
+                        session_entry, "first_model_call_pending", False)),
+                    first_message=event.text or "",
+                    profile_home=_wake_profile_home,
+                    # Legacy/lightweight store doubles without a state.db
+                    # keep the pre-Phase-3 in-memory gate.
+                    session_db=getattr(self.session_store, "_db", None))
+                if _wake_bound:
+                    self.session_store.persist_wake_packet(session_entry)
+                    self.session_store._save()
+            except Exception as e:
+                logger.debug("Wake packet skipped (non-fatal): %s", e)
+            try:
+                from gateway.continuity_wake import validated_wake_text
+                _wake_text = validated_wake_text(session_entry)
+            except Exception:
+                _wake_text = None
+            if _wake_text:
+                context_prompt = context_prompt + "\n\n" + _wake_text
+
         # Auto-load skill(s) for topic/channel bindings (Telegram DM Topics,
         # Discord channel_skill_bindings).  Supports a single name or ordered list.
         # Only inject on NEW sessions — ongoing conversations already have the
@@ -12981,6 +13031,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     )
                                     if _hyg_rotated:
                                         session_entry.session_id = _hyg_new_sid
+                                        # Re-key the durable wake binding to the
+                                        # child before saving, closing the
+                                        # publication crash window.
+                                        self.session_store.persist_wake_packet(
+                                            session_entry)
                                         await self.async_session_store._save()
                                         await asyncio.to_thread(
                                             self._sync_telegram_topic_binding,
@@ -13320,6 +13375,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # below; a /new or another lifecycle transition may move
             # session_entry.session_id while the old run is still unwinding.
             _run_start_session_id = session_entry.session_id
+            # This durable session's first model call is now being dispatched:
+            # consume the explicit wake-eligibility state so no later turn —
+            # or a resumed/switched copy of this session — can rebind.
+            if getattr(session_entry, "first_model_call_pending", False):
+                session_entry.first_model_call_pending = False
+                try:
+                    self.session_store._save()
+                except Exception:
+                    logger.debug("first_model_call_pending save failed",
+                                 exc_info=True)
             agent_result = await self._run_agent(
                 message=message_text,
                 context_prompt=context_prompt,
@@ -13450,6 +13515,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if agent_result.get("session_id") and agent_result["session_id"] != session_entry.session_id:
                 if session_entry.session_id == _run_start_session_id:
                     session_entry.session_id = agent_result["session_id"]
+                    self.session_store.persist_wake_packet(session_entry)
                     await self.async_session_store._save()
                     await self.async_session_store._record_gateway_session_peer(
                         session_entry.session_id,
@@ -21364,6 +21430,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                     else:
                         entry.session_id = agent_session_id
+                        # SessionStore owns durable wake publication.  Keep this
+                        # path compatible with lightweight/legacy store doubles
+                        # that implement only the pre-Phase-3 persistence API.
+                        _persist_wake = getattr(
+                            self.session_store, "persist_wake_packet", None
+                        )
+                        if callable(_persist_wake):
+                            _persist_wake(entry)
                         self.session_store._save()
                         self.session_store._record_gateway_session_peer(
                             agent_session_id,
