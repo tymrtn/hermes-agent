@@ -876,11 +876,12 @@ async def test_rest_fork_chain_materializes_wake_record(tmp_path):
 
 # -- post-verification finding 6: history-read failures are not attestations ----
 
-def test_conversation_history_read_failure_is_flagged(tmp_path):
+@pytest.mark.asyncio
+async def test_conversation_history_read_failure_is_flagged(tmp_path):
     adapter = make_adapter()
     db = adapter._ensure_session_db()
     db.create_session(session_id="hist-unit-1", source="api_server")
-    history, ok = adapter._conversation_history_for_session("hist-unit-1")
+    history, ok = await adapter._conversation_history_for_session("hist-unit-1")
     assert ok is True and history == []
 
     def _boom(*args, **kwargs):
@@ -889,7 +890,9 @@ def test_conversation_history_read_failure_is_flagged(tmp_path):
     original = db.get_messages_as_conversation
     db.get_messages_as_conversation = _boom
     try:
-        history, ok = adapter._conversation_history_for_session("hist-unit-1")
+        history, ok = await adapter._conversation_history_for_session(
+            "hist-unit-1"
+        )
     finally:
         db.get_messages_as_conversation = original
     assert ok is False and history == []

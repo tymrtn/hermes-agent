@@ -21,6 +21,7 @@ from . import COLLECTOR_VERSION
 from .canonical import canonical_json
 from .carry_forward import CarryForwardPolicy, run_carry_forward
 from .collect import CollectionBounds, collect_to_manifest
+from .context_health import audit_context_health, write_context_health
 from .contracts import parse_iso_datetime, require_valid
 from .dry_run import execute_dry_run
 from .dry_run_phase2 import execute_phase2_dry_run
@@ -58,6 +59,17 @@ def _now_iso() -> str:
 
 def _emit(obj: dict) -> None:
     print(canonical_json(obj))
+
+
+def cmd_context_health(args: argparse.Namespace) -> int:
+    report = audit_context_health(
+        args.cwd,
+        context_length=args.context_length,
+    )
+    if args.out:
+        write_context_health(report, args.out)
+    _emit(report)
+    return 0 if report["pass"] else 1
 
 
 def _writable_db_path(db: str, v3_root: str) -> Path:
@@ -518,9 +530,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     replay_description = (
         "accelerated historical evidence: seven contiguous one-day windows "
-        "replayed against real sources in one sitting. This is a replay, "
-        "NOT seven operational days — the cutover gate still requires "
-        "seven distinct elapsed operational dates in durable state.")
+        "replayed against real sources in one sitting. This is replay "
+        "evidence, NOT seven operational days, and not a substitute for the "
+        "fresh current-source shadow run "
+        "required by the same-day controlled cutover gate.")
 
     p = sub.add_parser("historical-replay",
                        help="seven contiguous one-day windows over real "
@@ -571,6 +584,20 @@ def build_parser() -> argparse.ArgumentParser:
                                       "JSON")
     p.add_argument("--threads", help="operator-reviewed thread seed JSON")
     p.set_defaults(func=cmd_seed_store)
+
+    p = sub.add_parser(
+        "context-health",
+        help="audit active project context files against the real prompt cap",
+        description="Enumerate only the project context sources Hermes would "
+                    "load, record source hashes/sizes and the effective cap, "
+                    "then build the real prompt and fail on any truncation.")
+    p.add_argument("--cwd", required=True,
+                   help="explicit project working directory")
+    p.add_argument("--context-length", type=int,
+                   help="effective model context window in tokens")
+    p.add_argument("--out",
+                   help="write canonical JSON evidence to a new file")
+    p.set_defaults(func=cmd_context_health)
 
     p = sub.add_parser("cutover-gate",
                        help="pass/fail hard invariants for cutover; refuses "
