@@ -26,6 +26,7 @@ from .contracts import PROJECT_ID_RE
 from .errors import DreamCycleError, ReadBackError
 
 _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+MAX_PROJECT_DOC_BYTES = 262_144
 
 
 def assert_confined_read_target(home: Path, target: Path, *,
@@ -57,7 +58,8 @@ def assert_confined_read_target(home: Path, target: Path, *,
             return
 
 
-def confined_read_bytes(home: Path, target: Path) -> bytes:
+def confined_read_bytes(home: Path, target: Path, *,
+                        max_bytes: int | None = None) -> bytes:
     """Read a confined regular file without following a final symlink."""
     assert_confined_read_target(home, target)
     st = os.lstat(target)
@@ -67,7 +69,11 @@ def confined_read_bytes(home: Path, target: Path) -> bytes:
             "bytes through it")
     fd = os.open(str(target), os.O_RDONLY | _O_NOFOLLOW)
     with os.fdopen(fd, "rb") as fh:
-        return fh.read()
+        data = fh.read(max_bytes + 1 if max_bytes is not None else -1)
+    if max_bytes is not None and len(data) > max_bytes:
+        raise ReadBackError(
+            f"{target}: project document exceeds {max_bytes} byte read limit")
+    return data
 
 
 def read_project_doc_sections(home: Path | str, project_id: str, doc: str
@@ -94,7 +100,8 @@ def read_project_doc_sections(home: Path | str, project_id: str, doc: str
         raise ReadBackError(f"{path}: no such project document")
     sections: list[tuple[str, str]] = []
     heading, buf = None, []
-    for line in confined_read_bytes(home, path).decode("utf-8").splitlines():
+    raw = confined_read_bytes(home, path, max_bytes=MAX_PROJECT_DOC_BYTES)
+    for line in raw.decode("utf-8").splitlines():
         if line.startswith("## "):
             if heading is not None:
                 sections.append((heading, "\n".join(buf)))

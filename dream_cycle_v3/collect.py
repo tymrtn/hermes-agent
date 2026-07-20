@@ -65,6 +65,13 @@ def _read_prefix_with_full_hash(path: Path, keep_bytes: int,
                 total += len(chunk)
                 if len(kept) < keep_bytes:
                     kept.extend(chunk[: keep_bytes - len(kept)])
+        finished = os.fstat(fd)
+        stable_fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns",
+                         "st_ctime_ns")
+        baseline = expected if expected is not None else opened
+        if any(getattr(finished, field) != getattr(baseline, field)
+               for field in stable_fields):
+            raise OSError("collection candidate changed while reading")
     finally:
         os.close(fd)
     return bytes(kept), total, "sha256:" + digest.hexdigest()

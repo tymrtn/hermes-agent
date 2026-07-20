@@ -539,7 +539,15 @@ class ContinuityStore:
         if read_only:
             if identity == "fresh":
                 raise StoreError(f"no continuity store at {self.path}")
-            self._conn = sqlite3.connect(f"file:{self.path}?mode=ro", uri=True,
+            wal = Path(str(self.path) + "-wal")
+            shm = Path(str(self.path) + "-shm")
+            if wal.exists() and not shm.exists():
+                raise StoreError(
+                    f"live WAL exists without shared-memory sidecar for {self.path}; "
+                    "refusing a stale immutable read or a sidecar-creating open")
+            query = "mode=ro" if wal.exists() else "mode=ro&immutable=1"
+            self._conn = sqlite3.connect(
+                f"file:{self.path}?{query}", uri=True,
                                          isolation_level=None, timeout=10)
             self._conn.row_factory = sqlite3.Row
             self._conn.execute("PRAGMA query_only = ON")
@@ -1319,14 +1327,20 @@ class ContinuityStore:
                 (disposition_id, thread_id, disposition_date, run_id, action,
                  reason, blocker, follow_up_after, proof_json, state_before,
                  state_after, now))
+            clear_wait_metadata = (
+                state_before in ("blocked", "waiting")
+                and state_after not in ("blocked", "waiting")
+            )
             cur = conn.execute(
                 "UPDATE threads SET state=?, last_disposition_date=?, "
-                "disposition_reason=?, blocked_by=COALESCE(?, blocked_by), "
-                "follow_up_after=COALESCE(?, follow_up_after), "
+                "disposition_reason=?, "
+                "blocked_by=CASE WHEN ? THEN NULL ELSE COALESCE(?, blocked_by) END, "
+                "follow_up_after=CASE WHEN ? THEN NULL ELSE COALESCE(?, follow_up_after) END, "
                 "closure_proof=COALESCE(?, closure_proof), updated_at=? "
                 "WHERE thread_id=? AND state=?",
-                (state_after, disposition_date, reason, blocker, follow_up_after,
-                 proof_json, now, thread_id, state_before))
+                (state_after, disposition_date, reason, clear_wait_metadata,
+                 blocker, clear_wait_metadata, follow_up_after, proof_json,
+                 now, thread_id, state_before))
             if cur.rowcount != 1:
                 raise StoreError(
                     f"thread {thread_id} state changed concurrently "
@@ -1413,7 +1427,8 @@ class ContinuityStore:
             (adapter,)).fetchone()
 
     # -- idempotency proofs --------------------------------------------------
-    TABLES = ("schema_migrations", "runs", "projects", "candidates", "threads",
+    TABLES = ("schema_migrations", "runs", "projects", "candidates",
+              "candidate_conflicts", "threads",
               "thread_dispositions", "events", "adapter_snapshots",
               "write_receipts")
 
@@ -1427,6 +1442,8 @@ class ContinuityStore:
         for table in self.TABLES:
             rows = [dict(r) for r in self._conn.execute(f"SELECT * FROM {table}")]
             key_cols = [c for c in ("run_id", "project_id", "candidate_id",
+                                    "content_revision", "conflicting_candidate_id",
+                                    "conflicting_content_revision",
                                     "thread_id", "disposition_id", "event_key",
                                     "snapshot_id", "receipt_id", "version")
                         if rows and c in rows[0]]

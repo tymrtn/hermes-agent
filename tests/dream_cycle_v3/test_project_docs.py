@@ -6,8 +6,9 @@ project_id='../outside' would otherwise read bytes above the home."""
 import pytest
 
 from dream_cycle_v3.broker import load_project_context
-from dream_cycle_v3.errors import DreamCycleError
+from dream_cycle_v3.errors import DreamCycleError, ReadBackError
 from dream_cycle_v3.project_docs import (assert_confined_read_target,
+                                         MAX_PROJECT_DOC_BYTES,
                                          confined_read_bytes,
                                          read_project_doc_sections)
 
@@ -30,6 +31,13 @@ def home(tmp_path):
 def test_good_project_still_reads(home):
     sections = read_project_doc_sections(home, "good-project", "map")
     assert sections == [("Purpose", "fine")]
+
+
+def test_oversized_project_document_is_refused_before_parsing(home):
+    (home / "good-project" / "map.md").write_bytes(
+        b"## Purpose\n" + b"x" * MAX_PROJECT_DOC_BYTES)
+    with pytest.raises(ReadBackError, match="exceeds"):
+        read_project_doc_sections(home, "good-project", "map")
 
 
 @pytest.mark.parametrize("evil", ["../outside", "a/../../outside",
