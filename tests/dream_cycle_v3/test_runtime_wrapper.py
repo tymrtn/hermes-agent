@@ -5,6 +5,7 @@ success, nonzero with a concise safe message on failure. No LLM calls, no
 credentials, no gateway restart.
 """
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -76,6 +77,17 @@ def test_wrapper_success_prints_one_concise_line(wrapper_env):
     assert proc.returncode == 0, proc.stderr
     assert proc.stdout.count("\n") == 1
     assert proc.stdout.startswith("dream-cycle-v3 cycle ok mode=shadow ")
+
+
+def test_wrapper_accepts_python_command_name_from_path(wrapper_env, tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "dc3-python").symlink_to(shutil.which("true"))
+    env = dict(wrapper_env)
+    env["PATH"] = f"{bin_dir}{os.pathsep}{env['PATH']}"
+    env["PYTHON"] = "dc3-python"
+    proc = run_wrapper(env)
+    assert proc.returncode == 0, proc.stderr
 
 
 def test_wrapper_missing_required_env_fails_concisely(wrapper_env):

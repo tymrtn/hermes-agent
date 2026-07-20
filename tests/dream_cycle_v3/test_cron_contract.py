@@ -14,7 +14,6 @@ import os
 import re
 import stat
 import subprocess
-import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -262,7 +261,6 @@ def test_shim_runs_the_wrapper_in_shadow_mode(tmp_path):
     env = {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         "HOME": str(home),
-        "PYTHON": sys.executable,
     }
     proc = subprocess.run(["bash", str(SHIM)], env=env,
                           capture_output=True, text=True, timeout=300)

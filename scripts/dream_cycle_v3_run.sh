@@ -20,6 +20,16 @@
 # Extra CLI arguments pass through verbatim: dream_cycle_v3_run.sh [ARGS...]
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HERMES_AGENT_REPO="$(cd "$SCRIPT_DIR/.." && pwd)"
+if [ -n "${PYTHON:-}" ]; then
+  PY="$PYTHON"
+elif [ -x "$HERMES_AGENT_REPO/.venv/bin/python" ]; then
+  PY="$HERMES_AGENT_REPO/.venv/bin/python"
+else
+  PY="$HERMES_AGENT_REPO/venv/bin/python"
+fi
+
 fail() {
   echo "dream-cycle-v3 run: $1" >&2
   exit 64
@@ -37,6 +47,9 @@ require DC3_ROOTS
 require DC3_WINDOW_START
 require DC3_WINDOW_END
 require DC3_DATE
+if ! command -v "$PY" >/dev/null 2>&1; then
+  fail "python not executable at $PY"
+fi
 if [ -z "${DC3_V3_ROOT:-}" ] && [ -z "${DC3_SHADOW_ROOT:-}" ]; then
   fail "set exactly one of DC3_V3_ROOT or DC3_SHADOW_ROOT"
 fi
@@ -89,4 +102,4 @@ if [ "${DC3_SMOKE_REQUIRE_THREAD:-0}" = "1" ]; then
   args+=(--smoke-require-thread)
 fi
 
-exec "${PYTHON:-python3}" -m dream_cycle_v3 "${args[@]}" "$@"
+exec "$PY" -m dream_cycle_v3 "${args[@]}" "$@"

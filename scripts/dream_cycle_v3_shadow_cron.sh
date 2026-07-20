@@ -18,9 +18,18 @@
 # a midnight race).
 set -euo pipefail
 
-PY="${PYTHON:-python3}"
-
 HERMES_AGENT_REPO="$HOME/.hermes/hermes-agent"
+if [ -n "${PYTHON:-}" ]; then
+  PY="$PYTHON"
+elif [ -x "$HERMES_AGENT_REPO/.venv/bin/python" ]; then
+  PY="$HERMES_AGENT_REPO/.venv/bin/python"
+else
+  PY="$HERMES_AGENT_REPO/venv/bin/python"
+fi
+if ! command -v "$PY" >/dev/null 2>&1; then
+  echo "dream-cycle-v3 shadow cron: python not executable at $PY" >&2
+  exit 64
+fi
 WRAPPER="$HERMES_AGENT_REPO/scripts/dream_cycle_v3_run.sh"
 if [ ! -x "$WRAPPER" ]; then
   echo "dream-cycle-v3 shadow cron: wrapper not executable at $WRAPPER" >&2
