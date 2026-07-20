@@ -276,6 +276,7 @@ async def test_run_agent_progress_stays_in_originating_topic(monkeypatch, tmp_pa
 
     fake_dotenv = types.ModuleType("dotenv")
     fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    setattr(fake_dotenv, "dotenv_values", lambda *args, **kwargs: {})
     monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
 
     fake_run_agent = types.ModuleType("run_agent")
@@ -323,6 +324,7 @@ async def test_run_agent_progress_edits_keep_originating_topic_metadata(monkeypa
 
     fake_dotenv = types.ModuleType("dotenv")
     fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    setattr(fake_dotenv, "dotenv_values", lambda *args, **kwargs: {})
     monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
 
     fake_run_agent = types.ModuleType("run_agent")
@@ -362,6 +364,7 @@ async def test_run_agent_progress_does_not_use_event_message_id_for_telegram_dm(
 
     fake_dotenv = types.ModuleType("dotenv")
     fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    setattr(fake_dotenv, "dotenv_values", lambda *args, **kwargs: {})
     monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
 
     fake_run_agent = types.ModuleType("run_agent")
@@ -412,6 +415,7 @@ async def test_run_agent_progress_uses_event_message_id_for_slack_dm(monkeypatch
 
     fake_dotenv = types.ModuleType("dotenv")
     fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    setattr(fake_dotenv, "dotenv_values", lambda *args, **kwargs: {})
     monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
 
     fake_run_agent = types.ModuleType("run_agent")
@@ -454,6 +458,7 @@ async def test_run_agent_feishu_progress_replies_inside_existing_thread(monkeypa
 
     fake_dotenv = types.ModuleType("dotenv")
     fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    setattr(fake_dotenv, "dotenv_values", lambda *args, **kwargs: {})
     monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
 
     fake_run_agent = types.ModuleType("run_agent")
@@ -531,6 +536,7 @@ def _run_long_preview_helper(monkeypatch, tmp_path, preview_length=0):
 
     fake_dotenv = types.ModuleType("dotenv")
     fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    setattr(fake_dotenv, "dotenv_values", lambda *args, **kwargs: {})
     monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
 
     fake_run_agent = types.ModuleType("run_agent")
@@ -697,6 +703,48 @@ class QueuedCommentaryAgent:
         }
 
 
+class QueuedSilenceAgent:
+    """First turn is intentionally silent; queued follow-up still runs."""
+
+    calls = 0
+
+    def __init__(self, **kwargs):
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        type(self).calls += 1
+        return {
+            "final_response": "NO_REPLY" if type(self).calls == 1 else "follow-up processed",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class QueuedFailedEmptyAgent:
+    """First turn fails empty; its normalized error must send before follow-up."""
+
+    calls = 0
+
+    def __init__(self, **kwargs):
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        type(self).calls += 1
+        if type(self).calls == 1:
+            return {
+                "final_response": "",
+                "messages": [],
+                "api_calls": 1,
+                "failed": True,
+                "error": "provider exploded",
+            }
+        return {
+            "final_response": "follow-up processed",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
 class BackgroundReviewAgent:
     def __init__(self, **kwargs):
         self.background_review_callback = kwargs.get("background_review_callback")
@@ -754,6 +802,7 @@ async def _run_with_agent(
 
     fake_dotenv = types.ModuleType("dotenv")
     fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    setattr(fake_dotenv, "dotenv_values", lambda *args, **kwargs: {})
     monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
 
     fake_run_agent = types.ModuleType("run_agent")
@@ -1091,6 +1140,52 @@ async def test_run_agent_queued_message_does_not_treat_commentary_as_final(monke
 
 
 @pytest.mark.asyncio
+async def test_run_agent_suppresses_silent_first_turn_and_processes_queued_followup(
+    monkeypatch, tmp_path,
+):
+    """Regression: queued direct-send must not leak NO_REPLY to the channel."""
+    QueuedSilenceAgent.calls = 0
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        QueuedSilenceAgent,
+        session_id="sess-queued-silence",
+        pending_text="queued follow-up",
+        platform=Platform.SLACK,
+        chat_id="C123",
+        thread_id="1712345678.000100",
+    )
+
+    sent_texts = [call["content"] for call in adapter.sent]
+    assert QueuedSilenceAgent.calls == 2
+    assert result["final_response"] == "follow-up processed"
+    assert "NO_REPLY" not in sent_texts
+
+
+@pytest.mark.asyncio
+async def test_run_agent_sends_normalized_failure_before_queued_followup(
+    monkeypatch, tmp_path,
+):
+    """Queued delivery uses finalized output, not the raw empty agent result."""
+    QueuedFailedEmptyAgent.calls = 0
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        QueuedFailedEmptyAgent,
+        session_id="sess-queued-failed-empty",
+        pending_text="queued follow-up",
+        platform=Platform.SLACK,
+        chat_id="C123",
+        thread_id="1712345678.000100",
+    )
+
+    sent_texts = [call["content"] for call in adapter.sent]
+    assert QueuedFailedEmptyAgent.calls == 2
+    assert result["final_response"] == "follow-up processed"
+    assert any("The request failed: provider exploded" in text for text in sent_texts)
+
+
+@pytest.mark.asyncio
 async def test_run_agent_defers_background_review_notification_until_release(monkeypatch, tmp_path):
     adapter, result = await _run_with_agent(
         monkeypatch,
@@ -1217,6 +1312,7 @@ async def test_run_agent_drops_tool_progress_after_generation_invalidation(monke
 
     fake_dotenv = types.ModuleType("dotenv")
     fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    setattr(fake_dotenv, "dotenv_values", lambda *args, **kwargs: {})
     monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
 
     fake_run_agent = types.ModuleType("run_agent")
@@ -1279,6 +1375,7 @@ async def test_run_agent_drops_interim_commentary_after_generation_invalidation(
 
     fake_dotenv = types.ModuleType("dotenv")
     fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    setattr(fake_dotenv, "dotenv_values", lambda *args, **kwargs: {})
     monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
 
     fake_run_agent = types.ModuleType("run_agent")
@@ -1435,6 +1532,7 @@ async def test_terminal_progress_renders_fenced_code_block(monkeypatch, tmp_path
 
     fake_dotenv = types.ModuleType("dotenv")
     fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    setattr(fake_dotenv, "dotenv_values", lambda *args, **kwargs: {})
     monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
 
     fake_run_agent = types.ModuleType("run_agent")
@@ -1488,6 +1586,7 @@ async def test_terminal_progress_verbose_shows_full_command(monkeypatch, tmp_pat
 
     fake_dotenv = types.ModuleType("dotenv")
     fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    setattr(fake_dotenv, "dotenv_values", lambda *args, **kwargs: {})
     monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
 
     fake_run_agent = types.ModuleType("run_agent")
@@ -1536,6 +1635,7 @@ async def test_terminal_progress_no_bash_block_in_verbose_mode(monkeypatch, tmp_
 
     fake_dotenv = types.ModuleType("dotenv")
     fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    setattr(fake_dotenv, "dotenv_values", lambda *args, **kwargs: {})
     monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
 
     fake_run_agent = types.ModuleType("run_agent")
@@ -1598,6 +1698,7 @@ async def test_consecutive_terminal_progress_collapses_headers(monkeypatch, tmp_
 
     fake_dotenv = types.ModuleType("dotenv")
     fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    setattr(fake_dotenv, "dotenv_values", lambda *args, **kwargs: {})
     monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
 
     fake_run_agent = types.ModuleType("run_agent")
