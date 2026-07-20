@@ -154,7 +154,9 @@ Companion artifacts (tracked in this repo):
    python3 -m dream_cycle_v3 cutover-gate \
      --db $HOME/.hermes/dream-cycle/v3-shadow/continuity.db \
      --replay-summary $HOME/.hermes/dream-cycle/v3-replay/reports/historical-replay-<d0>_<d0+7>.json \
-     --shadow-report $HOME/.hermes/dream-cycle/v3-shadow/reports/<latest run_id>.json
+     --shadow-report $HOME/.hermes/dream-cycle/v3-shadow/reports/<latest run_id>.json \
+     --context-cwd $HOME/.hermes/hermes-agent \
+     --context-length <effective model context window>
    ```
 
    The shadow report handed to the gate must come from a cycle with the

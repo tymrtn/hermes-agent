@@ -60,28 +60,56 @@ def active_project_context_files(cwd: Path | str) -> list[Path]:
 def audit_context_health(
     cwd: Path | str,
     *,
-    context_length: int | None = None,
+    profile: str,
+    context_length: int,
 ) -> dict[str, Any]:
-    """Build the real project-context prompt and report truncation truthfully."""
+    """Build the target profile's real project-context prompt."""
     root = Path(cwd).resolve()
-    cap = prompt_builder._get_context_file_max_chars(context_length)
     sources = active_project_context_files(root)
 
-    # Do not let a warning from an earlier prompt build contaminate this audit.
-    prompt_builder.drain_truncation_warnings()
-    rendered = prompt_builder.build_context_files_prompt(
-        cwd=str(root),
-        skip_soul=True,
-        context_length=context_length,
-        allow_install_tree_fallback=True,
-    )
-    warnings = prompt_builder.drain_truncation_warnings()
+    from hermes_cli.profiles import resolve_profile_env
+    from hermes_constants import (reset_hermes_home_override,
+                                  set_hermes_home_override)
+    try:
+        profile_home = Path(resolve_profile_env(profile)).resolve()
+    except (FileNotFoundError, ValueError) as exc:
+        return {
+            "schema_version": 1,
+            "kind": "dream-cycle-v3-context-health",
+            "profile": profile,
+            "cwd": str(root),
+            "context_length": context_length,
+            "effective_cap_chars": None,
+            "active_sources": [],
+            "active_source_count": 0,
+            "rendered_project_context_chars": 0,
+            "truncation_warnings": [],
+            "errors": [f"profile resolution failed: {exc}"],
+            "pass": False,
+            "remediation_required": True,
+            "remediation_key": f"context-file-continuity:{profile}:{root}",
+        }
+
+    token = set_hermes_home_override(profile_home)
+    try:
+        cap = prompt_builder._get_context_file_max_chars(context_length)
+        # Do not let a warning from an earlier prompt build contaminate this audit.
+        prompt_builder.drain_truncation_warnings()
+        rendered = prompt_builder.build_context_files_prompt(
+            cwd=str(root),
+            skip_soul=True,
+            context_length=context_length,
+            allow_install_tree_fallback=True,
+        )
+        warnings = prompt_builder.drain_truncation_warnings()
+    finally:
+        reset_hermes_home_override(token)
+
     project_payload = (
         rendered[len(_CONTEXT_PROMPT_PREFIX):]
         if rendered.startswith(_CONTEXT_PROMPT_PREFIX)
         else rendered
     )
-
     records: list[dict[str, Any]] = []
     errors: list[str] = []
     for path in sources:
@@ -103,6 +131,8 @@ def audit_context_health(
     return {
         "schema_version": 1,
         "kind": "dream-cycle-v3-context-health",
+        "profile": profile,
+        "profile_home": str(profile_home),
         "cwd": str(root),
         "context_length": context_length,
         "effective_cap_chars": cap,
@@ -113,7 +143,7 @@ def audit_context_health(
         "errors": errors,
         "pass": passed,
         "remediation_required": not passed,
-        "remediation_key": f"context-file-continuity:{root}",
+        "remediation_key": f"context-file-continuity:{profile}:{root}",
     }
 
 

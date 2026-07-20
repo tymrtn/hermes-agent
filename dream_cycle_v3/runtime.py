@@ -1419,7 +1419,7 @@ def evaluate_cutover_gate(*, store_path: Path | str,
                           replay_store_path: Path | str,
                           shadow_report: dict[str, Any],
                           context_cwd: Path | str,
-                          context_length: int | None = None,
+                          context_length: int,
                           required_operational_runs: int =
                           REQUIRED_OPERATIONAL_RUNS,
                           min_retrieval_rate: float =
@@ -1458,8 +1458,14 @@ def evaluate_cutover_gate(*, store_path: Path | str,
     # Import lazily so ordinary cycle/replay execution does not pay the prompt
     # builder's import cost.  The cutover path itself may not bypass this.
     from .context_health import audit_context_health
+    shadow_profile = (shadow_report.get("profile")
+                      if isinstance(shadow_report, dict) else None)
+    replay_profile_for_context = (replay_summary.get("profile")
+                                  if isinstance(replay_summary, dict) else None)
+    target_profile = (shadow_profile if shadow_profile
+                      and shadow_profile == replay_profile_for_context else "")
     context_health = audit_context_health(
-        context_cwd, context_length=context_length)
+        context_cwd, profile=target_profile, context_length=context_length)
     context_ok = context_health.get("pass") is True
     check(
         "context_file_continuity",

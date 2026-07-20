@@ -74,6 +74,15 @@ def _healthy_context(tmp_path: Path) -> Path:
     return context_cwd
 
 
+@pytest.fixture(autouse=True)
+def _profile_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    home = tmp_path / "profile-home"
+    home.mkdir(exist_ok=True)
+    monkeypatch.setattr(
+        "hermes_cli.profiles.resolve_profile_env", lambda _profile: str(home)
+    )
+
+
 @pytest.fixture
 def gated(tmp_path):
     """One replay (7 windows) plus one genuine current shadow cycle in one
@@ -140,7 +149,7 @@ def test_gate_passes_with_one_genuine_current_shadow_run(gated):
     invariant green passes cutover the same day — no seven-day soak."""
     verdict = evaluate_cutover_gate(
         store_path=gated["db"], replay_store_path=gated["db"],
-        context_cwd=gated["context_cwd"],
+        context_cwd=gated["context_cwd"], context_length=300_000,
         replay_summary=gated["summary"],
         shadow_report=gated["shadow_report"])
     assert verdict["kind"] == "dream-cycle-v3-cutover-gate"
@@ -168,7 +177,7 @@ def test_gate_fails_closed_when_active_context_is_truncated(gated, monkeypatch):
 
     verdict = evaluate_cutover_gate(
         store_path=gated["db"], replay_store_path=gated["db"],
-        context_cwd=gated["context_cwd"],
+        context_cwd=gated["context_cwd"], context_length=300_000,
         replay_summary=gated["summary"],
         shadow_report=gated["shadow_report"])
 
@@ -183,7 +192,7 @@ def test_gate_refuses_replay_alone(replay_only):
     replay report (historical_replay=True) is not a current shadow run."""
     verdict = evaluate_cutover_gate(
         store_path=replay_only["db"], replay_store_path=replay_only["db"],
-        context_cwd=replay_only["context_cwd"],
+        context_cwd=replay_only["context_cwd"], context_length=300_000,
         replay_summary=replay_only["summary"],
         shadow_report=replay_only["replay_report"])
     assert verdict["operational_runs_evidenced"] == 0
@@ -197,7 +206,7 @@ def test_gate_floor_is_one_run_and_cannot_be_lowered_below_one(gated):
     caller cannot lower it to zero (which would let replay alone pass)."""
     verdict = evaluate_cutover_gate(
         store_path=gated["db"], replay_store_path=gated["db"],
-        context_cwd=gated["context_cwd"],
+        context_cwd=gated["context_cwd"], context_length=300_000,
         replay_summary=gated["summary"],
         shadow_report=gated["shadow_report"], required_operational_runs=0)
     assert verdict["required_operational_runs"] == 1   # floored to 1, not 7
@@ -210,7 +219,7 @@ def test_gate_operator_may_raise_required_runs(gated):
     enough (proves the run count is real, not a rubber stamp)."""
     verdict = evaluate_cutover_gate(
         store_path=gated["db"], replay_store_path=gated["db"],
-        context_cwd=gated["context_cwd"],
+        context_cwd=gated["context_cwd"], context_length=300_000,
         replay_summary=gated["summary"],
         shadow_report=gated["shadow_report"], required_operational_runs=2)
     assert verdict["required_operational_runs"] == 2
@@ -225,7 +234,7 @@ def test_gate_has_no_accept_replay_bypass(gated):
     with pytest.raises(TypeError):
         evaluate_cutover_gate(
             store_path=gated["db"], replay_store_path=gated["db"],
-        context_cwd=gated["context_cwd"],
+        context_cwd=gated["context_cwd"], context_length=300_000,
             replay_summary=gated["summary"],
             shadow_report=gated["shadow_report"],
             accept_replay_as_operational=True)
@@ -289,7 +298,7 @@ def test_gate_never_counts_hashless_fabricated_linked_events(gated):
     _emit_cycle_events(gated["db"], DAY_DATES, run_ids="recorded")
     verdict = evaluate_cutover_gate(
         store_path=gated["db"], replay_store_path=gated["db"],
-        context_cwd=gated["context_cwd"],
+        context_cwd=gated["context_cwd"], context_length=300_000,
         replay_summary=gated["summary"],
         shadow_report=gated["shadow_report"])
     # The fabrications add zero: only the one genuine current cycle counts.
@@ -334,7 +343,7 @@ def test_genuine_backdated_runs_each_count_once(gated, monkeypatch):
 
     verdict = evaluate_cutover_gate(
         store_path=gated["db"], replay_store_path=gated["db"],
-        context_cwd=gated["context_cwd"],
+        context_cwd=gated["context_cwd"], context_length=300_000,
         replay_summary=gated["summary"],
         shadow_report=gated["shadow_report"])
     assert verdict["required_operational_runs"] == 1
@@ -373,7 +382,7 @@ def test_forged_events_never_inflate_run_count(gated):
     # the forgeries simply add nothing.
     verdict = evaluate_cutover_gate(
         store_path=gated["db"], replay_store_path=gated["db"],
-        context_cwd=gated["context_cwd"],
+        context_cwd=gated["context_cwd"], context_length=300_000,
         replay_summary=gated["summary"], shadow_report=gated["shadow_report"])
     assert verdict["operational_runs_evidenced"] == 1
     assert verdict["pass"] is True
@@ -382,7 +391,7 @@ def test_forged_events_never_inflate_run_count(gated):
     # cannot manufacture a second genuine run.
     raised = evaluate_cutover_gate(
         store_path=gated["db"], replay_store_path=gated["db"],
-        context_cwd=gated["context_cwd"],
+        context_cwd=gated["context_cwd"], context_length=300_000,
         replay_summary=gated["summary"], shadow_report=gated["shadow_report"],
         required_operational_runs=2)
     assert raised["operational_runs_evidenced"] == 1
@@ -397,7 +406,7 @@ def test_gate_never_counts_unlinked_synthetic_events(gated):
     _emit_cycle_events(gated["db"], DAY_DATES, run_ids=None)
     verdict = evaluate_cutover_gate(
         store_path=gated["db"], replay_store_path=gated["db"],
-        context_cwd=gated["context_cwd"],
+        context_cwd=gated["context_cwd"], context_length=300_000,
         replay_summary=gated["summary"],
         shadow_report=gated["shadow_report"], required_operational_runs=3)
     assert verdict["operational_runs_evidenced"] == 1  # only today's real cycle
@@ -412,7 +421,7 @@ def test_gate_never_counts_wrong_mode_or_profile_events(gated):
                        profile="some-other-profile")
     verdict = evaluate_cutover_gate(
         store_path=gated["db"], replay_store_path=gated["db"],
-        context_cwd=gated["context_cwd"],
+        context_cwd=gated["context_cwd"], context_length=300_000,
         replay_summary=gated["summary"],
         shadow_report=gated["shadow_report"])
     assert verdict["operational_runs_evidenced"] == 1
@@ -423,7 +432,7 @@ def test_gate_fails_on_profile_disagreement(gated):
     tampered["profile"] = "someone-else"
     verdict = evaluate_cutover_gate(
         store_path=gated["db"], replay_store_path=gated["db"],
-        context_cwd=gated["context_cwd"],
+        context_cwd=gated["context_cwd"], context_length=300_000,
         replay_summary=gated["summary"],
         shadow_report=tampered)
     assert verdict["checks"]["profile_agreement"]["ok"] is False
@@ -437,7 +446,7 @@ def test_gate_fails_when_shadow_report_run_is_not_recorded(gated):
     tampered["run_id"] = "never-recorded-run"
     verdict = evaluate_cutover_gate(
         store_path=gated["db"], replay_store_path=gated["db"],
-        context_cwd=gated["context_cwd"],
+        context_cwd=gated["context_cwd"], context_length=300_000,
         replay_summary=gated["summary"],
         shadow_report=tampered)
     assert verdict["checks"]["shadow_cycle_report"]["ok"] is False
@@ -455,7 +464,7 @@ def test_gate_links_shadow_report_to_recorded_manifest_and_window(
     tampered[field] = value
     verdict = evaluate_cutover_gate(
         store_path=gated["db"], replay_store_path=gated["db"],
-        context_cwd=gated["context_cwd"],
+        context_cwd=gated["context_cwd"], context_length=300_000,
         replay_summary=gated["summary"],
         shadow_report=tampered)
     assert verdict["checks"]["shadow_cycle_report"]["ok"] is False
@@ -467,7 +476,7 @@ def test_gate_rejects_empty_assertion_only_replay_windows(gated):
     tampered["windows"] = [{} for _ in range(7)]
     verdict = evaluate_cutover_gate(
         store_path=gated["db"], replay_store_path=gated["db"],
-        context_cwd=gated["context_cwd"],
+        context_cwd=gated["context_cwd"], context_length=300_000,
         replay_summary=tampered,
         shadow_report=gated["shadow_report"])
     assert verdict["checks"]["replay_summary_shape"]["ok"] is False
@@ -494,7 +503,7 @@ def test_gate_does_not_trust_payload_profile_over_recorded_run_profile(gated):
                     run_id=run_id, now=f"{day}T04:00:00+00:00")
     verdict = evaluate_cutover_gate(
         store_path=gated["db"], replay_store_path=gated["db"],
-        context_cwd=gated["context_cwd"],
+        context_cwd=gated["context_cwd"], context_length=300_000,
         replay_summary=gated["summary"],
         shadow_report=gated["shadow_report"])
     assert verdict["operational_runs_evidenced"] == 1
@@ -505,7 +514,7 @@ def test_gate_fails_on_broken_replay_invariants(gated):
     tampered["invariants"]["all_reruns_zero_delta"] = False
     verdict = evaluate_cutover_gate(
         store_path=gated["db"], replay_store_path=gated["db"],
-        context_cwd=gated["context_cwd"],
+        context_cwd=gated["context_cwd"], context_length=300_000,
         replay_summary=tampered,
         shadow_report=gated["shadow_report"])
     assert verdict["pass"] is False
@@ -517,7 +526,7 @@ def test_gate_fails_on_low_retrieval_rate(gated):
     tampered["invariants"]["retrieval_success_rate"] = 0.5
     verdict = evaluate_cutover_gate(
         store_path=gated["db"], replay_store_path=gated["db"],
-        context_cwd=gated["context_cwd"],
+        context_cwd=gated["context_cwd"], context_length=300_000,
         replay_summary=tampered,
         shadow_report=gated["shadow_report"])
     assert verdict["pass"] is False
@@ -527,7 +536,7 @@ def test_gate_fails_on_low_retrieval_rate(gated):
 def test_gate_fails_on_wrong_document_shapes(gated):
     verdict = evaluate_cutover_gate(
         store_path=gated["db"], replay_store_path=gated["db"],
-        context_cwd=gated["context_cwd"],
+        context_cwd=gated["context_cwd"], context_length=300_000,
         replay_summary={"kind": "something-else"},
         shadow_report=gated["shadow_report"])
     assert verdict["pass"] is False
@@ -535,7 +544,7 @@ def test_gate_fails_on_wrong_document_shapes(gated):
 
     verdict = evaluate_cutover_gate(
         store_path=gated["db"], replay_store_path=gated["db"],
-        context_cwd=gated["context_cwd"],
+        context_cwd=gated["context_cwd"], context_length=300_000,
         replay_summary=gated["summary"],
         shadow_report={"kind": "not-a-cycle-report"})
     assert verdict["pass"] is False
@@ -550,7 +559,8 @@ def test_cli_cutover_gate(gated, capsys):
             "--db", str(gated["db"]),
             "--replay-summary", str(gated["summary_path"]),
             "--shadow-report", str(gated["shadow_report_path"]),
-            "--context-cwd", str(gated["context_cwd"])]
+            "--context-cwd", str(gated["context_cwd"]),
+            "--context-length", "300000"]
     rc = main(args)
     out = capsys.readouterr().out
     verdict = json.loads(out)
@@ -577,7 +587,7 @@ def test_gate_rejects_fabricated_replay_window_run_id(gated):
     tampered["windows"][0]["run_id"] = "fabricated-run-id-not-recorded"
     verdict = evaluate_cutover_gate(
         store_path=gated["db"], replay_store_path=gated["db"],
-        context_cwd=gated["context_cwd"],
+        context_cwd=gated["context_cwd"], context_length=300_000,
         replay_summary=tampered,
         shadow_report=gated["shadow_report"])
     # the shape-only check still finds seven distinct, well-typed rows
@@ -594,7 +604,7 @@ def test_gate_rejects_replay_window_claim_mismatch_for_a_real_run(gated):
     tampered["windows"][0]["sources"] += 1
     verdict = evaluate_cutover_gate(
         store_path=gated["db"], replay_store_path=gated["db"],
-        context_cwd=gated["context_cwd"],
+        context_cwd=gated["context_cwd"], context_length=300_000,
         replay_summary=tampered,
         shadow_report=gated["shadow_report"])
     assert verdict["checks"]["replay_windows_linked_to_store"]["ok"] is False
@@ -606,7 +616,7 @@ def test_gate_fails_closed_on_missing_replay_store(gated):
     verdict = evaluate_cutover_gate(
         store_path=gated["db"],
         replay_store_path=gated["tmp"] / "no-such-root" / "continuity.db",
-        context_cwd=gated["context_cwd"],
+        context_cwd=gated["context_cwd"], context_length=300_000,
         replay_summary=gated["summary"],
         shadow_report=gated["shadow_report"])
     assert verdict["checks"]["replay_windows_linked_to_store"]["ok"] is False
@@ -638,7 +648,7 @@ def test_gate_rejects_edited_shadow_report_dict_claiming_false_smoke(gated):
 
     verdict = evaluate_cutover_gate(
         store_path=off_root / "continuity.db", replay_store_path=gated["db"],
-        context_cwd=gated["context_cwd"],
+        context_cwd=gated["context_cwd"], context_length=300_000,
         replay_summary=gated["summary"],
         shadow_report=lie)
     assert verdict["checks"]["shadow_report_authenticity"]["ok"] is True
@@ -658,7 +668,7 @@ def test_gate_rejects_report_file_tampered_after_publication(gated):
 
     verdict = evaluate_cutover_gate(
         store_path=gated["db"], replay_store_path=gated["db"],
-        context_cwd=gated["context_cwd"],
+        context_cwd=gated["context_cwd"], context_length=300_000,
         replay_summary=gated["summary"],
         shadow_report=gated["shadow_report"])  # untouched, originally-correct
     assert verdict["checks"]["shadow_report_authenticity"]["ok"] is False
@@ -682,7 +692,8 @@ def test_cli_cutover_gate_refuses_symlinked_replay_store(gated, tmp_path):
             "--db", str(gated["db"]),
             "--replay-summary", str(summary_copy),
             "--shadow-report", str(gated["shadow_report_path"]),
-            "--context-cwd", str(gated["context_cwd"])]
+            "--context-cwd", str(gated["context_cwd"]),
+            "--context-length", "300000"]
     rc = main(args)
     assert rc == 2
 
@@ -701,7 +712,7 @@ def test_gate_rejects_edited_replay_summary_dict(gated):
     tampered["windows"][0]["rerun_zero_delta"] = False
     verdict = evaluate_cutover_gate(
         store_path=gated["db"], replay_store_path=gated["db"],
-        context_cwd=gated["context_cwd"],
+        context_cwd=gated["context_cwd"], context_length=300_000,
         replay_summary=tampered,
         shadow_report=gated["shadow_report"])
     assert verdict["checks"]["replay_summary_authenticity"]["ok"] is False
@@ -720,7 +731,7 @@ def test_gate_rejects_replay_summary_file_tampered_after_publication(gated):
 
     verdict = evaluate_cutover_gate(
         store_path=gated["db"], replay_store_path=gated["db"],
-        context_cwd=gated["context_cwd"],
+        context_cwd=gated["context_cwd"], context_length=300_000,
         replay_summary=gated["summary"],  # untouched, originally-correct
         shadow_report=gated["shadow_report"])
     assert verdict["checks"]["replay_summary_authenticity"]["ok"] is False
@@ -732,7 +743,7 @@ def test_gate_accepts_genuine_unmodified_replay_summary(gated):
     authenticate cleanly."""
     verdict = evaluate_cutover_gate(
         store_path=gated["db"], replay_store_path=gated["db"],
-        context_cwd=gated["context_cwd"],
+        context_cwd=gated["context_cwd"], context_length=300_000,
         replay_summary=gated["summary"],
         shadow_report=gated["shadow_report"])
     assert verdict["checks"]["replay_summary_authenticity"]["ok"] is True
@@ -749,7 +760,7 @@ def test_gate_handles_non_dict_replay_window_rows_without_crashing(gated):
     tampered["windows"] = ["not-a-dict"] * 7
     verdict = evaluate_cutover_gate(
         store_path=gated["db"], replay_store_path=gated["db"],
-        context_cwd=gated["context_cwd"],
+        context_cwd=gated["context_cwd"], context_length=300_000,
         replay_summary=tampered,
         shadow_report=gated["shadow_report"])
     assert verdict["checks"]["replay_summary_shape"]["ok"] is False
@@ -763,7 +774,7 @@ def test_gate_handles_mixed_non_dict_replay_window_rows_without_crashing(
                            {"date": "2026-07-05"}, True]
     verdict = evaluate_cutover_gate(
         store_path=gated["db"], replay_store_path=gated["db"],
-        context_cwd=gated["context_cwd"],
+        context_cwd=gated["context_cwd"], context_length=300_000,
         replay_summary=tampered,
         shadow_report=gated["shadow_report"])
     assert verdict["checks"]["replay_summary_shape"]["ok"] is False

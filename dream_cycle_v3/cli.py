@@ -64,6 +64,7 @@ def _emit(obj: dict) -> None:
 def cmd_context_health(args: argparse.Namespace) -> int:
     report = audit_context_health(
         args.cwd,
+        profile=args.profile,
         context_length=args.context_length,
     )
     if args.out:
@@ -595,7 +596,9 @@ def build_parser() -> argparse.ArgumentParser:
                     "then build the real prompt and fail on any truncation.")
     p.add_argument("--cwd", required=True,
                    help="explicit project working directory")
-    p.add_argument("--context-length", type=int,
+    p.add_argument("--profile", required=True,
+                   help="target Hermes profile whose config supplies the cap")
+    p.add_argument("--context-length", type=int, required=True,
                    help="effective model context window in tokens")
     p.add_argument("--out",
                    help="write canonical JSON evidence to a new file")
@@ -610,7 +613,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--context-cwd", required=True,
                    help="project directory whose active context file must "
                         "render without truncation")
-    p.add_argument("--context-length", type=int,
+    p.add_argument("--context-length", type=int, required=True,
                    help="effective model context window in tokens")
     p.set_defaults(func=cmd_cutover_gate)
 

@@ -13,6 +13,15 @@ from dream_cycle_v3.context_health import (
 from dream_cycle_v3.errors import DreamCycleError
 
 
+@pytest.fixture(autouse=True)
+def _profile_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    home = tmp_path / "profile-home"
+    home.mkdir()
+    monkeypatch.setattr(
+        "hermes_cli.profiles.resolve_profile_env", lambda _profile: str(home)
+    )
+
+
 def test_active_sources_follow_prompt_builder_priority(tmp_path: Path) -> None:
     (tmp_path / "AGENTS.md").write_text("agent rules\n", encoding="utf-8")
     (tmp_path / "CLAUDE.md").write_text("claude rules\n", encoding="utf-8")
@@ -32,7 +41,8 @@ def test_context_health_uses_real_cap_and_detects_truncation(
         "agent.prompt_builder._get_context_file_max_chars", lambda _length: 100
     )
 
-    report = audit_context_health(tmp_path, context_length=1_000_000)
+    report = audit_context_health(
+        tmp_path, profile="test-profile", context_length=1_000_000)
 
     assert report["pass"] is False
     assert report["remediation_required"] is True
@@ -52,7 +62,8 @@ def test_context_health_passes_and_writes_fresh_canonical_evidence(
     monkeypatch.setattr(
         "agent.prompt_builder._get_context_file_max_chars", lambda _length: 1_000
     )
-    report = audit_context_health(tmp_path)
+    report = audit_context_health(
+        tmp_path, profile="test-profile", context_length=300_000)
     out = tmp_path / "evidence" / "context-health.json"
 
     assert report["pass"] is True
