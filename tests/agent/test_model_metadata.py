@@ -431,20 +431,21 @@ class TestDefaultContextLengths:
 # =========================================================================
 
 class TestCodexOAuthContextLength:
-    """ChatGPT Codex OAuth exposes provider-specific context limits.
-
-    Older Codex slugs are often 272k (Spark is 128k), while gpt-5.5 currently
-    exposes the same 1M-class window as the direct OpenAI API.
+    """ChatGPT Codex OAuth context windows come from the authenticated
+    /models catalogue and may differ from the static fallback table or the
+    direct OpenAI API allocation. The fallback values below are conservative
+    defaults used only when the live probe is unavailable.
     """
 
     def setup_method(self):
         import agent.model_metadata as mm
         mm._codex_oauth_context_cache = {}
-        mm._codex_oauth_context_cache_time = 0.0
 
     def test_fallback_table_used_without_token(self):
-        """With no access token, the hardcoded Codex fallback table wins
-        over generic models.dev values.
+        """Without a token, use provider-specific fallback values.
+
+        Tyler's verified gpt-5.5 Codex allocation is 1M-class; older slugs
+        retain conservative limits until an authenticated probe overrides them.
         """
         from agent.model_metadata import get_model_context_length
 
@@ -505,10 +506,57 @@ class TestCodexOAuthContextLength:
         assert ctx_55 == 300_000
         assert ctx_54 == 400_000
 
+    def test_live_catalogue_cache_is_scoped_to_access_token(self):
+        """Different OAuth tokens must not share entitlement-specific metadata."""
+        from agent import model_metadata as mm
+        from agent.model_metadata import get_model_context_length
+
+        first_response = MagicMock()
+        first_response.status_code = 200
+        first_response.json.return_value = {
+            "models": [{"slug": "gpt-5.6-terra", "context_window": 272_000}]
+        }
+        second_response = MagicMock()
+        second_response.status_code = 200
+        second_response.json.return_value = {
+            "models": [{"slug": "gpt-5.6-terra", "context_window": 372_000}]
+        }
+
+        with patch(
+            "agent.model_metadata.requests.get",
+            side_effect=[first_response, second_response],
+        ) as mock_get, patch("agent.model_metadata.save_context_length") as mock_save:
+            first = get_model_context_length(
+                "gpt-5.6-terra",
+                base_url="https://chatgpt.com/backend-api/codex",
+                api_key="token-account-a",
+                provider="openai-codex",
+            )
+            first_again = get_model_context_length(
+                "gpt-5.6-terra",
+                base_url="https://chatgpt.com/backend-api/codex",
+                api_key="token-account-a",
+                provider="openai-codex",
+            )
+            second = get_model_context_length(
+                "gpt-5.6-terra",
+                base_url="https://chatgpt.com/backend-api/codex",
+                api_key="token-account-b",
+                provider="openai-codex",
+            )
+
+        assert (first, first_again, second) == (272_000, 272_000, 372_000)
+        assert mock_get.call_count == 2
+        assert mock_get.call_args_list[0].kwargs["headers"]["Authorization"] == "Bearer token-account-a"
+        assert mock_get.call_args_list[1].kwargs["headers"]["Authorization"] == "Bearer token-account-b"
+        assert mock_save.call_count == 2
+        assert all(
+            "token-account" not in key
+            for key in mm._codex_oauth_context_cache
+        )
+
     def test_probe_failure_falls_back_to_hardcoded(self):
-        """If the probe fails (non-200 / network error), we still return
-        the hardcoded provider-specific fallback rather than leaking through
-        to generic models.dev values."""
+        """A failed probe uses the verified provider-specific fallback."""
         from agent.model_metadata import get_model_context_length
 
         fake_response = MagicMock()
@@ -527,16 +575,13 @@ class TestCodexOAuthContextLength:
         assert ctx == 1_050_000
 
     def test_non_codex_providers_unaffected(self):
-        """Resolving gpt-5.5 on non-Codex providers must NOT use the Codex
-        provider-specific fallback — OpenRouter / direct OpenAI API have their
-        own resolution paths.
-        """
+        """Resolving gpt-5.5 outside Codex uses that provider's own path."""
         from agent.model_metadata import get_model_context_length
 
         # OpenRouter — should hit its own catalog path first; when mocked
         # empty, falls through to hardcoded DEFAULT_CONTEXT_LENGTHS (1.05M,
-        # matching the real direct-API value — Codex OAuth provider-specific
-        # fallbacks must not leak here).
+        # matching the real direct-API value; Codex metadata must not leak
+        # outside the openai-codex provider path).
         with patch("agent.model_metadata.fetch_model_metadata", return_value={}), \
              patch("agent.model_metadata.fetch_endpoint_model_metadata", return_value={}), \
              patch("agent.model_metadata.get_cached_context_length", return_value=None), \
@@ -552,160 +597,104 @@ class TestCodexOAuthContextLength:
             "leaked outside openai-codex provider"
         )
 
-    def test_stale_codex_cache_over_400k_is_invalidated_for_272k_slugs(self, tmp_path, monkeypatch):
-        """Older Codex OAuth slugs cap at 272k, so cached direct-API values
-        >= 400k for those slugs must be dropped and re-resolved via the live probe.
-        """
+    @pytest.mark.parametrize(
+        "stale_context,live_context",
+        [(272_000, 372_000), (372_000, 272_000)],
+        ids=("expansion", "rollback"),
+    )
+    def test_live_codex_context_replaces_stale_cache_in_both_directions(
+        self, tmp_path, monkeypatch, stale_context, live_context
+    ):
+        """Authenticated metadata must replace stale disk values in either direction."""
         from agent import model_metadata as mm
 
-        # Isolate the cache file to tmp_path
         cache_file = tmp_path / "context_length_cache.yaml"
         monkeypatch.setattr(mm, "_get_context_cache_path", lambda: cache_file)
 
-        base_url = "https://chatgpt.com/backend-api/codex/"
-        stale_key = f"gpt-5.4@{base_url}"
+        base_url = "https://chatgpt.com/backend-api/codex"
+        stale_key = f"gpt-5.6-terra@{base_url}"
         other_key = "other-model@https://api.openai.com/v1/"
         import yaml as _yaml
         cache_file.write_text(_yaml.dump({"context_lengths": {
-            stale_key: 1_050_000,   # stale direct-API value for a 272k Codex slug
-            other_key: 128_000,     # unrelated, must survive
+            stale_key: stale_context,
+            other_key: 128_000,
         }}))
 
         fake_response = MagicMock()
         fake_response.status_code = 200
         fake_response.json.return_value = {
-            "models": [{"slug": "gpt-5.4", "context_window": 272_000}]
+            "models": [{"slug": "gpt-5.6-terra", "context_window": live_context}]
         }
-
-        with patch("agent.model_metadata.requests.get", return_value=fake_response), \
-             patch("agent.model_metadata.save_context_length") as mock_save:
+        # Exercise real persistence here: this test verifies that a live value
+        # replaces the stale on-disk entry. Failure-path tests below mock the
+        # writer because they assert that fallback values are not persisted.
+        with patch("agent.model_metadata.requests.get", return_value=fake_response) as mock_get:
             ctx = mm.get_model_context_length(
-                model="gpt-5.4",
+                model="gpt-5.6-terra",
                 base_url=base_url,
                 api_key="fake-token",
                 provider="openai-codex",
             )
 
-        assert ctx == 272_000, f"Stale entry should have been re-resolved to 272k, got {ctx}"
-        # Live save was called with the fresh value
-        mock_save.assert_called_with("gpt-5.4", base_url, 272_000)
-        # The stale entry was removed from disk; unrelated entries survived
+        assert ctx == live_context
+        mock_get.assert_called_once()
         remaining = _yaml.safe_load(cache_file.read_text()).get("context_lengths", {})
-        assert stale_key not in remaining, "Stale entry was not invalidated from the cache file"
-        assert remaining.get(other_key) == 128_000, "Unrelated cache entries must not be touched"
+        assert remaining.get(stale_key) == live_context
+        assert remaining.get(other_key) == 128_000
 
-    def test_fresh_codex_cache_under_400k_is_respected_for_272k_slugs(self, tmp_path, monkeypatch):
-        """Codex entries at the correct 272k must NOT be invalidated for
-        slugs whose current fallback is 272k."""
+    def test_codex_fallback_is_not_persisted(self, tmp_path, monkeypatch):
+        """A failed live probe must not poison the persistent cache."""
         from agent import model_metadata as mm
 
         cache_file = tmp_path / "context_length_cache.yaml"
         monkeypatch.setattr(mm, "_get_context_cache_path", lambda: cache_file)
-
-        base_url = "https://chatgpt.com/backend-api/codex/"
-        import yaml as _yaml
-        cache_file.write_text(_yaml.dump({"context_lengths": {
-            f"gpt-5.4@{base_url}": 272_000,
-        }}))
-
-        # If the invalidation incorrectly fired, this would be called; assert it isn't.
-        with patch("agent.model_metadata.requests.get") as mock_get:
-            ctx = mm.get_model_context_length(
-                model="gpt-5.4",
-                base_url=base_url,
-                api_key="fake-token",
-                provider="openai-codex",
-            )
-        assert ctx == 272_000
-        mock_get.assert_not_called()
-
-    def test_low_codex_cache_survives_when_probe_fails_for_gpt55(self, tmp_path, monkeypatch):
-        """A cached low gpt-5.5 Codex limit may have come from a live probe.
-
-        If the next process has an expired token or a network blip, the fallback
-        table is not authoritative enough to delete that provider-reported value.
-        """
-        from agent import model_metadata as mm
-
-        cache_file = tmp_path / "context_length_cache.yaml"
-        monkeypatch.setattr(mm, "_get_context_cache_path", lambda: cache_file)
-
-        base_url = "https://chatgpt.com/backend-api/codex/"
-        import yaml as _yaml
-        stale_key = f"gpt-5.5@{base_url}"
-        cache_file.write_text(_yaml.dump({"context_lengths": {stale_key: 272_000}}))
+        base_url = "https://chatgpt.com/backend-api/codex"
 
         fake_response = MagicMock()
         fake_response.status_code = 401
         fake_response.json.return_value = {}
 
         with patch("agent.model_metadata.requests.get", return_value=fake_response), \
-             patch("agent.model_metadata.save_context_length"):
+             patch("agent.model_metadata.save_context_length") as mock_save:
             ctx = mm.get_model_context_length(
-                model="gpt-5.5",
+                model="gpt-5.6-terra",
                 base_url=base_url,
                 api_key="expired-token",
                 provider="openai-codex",
             )
 
         assert ctx == 272_000
-        remaining = _yaml.safe_load(cache_file.read_text()).get("context_lengths", {})
-        assert remaining.get(stale_key) == 272_000
+        mock_save.assert_not_called()
+        assert not cache_file.exists()
 
-    def test_stale_272k_codex_cache_is_invalidated_for_gpt55_after_live_probe(self, tmp_path, monkeypatch):
-        """gpt-5.5 low cache entries are replaced only after /models confirms
-        the current 1M-class Codex window."""
+    def test_codex_cache_is_not_used_when_probe_fails(self, tmp_path, monkeypatch):
+        """Even a previously live-looking Codex row must not suppress probing."""
         from agent import model_metadata as mm
 
         cache_file = tmp_path / "context_length_cache.yaml"
         monkeypatch.setattr(mm, "_get_context_cache_path", lambda: cache_file)
-
-        base_url = "https://chatgpt.com/backend-api/codex/"
+        base_url = "https://chatgpt.com/backend-api/codex"
         import yaml as _yaml
-        stale_key = f"gpt-5.5@{base_url}"
-        cache_file.write_text(_yaml.dump({"context_lengths": {stale_key: 272_000}}))
+        cache_file.write_text(_yaml.dump({"context_lengths": {
+            f"gpt-5.6-terra@{base_url}": 372_000,
+        }}))
 
         fake_response = MagicMock()
-        fake_response.status_code = 200
-        fake_response.json.return_value = {
-            "models": [{"slug": "gpt-5.5", "context_window": 1_050_000}]
-        }
+        fake_response.status_code = 401
+        fake_response.json.return_value = {}
 
-        with patch("agent.model_metadata.requests.get", return_value=fake_response), \
-             patch("agent.model_metadata.save_context_length") as mock_save:
+        with patch("agent.model_metadata.requests.get", return_value=fake_response) as mock_get:
             ctx = mm.get_model_context_length(
-                model="gpt-5.5",
+                model="gpt-5.6-terra",
                 base_url=base_url,
-                api_key="fresh-token",
+                api_key="expired-token",
                 provider="openai-codex",
             )
 
-        assert ctx == 1_050_000
-        mock_save.assert_called_with("gpt-5.5", base_url, 1_050_000)
+        assert ctx == 272_000
+        mock_get.assert_called_once()
         remaining = _yaml.safe_load(cache_file.read_text()).get("context_lengths", {})
-        assert stale_key not in remaining
-
-    def test_stale_invalidation_scoped_to_codex_provider(self, tmp_path, monkeypatch):
-        """A cached 1M entry for a non-Codex provider (e.g. Anthropic opus on
-        OpenRouter, legitimately 1M) must NOT be invalidated by this guard."""
-        from agent import model_metadata as mm
-
-        cache_file = tmp_path / "context_length_cache.yaml"
-        monkeypatch.setattr(mm, "_get_context_cache_path", lambda: cache_file)
-
-        base_url = "https://openrouter.ai/api/v1"
-        import yaml as _yaml
-        cache_file.write_text(_yaml.dump({"context_lengths": {
-            f"anthropic/claude-opus-4.6@{base_url}": 1_000_000,
-        }}))
-
-        ctx = mm.get_model_context_length(
-            model="anthropic/claude-opus-4.6",
-            base_url=base_url,
-            api_key="fake",
-            provider="openrouter",
-        )
-        assert ctx == 1_000_000, "Non-codex 1M cache entries must be respected"
+        assert remaining.get(f"gpt-5.6-terra@{base_url}") == 372_000
 
 
 # =========================================================================
