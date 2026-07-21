@@ -1929,6 +1929,336 @@ def test_respawn_guard_active_pr_in_comment(kanban_home):
     assert reason == "active_pr"
 
 
+def test_respawn_guard_active_pr_bypassed_by_same_second_later_review_requeue(
+    kanban_home, monkeypatch, all_assignees_spawnable
+):
+    """Event order lets a same-second post-PR review unblock run fixes."""
+    now = int(time.time())
+    spawned_ids = []
+
+    def fake_spawn(task, workspace):
+        spawned_ids.append(task.id)
+
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="fix-reviewed-pr", assignee="alice")
+        assert kb.block_task(
+            conn,
+            t,
+            reason="review-required: PR needs independent review",
+            kind="needs_input",
+        )
+        kb.add_comment(
+            conn,
+            t,
+            "worker",
+            "PR created: https://github.com/totemx-AI/subsidysmart/pull/42",
+        )
+        kb.add_comment(conn, t, "reviewer", "Changes required before merge.")
+        assert kb.unblock_task(conn, t)
+
+        result = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+        # ``fake_spawn`` intentionally returns no PID.  The dispatch claim,
+        # not the optional spawned event, must consume this one-shot requeue.
+        assert kb.check_respawn_guard(conn, t) == "active_pr"
+
+    assert t in spawned_ids
+    assert not any(task_id == t for task_id, _reason in result.respawn_guarded)
+
+
+def test_respawn_guard_active_pr_ignores_same_second_pre_pr_unblock(
+    kanban_home, monkeypatch
+):
+    """Event order keeps a same-second pre-PR unblock from bypassing the guard."""
+    now = int(time.time())
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="already-requeued", assignee="alice")
+        assert kb.block_task(
+            conn, t, reason="waiting for operator", kind="needs_input"
+        )
+        assert kb.unblock_task(conn, t)
+        kb.add_comment(
+            conn,
+            t,
+            "worker",
+            "New PR: https://github.com/totemx-AI/subsidysmart/pull/43",
+        )
+
+        assert kb.check_respawn_guard(conn, t) == "active_pr"
+
+
+def test_respawn_guard_active_pr_bypassed_by_manual_promotion(
+    kanban_home, monkeypatch
+):
+    """The operator promotion event is an explicit post-PR remediation."""
+    now = int(time.time())
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="promote-reviewed-pr", assignee="alice")
+        assert kb.block_task(
+            conn, t, reason="review-required: changes requested", kind="needs_input"
+        )
+        kb.add_comment(
+            conn,
+            t,
+            "worker",
+            "PR created: https://github.com/acme/widgets/pull/44",
+        )
+        promoted, refusal = kb.promote_task(conn, t, actor="operator")
+
+        assert promoted, refusal
+        assert kb.check_respawn_guard(conn, t) is None
+
+
+def test_respawn_guard_active_pr_bypassed_by_explicit_ready_status(
+    kanban_home, monkeypatch
+):
+    """A dashboard move to ready is an explicit post-PR requeue."""
+    now = int(time.time())
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="ready-reviewed-pr", assignee="alice")
+        kb.add_comment(
+            conn,
+            t,
+            "worker",
+            "PR created: https://github.com/acme/widgets/pull/47",
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'status', ?, ?)",
+            (t, '{"status":"ready"}', now),
+        )
+
+        assert kb.check_respawn_guard(conn, t) is None
+
+
+def test_respawn_guard_active_pr_ignores_dependency_repromotion(
+    kanban_home, monkeypatch
+):
+    """Automatic todo/promoted churn is not remediation authorization."""
+    now = int(time.time())
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="dependency-churn-pr", assignee="alice")
+        kb.add_comment(
+            conn,
+            t,
+            "worker",
+            "PR created: https://github.com/acme/widgets/pull/48",
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'status', ?, ?)",
+            (t, '{"status":"todo","reason":"parent_reopened"}', now),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, created_at) "
+            "VALUES (?, 'promoted', ?)",
+            (t, now),
+        )
+
+        assert kb.check_respawn_guard(conn, t) == "active_pr"
+
+
+def test_respawn_guard_active_pr_ignores_automatic_reclaim(
+    kanban_home, monkeypatch
+):
+    """Stale-claim recovery is not operator authorization for duplicate work."""
+    now = int(time.time())
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="stale-worker-pr", assignee="alice")
+        kb.add_comment(
+            conn,
+            t,
+            "worker",
+            "PR created: https://github.com/acme/widgets/pull/45",
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'reclaimed', ?, ?)",
+            (t, '{"stale_lock":"host:123"}', now),
+        )
+
+        assert kb.check_respawn_guard(conn, t) == "active_pr"
+
+
+def test_respawn_guard_active_pr_bypassed_by_manual_reclaim(
+    kanban_home, monkeypatch
+):
+    """A manual reclaim explicitly authorizes post-PR remediation work."""
+    now = int(time.time())
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="operator-reclaimed-pr", assignee="alice")
+        kb.add_comment(
+            conn,
+            t,
+            "worker",
+            "PR created: https://github.com/acme/widgets/pull/46",
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'reclaimed', ?, ?)",
+            (t, '{"manual":true,"reason":"review fixes"}', now),
+        )
+
+        assert kb.check_respawn_guard(conn, t) is None
+
+
+def test_respawn_guard_active_pr_requeue_is_consumed_by_next_claim(
+    kanban_home, monkeypatch
+):
+    """One explicit requeue authorizes one remediation worker, not a storm."""
+    now = int(time.time())
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="one-remediation-run", assignee="alice")
+        kb.add_comment(
+            conn,
+            t,
+            "worker",
+            "PR created: https://github.com/acme/widgets/pull/49",
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, created_at) "
+            "VALUES (?, 'unblocked', ?)",
+            (t, now),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'claimed', ?, ?)",
+            (t, '{"run_id":123}', now),
+        )
+
+        assert kb.check_respawn_guard(conn, t) == "active_pr"
+
+
+def test_respawn_guard_active_pr_new_requeue_after_claim_authorizes_retry(
+    kanban_home, monkeypatch
+):
+    """A fresh operator requeue after a consumed one authorizes one retry."""
+    now = int(time.time())
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="second-remediation-run", assignee="alice")
+        kb.add_comment(
+            conn,
+            t,
+            "worker",
+            "PR created: https://github.com/acme/widgets/pull/50",
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, created_at) "
+            "VALUES (?, 'unblocked', ?)",
+            (t, now),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'claimed', ?, ?)",
+            (t, '{"run_id":123}', now),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, created_at) "
+            "VALUES (?, 'unblocked', ?)",
+            (t, now),
+        )
+
+        assert kb.check_respawn_guard(conn, t) is None
+
+
+def test_respawn_guard_active_pr_no_pid_spawn_consumes_requeue(
+    kanban_home, monkeypatch
+):
+    """A claimed no-PID spawn still consumes exactly one remediation requeue."""
+    now = int(time.time())
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _name: True)
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="no-pid-remediation", assignee="alice")
+        kb.add_comment(
+            conn,
+            t,
+            "worker",
+            "PR created: https://github.com/acme/widgets/pull/51",
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, created_at) "
+            "VALUES (?, 'unblocked', ?)",
+            (t, now),
+        )
+
+        result = kb.dispatch_once(conn, spawn_fn=lambda _task, _workspace: None)
+
+        assert [row[0] for row in result.spawned] == [t]
+        kinds = [event.kind for event in kb.list_events(conn, t)]
+        assert "claimed" in kinds
+        assert "spawned" not in kinds
+        assert kb.check_respawn_guard(conn, t) == "active_pr"
+
+
+def test_respawn_guard_active_pr_same_second_legacy_comment_is_conservative(
+    kanban_home, monkeypatch
+):
+    """Unlinked legacy comments do not guess at ambiguous same-second order."""
+    now = int(time.time())
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="legacy-pr-comment", assignee="alice")
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'worker', ?, ?)",
+            (t, "PR: https://github.com/acme/widgets/pull/7", now),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'commented', ?, ?)",
+            (t, '{"author":"worker","len":45}', now),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, created_at) "
+            "VALUES (?, 'unblocked', ?)",
+            (t, now),
+        )
+
+        assert kb.check_respawn_guard(conn, t) == "active_pr"
+
+
+def test_respawn_guard_live_continuity_task_legacy_requeue_after_pr(
+    kanban_home, monkeypatch
+):
+    """The t_1eef21d9 chronology permits its later remediation requeue."""
+    now = int(time.time())
+    pr_at = now - 3600
+    requeue_at = now - 60
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="salvage existing PR", assignee="alice")
+        conn.execute(
+            "UPDATE task_events SET created_at = ? WHERE task_id = ?",
+            (pr_at - 60, t),
+        )
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'p0', ?, ?)",
+            (t, "Review: https://github.com/NousResearch/hermes-agent/pull/31692", pr_at),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'commented', ?, ?)",
+            (t, '{"author":"p0","len":64}', pr_at),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, created_at) "
+            "VALUES (?, 'unblocked', ?)",
+            (t, requeue_at),
+        )
+
+        assert kb.check_respawn_guard(conn, t) is None
+
+
 def test_respawn_guard_old_pr_comment_not_guarded(kanban_home):
     """A GitHub PR URL in a comment older than the PR window does not block."""
     with kb.connect() as conn:

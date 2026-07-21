@@ -3080,8 +3080,14 @@ def add_comment(
             "VALUES (?, ?, ?, ?)",
             (task_id, author.strip(), body.strip(), now),
         )
-        _append_event(conn, task_id, "commented", {"author": author, "len": len(body)})
-        return int(cur.lastrowid or 0)
+        comment_id = int(cur.lastrowid or 0)
+        _append_event(
+            conn,
+            task_id,
+            "commented",
+            {"author": author, "len": len(body), "comment_id": comment_id},
+        )
+        return comment_id
 
 
 def list_comments(conn: sqlite3.Connection, task_id: str) -> list[Comment]:
@@ -7432,6 +7438,8 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         A GitHub PR URL appears in a recent task comment (within
         ``_RESPAWN_GUARD_PR_WINDOW`` seconds).  A prior worker already
         opened a PR; re-spawning risks a duplicate PR on the same task.
+        Bypassed when an explicit re-queue event arrives after the latest
+        matching PR comment so requested review fixes can run.
 
     Stale / dead claim locks are NOT a guard reason — they are handled
     by ``release_stale_claims`` and ``detect_crashed_workers`` which
@@ -7514,12 +7522,91 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
             return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
+    #    As with recent success, an explicit re-queue after that evidence is a
+    #    deliberate request to continue the task (typically review fixes).
+    #    Only events after the latest matching PR comment count; an older
+    #    unblock must not authorize duplicate work on a subsequently opened PR.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
+    latest_pr_comment_id: Optional[int] = None
+    latest_pr_at: Optional[int] = None
     for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+        "SELECT id, body, created_at FROM task_comments "
+        "WHERE task_id = ? AND created_at >= ? "
+        "ORDER BY created_at DESC, id DESC",
         (task_id, pr_cutoff),
     ).fetchall():
         if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
+            latest_pr_comment_id = int(c["id"])
+            latest_pr_at = int(c["created_at"])
+            break
+    if latest_pr_comment_id is not None and latest_pr_at is not None:
+        # New comments link their ``commented`` event to the comment row so
+        # same-second actions can be ordered by the durable event id. Legacy
+        # events lack that link; retain the conservative timestamp fallback
+        # for them rather than letting an ambiguous pre-PR requeue through.
+        latest_pr_event_id: Optional[int] = None
+        comment_events = conn.execute(
+            "SELECT id, payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'commented' "
+            "ORDER BY id DESC",
+            (task_id,),
+        ).fetchall()
+        for event in comment_events:
+            try:
+                payload = json.loads(event["payload"]) if event["payload"] else {}
+            except (TypeError, ValueError):
+                payload = {}
+            if (
+                isinstance(payload, dict)
+                and payload.get("comment_id") == latest_pr_comment_id
+            ):
+                latest_pr_event_id = int(event["id"])
+                break
+
+        if latest_pr_event_id is not None:
+            requeue_events = conn.execute(
+                "SELECT id, kind, payload FROM task_events "
+                "WHERE task_id = ? AND id > ? "
+                "AND kind IN ('status', 'promoted_manual', 'unblocked', "
+                "'reclaimed') ORDER BY id DESC",
+                (task_id, latest_pr_event_id),
+            ).fetchall()
+        else:
+            requeue_events = conn.execute(
+                "SELECT id, kind, payload FROM task_events "
+                "WHERE task_id = ? AND created_at > ? "
+                "AND kind IN ('status', 'promoted_manual', 'unblocked', "
+                "'reclaimed') ORDER BY id DESC",
+                (task_id, latest_pr_at),
+            ).fetchall()
+        requeue_event_id: Optional[int] = None
+        for event in requeue_events:
+            if event["kind"] in {"promoted_manual", "unblocked"}:
+                requeue_event_id = int(event["id"])
+                break
+            try:
+                payload = json.loads(event["payload"]) if event["payload"] else {}
+            except (TypeError, ValueError):
+                payload = {}
+            if not isinstance(payload, dict):
+                continue
+            if (
+                event["kind"] == "status"
+                and payload.get("status") == "ready"
+            ) or (
+                event["kind"] == "reclaimed"
+                and payload.get("manual") is True
+            ):
+                requeue_event_id = int(event["id"])
+                break
+        if requeue_event_id is None:
+            return "active_pr"
+        consumed = conn.execute(
+            "SELECT 1 FROM task_events "
+            "WHERE task_id = ? AND kind = 'claimed' AND id > ? LIMIT 1",
+            (task_id, requeue_event_id),
+        ).fetchone()
+        if consumed:
             return "active_pr"
 
     return None
