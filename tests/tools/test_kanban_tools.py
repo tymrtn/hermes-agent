@@ -2214,6 +2214,39 @@ def test_create_subscribes_gateway_session(monkeypatch, worker_env):
     assert s["notifier_profile"] == "test-worker"
 
 
+def test_create_prefers_session_profile_over_stale_process_profile(
+    monkeypatch, worker_env
+):
+    """A task-local gateway profile must win over process-global profile state.
+
+    Concurrent gateway sessions share a process, so trusting HERMES_PROFILE first
+    can persist another bot as the notifier owner for this session's task.
+    """
+    from gateway.session_context import reset_session_vars, set_session_vars
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_PROFILE", "skippy")
+    set_session_vars(
+        platform="telegram",
+        chat_id="chat-42",
+        profile="nagatha",
+    )
+    try:
+        out = kt._handle_create({
+            "title": "session-owned auto-sub",
+            "assignee": "peer",
+        })
+    finally:
+        reset_session_vars()
+
+    d = json.loads(out)
+    assert d["ok"] is True
+    assert d["subscribed"] is True, d
+    subs = _sub_index(_list_subs_for_task(d["task_id"]))
+    assert len(subs) == 1
+    assert subs[0]["notifier_profile"] == "nagatha"
+
+
 def test_create_subscribes_gateway_session_with_active_profile_when_env_missing(monkeypatch, worker_env):
     """Gateway auto-subscribe rows must be owned by the active profile even
     when HERMES_PROFILE is not exported. Otherwise every Telegram gateway with
