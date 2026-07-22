@@ -214,6 +214,13 @@
     } catch (_e) { return null; }
   }
 
+  function readDeepLinkParam(name) {
+    try {
+      const v = new URLSearchParams(window.location.search).get(name);
+      return (v || "").trim() || null;
+    } catch (_e) { return null; }
+  }
+
   function writeSelectedBoard(slug) {
     try {
       // Persist the user's dashboard-side board pin even for "default".
@@ -506,7 +513,10 @@
 
   function KanbanPage() {
     const { t } = useI18n();
-    const [board, setBoard] = useState(() => readSelectedBoard() || null);
+    // Explicit deep links outrank the browser's remembered board. This keeps
+    // /kanban?board=<slug>&task=<id> deterministic across operators while the
+    // localStorage pin remains the default for ordinary /kanban visits.
+    const [board, setBoard] = useState(() => readDeepLinkParam("board") || readSelectedBoard() || null);
     const [boardList, setBoardList] = useState([]);      // [{slug, name, counts, ...}]
     const [showNewBoard, setShowNewBoard] = useState(false);
     const [showBoardSettings, setShowBoardSettings] = useState(false);
@@ -531,7 +541,7 @@
     const [laneByProfile, setLaneByProfile] = useState(true);
     const [configApplied, setConfigApplied] = useState(false);
 
-    const [selectedTaskId, setSelectedTaskId] = useState(null);
+    const [selectedTaskId, setSelectedTaskId] = useState(() => readDeepLinkParam("task"));
     const [selectedIds, setSelectedIds] = useState(() => new Set());
     const [lastSelectedId, setLastSelectedId] = useState(null);
     const [failedIds, setFailedIds] = useState(() => new Set());
@@ -645,6 +655,20 @@
         // ``current`` file — same rationale as ``withBoard()`` above.
         // Regression: #20879.
         if (board) wsParams.board = board;
+        // Feature-detect the host's WS URL helper. A stale/legacy host bundle
+        // served alongside a newer plugin build may predate buildWsUrl (it was
+        // an additive SDK helper). The old unguarded call threw synchronously
+        // right here — inside a React effect — which unmounted the whole board
+        // and left users a blank page. Degrade to REST-only instead: the board,
+        // task drawer, and every REST action stay usable; only live push
+        // updates are off. Surface a non-fatal notice and stop — no retry loop
+        // (the helper won't materialise without a host reload) and no
+        // hand-rolled insecure WS auth.
+        if (typeof SDK.buildWsUrl !== "function") {
+          setError(tx(t, "wsUnavailable",
+            "Live updates unavailable — reload the page to refresh. The board still works."));
+          return;
+        }
         SDK.buildWsUrl(`${API}/events`, wsParams).then(function (url) {
           if (wsClosedRef.current) return;
           let ws;
