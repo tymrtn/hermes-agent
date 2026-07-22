@@ -379,3 +379,35 @@ class TestSocketModeRestart:
         await adapter._socket_watchdog_loop()
 
         assert reasons == ["transport disconnected"]
+
+
+class TestReconnectRearmsThreadRehydration:
+    """Events can be dropped while the socket is down — the same gap as a
+    gateway restart. A successful reconnect must re-arm the once-per-thread
+    rehydration check so each thread's next reply fetches the delta past its
+    persisted watermark; a failed reconnect must not (nothing was healed)."""
+
+    @pytest.mark.asyncio
+    async def test_successful_reconnect_clears_rehydration_checked(self, adapter):
+        adapter._thread_rehydration_checked = {"T1:C1:1.0", "T1:C2:2.0"}
+        adapter._stop_socket_mode_handler = AsyncMock()
+
+        with patch.object(adapter, "_start_socket_mode_handler") as start:
+            await adapter._restart_socket_mode("ping/pong stale")
+
+        start.assert_called_once()
+        assert adapter._thread_rehydration_checked == set()
+
+    @pytest.mark.asyncio
+    async def test_failed_reconnect_keeps_rehydration_checked(self, adapter):
+        adapter._thread_rehydration_checked = {"T1:C1:1.0"}
+        adapter._stop_socket_mode_handler = AsyncMock()
+
+        with patch.object(
+            adapter,
+            "_start_socket_mode_handler",
+            side_effect=RuntimeError("socket start failed"),
+        ):
+            await adapter._restart_socket_mode("ping/pong stale")
+
+        assert adapter._thread_rehydration_checked == {"T1:C1:1.0"}

@@ -2057,6 +2057,7 @@ from gateway.platforms.base import (
     EphemeralReply,
     MessageEvent,
     MessageType,
+    STAGED_WATERMARK_COMMIT_KEY,
     _prefix_within_utf16_limit,
     _reply_anchor_for_event,
     merge_pending_message_event,
@@ -11623,6 +11624,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 "Failed to resume typing after clarify response",
                                 exc_info=True,
                             )
+                    # The clarify resolver delivers ONLY the reply text to the
+                    # waiting agent — any freshly-fetched channel_context on
+                    # this event (thread backfill/delta) is never seen by it.
+                    # Committing the staged thread-watermark would then mark
+                    # that unseen backfill consumed, silently dropping it from
+                    # every future refresh. Drop the stage when context went
+                    # undelivered so it stays refresh-eligible and re-injects
+                    # on the next turn (duplicate context is recoverable;
+                    # silent loss is not). A reply with no recovered context
+                    # keeps its stage so the watermark still advances.
+                    if (getattr(event, "channel_context", None) or "").strip():
+                        _clarify_md = getattr(event, "metadata", None)
+                        if isinstance(_clarify_md, dict):
+                            _clarify_md.pop(STAGED_WATERMARK_COMMIT_KEY, None)
+                    # The reply passed authorization above and was consumed
+                    # by the clarify resolver — admit it so deferred adapter
+                    # side effects (e.g. Slack's staged thread-watermark
+                    # commit, fired by the base clarify-intercept's
+                    # completion hook) know it reached the agent.
+                    event.mark_turn_admitted()
                     # Acknowledge with empty string so adapters that emit
                     # the agent's response don't double-post.  The agent
                     # itself will produce the next user-facing message.
@@ -12963,6 +12984,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # (mirrors the same field's treatment in
             # build_session_context_prompt via _format_untrusted_prompt_value).
             _safe_user_name = neutralize_untrusted_inline_text(source.user_name)
+            # On Slack, expose the current author's verifiable user ID next to
+            # the display name (#17916): "mention me again" requests need a
+            # trusted `<@U...>` target for the CURRENT speaker — display names
+            # are ambiguous and historical mentions may point at someone else.
+            # The user_id comes from the Slack event envelope (not
+            # user-editable text), so it does not need neutralization.
+            if source.platform == Platform.SLACK and source.user_id:
+                _safe_user_name = (
+                    f"{_safe_user_name} | Slack user <@{source.user_id}>"
+                )
             message_text = f"[{_safe_user_name}] {message_text}"
 
         # Prepend channel context from history backfill (if any).  This
@@ -13399,6 +13430,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
+        # NOTE: turn admission (event.mark_turn_admitted()) is deferred to the
+        # point AFTER session resolution and inbound preprocessing succeed —
+        # just before the agent run below. Early returns here (a failed
+        # delegated-session resolution, inbound preprocessing yielding None)
+        # must NOT count as an admitted turn, or a deferred adapter side effect
+        # (e.g. Slack's staged thread-watermark commit) would fire for a
+        # message that never reached the agent.
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
         _msg_preview = (event.text or "")[:80].replace("\n", " ")
@@ -14375,6 +14413,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         if message_text is None:
             return
+
+        # Turn admission: session resolution and inbound preprocessing have
+        # succeeded and this message IS the turn — it is now going to the
+        # agent run below. Every pre-dispatch gate passed upstream
+        # (authorization, command routing, clarify/approval interception,
+        # busy queueing) and no early return above fired. Deferred adapter
+        # side effects (e.g. Slack's staged thread-watermark commit) key off
+        # this marker; an authorization rejection returns None upstream and
+        # never reaches here, so a SUCCESS processing outcome alone can never
+        # fake admission.
+        event.mark_turn_admitted()
 
         # Capture the platform event time as message metadata and keep the
         # persisted transcript clean (strip any leading timestamp prefix).

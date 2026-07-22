@@ -2169,3 +2169,270 @@ class TestMediaFallbackDoesNotLeakHostPath:
         sent_text = adapter.sent[0]["content"]
         assert "Here's the daily summary." in sent_text
         assert self.SENSITIVE_PATH not in sent_text
+
+
+# ---------------------------------------------------------------------------
+# Staged watermark commit — must follow consumed busy/debounced messages
+# ---------------------------------------------------------------------------
+
+
+import asyncio
+
+from unittest.mock import AsyncMock
+
+from gateway.config import Platform, PlatformConfig
+from gateway.platforms.base import (
+    MessageType as _MT,
+    SendResult,
+    STAGED_WATERMARK_COMMIT_KEY,
+    merge_pending_message_event,
+)
+from gateway.session import SessionSource
+
+
+def _staged_commit(watermark_ts, mark=False):
+    return {
+        "channel_id": "C1",
+        "thread_ts": "100.0",
+        "user_id": "U1",
+        "watermark_ts": watermark_ts,
+        "team_id": "T1",
+        "mark_rehydration_checked": mark,
+    }
+
+
+def _staged_event(
+    text, ts, mark=False, message_type=_MT.TEXT, media=None, channel_context=None
+):
+    return MessageEvent(
+        text=text,
+        message_type=message_type,
+        source=SessionSource(
+            platform=Platform.SLACK,
+            chat_id="C1",
+            chat_type="group",
+            user_id="U1",
+            thread_id="100.0",
+        ),
+        message_id=ts,
+        media_urls=list(media or []),
+        media_types=["image/png"] * len(media or []),
+        channel_context=channel_context,
+        metadata={STAGED_WATERMARK_COMMIT_KEY: _staged_commit(ts, mark)},
+    )
+
+
+class TestMergedPendingStagedWatermark:
+    """merge_pending_message_event updates text/media/message anchors when
+    events merge — the staged watermark commit must follow, or the merged
+    turn commits only the FIRST message's ts and every later merged message
+    stays refresh-eligible (duplicate context injection)."""
+
+    def test_merge_text_carries_latest_staged_watermark(self):
+        pending = {}
+        first = _staged_event("first thought", "101.0", mark=True)
+        second = _staged_event("second thought", "102.0", mark=False)
+
+        merge_pending_message_event(pending, "sk", first, merge_text=True)
+        merge_pending_message_event(pending, "sk", second, merge_text=True)
+
+        survivor = pending["sk"]
+        assert survivor is first  # merged INTO the buffered event
+        assert "second thought" in survivor.text
+        commit = survivor.metadata[STAGED_WATERMARK_COMMIT_KEY]
+        assert commit["watermark_ts"] == "102.0"
+        # The buffered event's staged rehydration pass survives the merge.
+        assert commit["mark_rehydration_checked"] is True
+
+    def test_merge_photo_burst_carries_latest_staged_watermark(self):
+        pending = {}
+        first = _staged_event(
+            "photo one", "101.0", mark=False,
+            message_type=_MT.PHOTO, media=["/tmp/a.png"],
+        )
+        second = _staged_event(
+            "photo two", "102.0", mark=False,
+            message_type=_MT.PHOTO, media=["/tmp/b.png"],
+        )
+
+        merge_pending_message_event(pending, "sk", first)
+        merge_pending_message_event(pending, "sk", second)
+
+        survivor = pending["sk"]
+        assert survivor is first
+        assert len(survivor.media_urls) == 2
+        commit = survivor.metadata[STAGED_WATERMARK_COMMIT_KEY]
+        assert commit["watermark_ts"] == "102.0"
+
+    def test_merge_text_retains_incoming_channel_context(self):
+        """Advancing the watermark past a later message must carry that
+        message's channel_context onto the survivor — else the watermark
+        claims coverage of a delta the merged turn never receives."""
+        pending = {}
+        first = _staged_event(
+            "first thought", "101.0", mark=True,
+            channel_context="[Recent channel messages]\n[Alice] earlier",
+        )
+        second = _staged_event(
+            "second thought", "102.0", mark=False,
+            channel_context="[Recent channel messages]\n[Bob] delta since",
+        )
+
+        merge_pending_message_event(pending, "sk", first, merge_text=True)
+        merge_pending_message_event(pending, "sk", second, merge_text=True)
+
+        survivor = pending["sk"]
+        commit = survivor.metadata[STAGED_WATERMARK_COMMIT_KEY]
+        assert commit["watermark_ts"] == "102.0"
+        # Both the buffered context and the later delta are retained.
+        assert "[Alice] earlier" in survivor.channel_context
+        assert "[Bob] delta since" in survivor.channel_context
+        # No duplication of the shared header line.
+        assert survivor.channel_context.count("[Recent channel messages]") == 1
+
+    def test_merge_photo_burst_retains_incoming_channel_context(self):
+        pending = {}
+        first = _staged_event(
+            "photo one", "101.0", mark=False,
+            message_type=_MT.PHOTO, media=["/tmp/a.png"],
+            channel_context="[Recent channel messages]\n[Alice] earlier",
+        )
+        second = _staged_event(
+            "photo two", "102.0", mark=False,
+            message_type=_MT.PHOTO, media=["/tmp/b.png"],
+            channel_context="[Recent channel messages]\n[Bob] delta since",
+        )
+
+        merge_pending_message_event(pending, "sk", first)
+        merge_pending_message_event(pending, "sk", second)
+
+        survivor = pending["sk"]
+        commit = survivor.metadata[STAGED_WATERMARK_COMMIT_KEY]
+        assert commit["watermark_ts"] == "102.0"
+        assert "[Alice] earlier" in survivor.channel_context
+        assert "[Bob] delta since" in survivor.channel_context
+
+    def test_merge_media_retains_incoming_channel_context(self):
+        """The mixed-media merge branch (existing text + incoming media) must
+        also carry incoming channel_context alongside the advanced watermark."""
+        pending = {}
+        first = _staged_event(
+            "just text", "101.0", mark=False,
+            channel_context="[Recent channel messages]\n[Alice] earlier",
+        )
+        second = _staged_event(
+            "with a doc", "102.0", mark=False,
+            media=["/tmp/report.pdf"],
+            channel_context="[Recent channel messages]\n[Bob] delta since",
+        )
+        second.media_types = ["application/pdf"]
+
+        merge_pending_message_event(pending, "sk", first)
+        merge_pending_message_event(pending, "sk", second)
+
+        survivor = pending["sk"]
+        commit = survivor.metadata[STAGED_WATERMARK_COMMIT_KEY]
+        assert commit["watermark_ts"] == "102.0"
+        assert "[Alice] earlier" in survivor.channel_context
+        assert "[Bob] delta since" in survivor.channel_context
+
+    def test_merge_does_not_duplicate_identical_channel_context(self):
+        """When the incoming context is already contained in the survivor's,
+        nothing is appended (no duplicate injection)."""
+        pending = {}
+        ctx = "[Recent channel messages]\n[Alice] earlier"
+        first = _staged_event("first", "101.0", mark=True, channel_context=ctx)
+        second = _staged_event("second", "102.0", mark=False, channel_context=ctx)
+
+        merge_pending_message_event(pending, "sk", first, merge_text=True)
+        merge_pending_message_event(pending, "sk", second, merge_text=True)
+
+        survivor = pending["sk"]
+        assert survivor.channel_context == ctx
+
+    def test_merge_adopts_incoming_context_when_survivor_had_none(self):
+        pending = {}
+        first = _staged_event("first", "101.0", mark=True, channel_context=None)
+        second = _staged_event(
+            "second", "102.0", mark=False,
+            channel_context="[Recent channel messages]\n[Bob] delta since",
+        )
+
+        merge_pending_message_event(pending, "sk", first, merge_text=True)
+        merge_pending_message_event(pending, "sk", second, merge_text=True)
+
+        survivor = pending["sk"]
+        assert survivor.channel_context == (
+            "[Recent channel messages]\n[Bob] delta since"
+        )
+
+
+class _DebounceAdapter(BasePlatformAdapter):
+    def __init__(self):
+        super().__init__(PlatformConfig(enabled=True, token="test"), Platform.SLACK)
+        self._busy_text_debounce_seconds = 0.05
+        self._busy_text_hard_cap_seconds = 0.2
+
+    async def connect(self):
+        return True
+
+    async def disconnect(self):
+        pass
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None):
+        return SendResult(success=True, message_id="m1")
+
+    async def get_chat_info(self, chat_id):
+        return {"id": chat_id}
+
+
+class TestTextDebounceStagedWatermark:
+    """Queue-mode busy text debounce merges follow-ups into the buffered
+    event (text + message_id already follow) — the staged watermark commit
+    must follow too."""
+
+    @pytest.mark.asyncio
+    async def test_debounce_merge_carries_latest_staged_watermark(self):
+        adapter = _DebounceAdapter()
+        first = _staged_event("first", "101.0", mark=True)
+        second = _staged_event("second", "102.0", mark=False)
+
+        await adapter._queue_text_debounce("sk", first)
+        await adapter._queue_text_debounce("sk", second)
+        try:
+            flushed = await adapter._flush_text_debounce_now("sk")
+        finally:
+            adapter._discard_text_debounce("sk")
+
+        assert flushed is True
+        merged = adapter._pending_messages["sk"]
+        assert merged.message_id == "102.0"
+        commit = merged.metadata[STAGED_WATERMARK_COMMIT_KEY]
+        assert commit["watermark_ts"] == "102.0"
+
+    @pytest.mark.asyncio
+    async def test_debounce_merge_retains_incoming_channel_context(self):
+        adapter = _DebounceAdapter()
+        first = _staged_event(
+            "first", "101.0", mark=True,
+            channel_context="[Recent channel messages]\n[Alice] earlier",
+        )
+        second = _staged_event(
+            "second", "102.0", mark=False,
+            channel_context="[Recent channel messages]\n[Bob] delta since",
+        )
+
+        await adapter._queue_text_debounce("sk", first)
+        await adapter._queue_text_debounce("sk", second)
+        try:
+            flushed = await adapter._flush_text_debounce_now("sk")
+        finally:
+            adapter._discard_text_debounce("sk")
+
+        assert flushed is True
+        merged = adapter._pending_messages["sk"]
+        commit = merged.metadata[STAGED_WATERMARK_COMMIT_KEY]
+        assert commit["watermark_ts"] == "102.0"
+        assert "[Alice] earlier" in merged.channel_context
+        assert "[Bob] delta since" in merged.channel_context
+        assert commit["mark_rehydration_checked"] is True

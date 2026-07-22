@@ -1989,6 +1989,27 @@ class MessageEvent:
         args = args.replace("\u2014\u2014", "--").replace("\u2014", "--").replace("\u2013", "-")
         return args
 
+    def mark_turn_admitted(self) -> None:
+        """Record that this message passed every gateway pre-dispatch gate.
+
+        Called ONLY by GatewayRunner \u2014 after authorization succeeded and the
+        message is actually being consumed (as an agent turn, or as an
+        accepted clarify reply). Platform adapters must never call this.
+        Deferred adapter side effects that must not run for rejected or
+        merely-queued messages (e.g. Slack's staged thread-watermark commit)
+        key off :attr:`turn_admitted`; the gateway's authorization rejection
+        returns None, which the base lifecycle classifies as a SUCCESS
+        outcome, so outcome alone cannot distinguish the two. Deliberately a
+        plain attribute rather than a dataclass field so adapter-side event
+        construction cannot pre-set it.
+        """
+        self._turn_admitted = True
+
+    @property
+    def turn_admitted(self) -> bool:
+        """True once the gateway runner admitted this message as a turn."""
+        return bool(getattr(self, "_turn_admitted", False))
+
 
 @dataclass
 class TextDebounceState:
@@ -2299,6 +2320,90 @@ def _invalidate_pending_stt_cache(event: MessageEvent) -> None:
             delattr(event, attr)
 
 
+# Metadata key under which a platform adapter stages a deferred thread-
+# watermark commit (Slack today). The adapter's on_processing_complete
+# applies it only after the turn is admitted (MessageEvent.turn_admitted)
+# and succeeded. When pending events merge, the surviving event must carry
+# the NEWEST staged commit — see _adopt_newer_staged_watermark.
+STAGED_WATERMARK_COMMIT_KEY = "staged_watermark_commit"
+
+
+def _merge_unique_channel_context(
+    existing_ctx: Optional[str], incoming_ctx: Optional[str]
+) -> Optional[str]:
+    """Return ``existing_ctx`` with any unique lines from ``incoming_ctx`` appended.
+
+    Channel context is a formatted backfill block (``[Recent channel messages]``
+    + per-sender lines). When two events merge, the later event's delta must
+    survive alongside the buffered context, but overlapping lines (a shared
+    header, a message both fetches captured) must not be duplicated. Dedup is
+    line-level and order-preserving: only incoming lines not already present
+    are appended.
+    """
+    incoming_ctx = incoming_ctx or ""
+    if not incoming_ctx.strip():
+        return existing_ctx
+    if not (existing_ctx or "").strip():
+        return incoming_ctx
+    if incoming_ctx == existing_ctx:
+        return existing_ctx
+    seen = set(existing_ctx.split("\n"))
+    appended = [
+        line for line in incoming_ctx.split("\n") if line.strip() and line not in seen
+    ]
+    if not appended:
+        return existing_ctx
+    return existing_ctx + "\n" + "\n".join(appended)
+
+
+def _adopt_newer_staged_watermark(
+    existing: MessageEvent, incoming: MessageEvent
+) -> None:
+    """Carry the newest staged watermark commit onto the surviving merged event.
+
+    ``incoming`` is the later-arriving message being merged into ``existing``
+    (merge helpers always merge in arrival order, and platform message ids
+    are monotonic per thread). The merged turn consumes BOTH messages, so
+    the survivor must stage the newer watermark_ts — otherwise the commit
+    stays at the first message's ts and every later merged message remains
+    refresh-eligible, re-injected as duplicate context by the next refresh.
+    A staged ``mark_rehydration_checked`` flag is preserved (OR) because the
+    event that staged the rehydration pass also contributes its injected
+    context to the merged turn.
+
+    Advancing the watermark and retaining the incoming ``channel_context`` are
+    one atomic step: the newer watermark_ts claims coverage up to the later
+    message, so that message's freshly-fetched backfill (delta) MUST land on
+    the survivor's turn or the watermark would mark unseen messages consumed —
+    silently dropping them from every future refresh.
+    """
+    incoming_md = getattr(incoming, "metadata", None)
+    incoming_commit = (
+        incoming_md.get(STAGED_WATERMARK_COMMIT_KEY)
+        if isinstance(incoming_md, dict)
+        else None
+    )
+    if not isinstance(incoming_commit, dict):
+        return
+    existing_md = getattr(existing, "metadata", None)
+    if not isinstance(existing_md, dict):
+        existing_md = {}
+        existing.metadata = existing_md
+    existing_commit = existing_md.get(STAGED_WATERMARK_COMMIT_KEY)
+    merged = dict(incoming_commit)
+    if isinstance(existing_commit, dict) and existing_commit.get(
+        "mark_rehydration_checked"
+    ):
+        merged["mark_rehydration_checked"] = True
+    existing_md[STAGED_WATERMARK_COMMIT_KEY] = merged
+    # Retain the later message's delta context atomically with the watermark
+    # advance, deduping shared lines so nothing is re-injected twice.
+    existing.channel_context = _merge_unique_channel_context(
+        getattr(existing, "channel_context", None),
+        getattr(incoming, "channel_context", None),
+    )
+
+
 def merge_pending_message_event(
     pending_messages: Dict[str, MessageEvent],
     session_key: str,
@@ -2331,6 +2436,7 @@ def merge_pending_message_event(
                 existing.context_refs.extend(event.context_refs)
             if event.text:
                 existing.text = BasePlatformAdapter._merge_caption(existing.text, event.text)
+            _adopt_newer_staged_watermark(existing, event)
             _invalidate_pending_stt_cache(existing)
             return
 
@@ -2352,6 +2458,7 @@ def merge_pending_message_event(
                 and event.message_type != MessageType.TEXT
             ):
                 existing.message_type = event.message_type
+            _adopt_newer_staged_watermark(existing, event)
             _invalidate_pending_stt_cache(existing)
             return
 
@@ -2364,6 +2471,7 @@ def merge_pending_message_event(
                 existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
             if getattr(event, "context_refs", None):
                 existing.context_refs.extend(event.context_refs)
+            _adopt_newer_staged_watermark(existing, event)
             return
 
     pending_messages[session_key] = event
@@ -4909,6 +5017,11 @@ class BasePlatformAdapter(ABC):
                 state.event.message_id = str(latest_message_id)
             if latest_anchor is not None and hasattr(state.event, "reply_to_message_id"):
                 state.event.reply_to_message_id = str(latest_anchor)
+            # The merged turn consumes this follow-up too — its staged
+            # watermark must follow the text/message-id, or the commit
+            # stays at the first buffered ts and this message remains
+            # refresh-eligible (duplicate context injection).
+            _adopt_newer_staged_watermark(state.event, event)
             state.last_ts = now
 
         if state.task is not None and not state.task.done():
@@ -5357,6 +5470,18 @@ class BasePlatformAdapter(ABC):
                                     message_id=_r.message_id,
                                     ttl_seconds=_eph_ttl,
                                 )
+                        # Consumed inline — _process_message_background never
+                        # runs for this event, so fire the completion hook
+                        # here for deferred per-message side effects (e.g.
+                        # Slack's staged watermark commit). Commits are
+                        # admission-gated downstream: a reply the runner
+                        # rejected (returned None without marking the event
+                        # turn-admitted) commits nothing.
+                        await self._run_processing_hook(
+                            "on_processing_complete",
+                            event,
+                            ProcessingOutcome.SUCCESS,
+                        )
                     except Exception as e:
                         logger.error(
                             "[%s] Clarify text-intercept dispatch failed: %s",

@@ -144,3 +144,235 @@ async def test_gateway_clarify_reply_resumes_typing_before_returning_empty_ack()
 
     assert result == ""
     assert "12345" not in adapter._typing_paused
+
+
+# ---------------------------------------------------------------------------
+# Turn-admission marker — set only by the gateway runner post-authorization
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_accepted_clarify_reply_marks_turn_admitted():
+    """An authorized, resolved clarify reply must carry the runner's
+    turn-admission marker so adapter-side deferred commits (e.g. Slack
+    thread watermarks) know the message was actually consumed."""
+    _clear_clarify_state()
+    from gateway.run import GatewayRunner
+    from tools import clarify_gateway as cm
+
+    adapter = _ClarifyBypassAdapter()
+    event = _event("the missing details")
+    assert event.turn_admitted is False
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._startup_restore_in_progress = False
+    runner._scale_to_zero_note_real_inbound = lambda: None
+    runner._is_user_authorized = lambda source: True
+    runner._session_key_for_source = lambda source: "clarify-admit"
+    runner._adapter_for_source = lambda source: adapter
+    runner._update_prompt_pending = {}
+
+    cm.register("clarify-admit-1", "clarify-admit", "What is missing?", None)
+    try:
+        with patch("hermes_cli.plugins.invoke_hook", return_value=[]):
+            result = await runner._handle_message(event)
+    finally:
+        _clear_clarify_state()
+
+    assert result == ""
+    assert event.turn_admitted is True
+
+
+@pytest.mark.asyncio
+async def test_unauthorized_message_is_not_turn_admitted():
+    """Gateway authorization rejection returns None (classified as a SUCCESS
+    outcome by the base lifecycle) — the admission marker must stay unset so
+    deferred adapter commits treat the message as rejected."""
+    from gateway.run import GatewayRunner
+
+    event = MessageEvent(
+        text="hello",
+        message_type=MessageType.TEXT,
+        source=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="G-1",
+            chat_type="group",
+            user_id="intruder",
+        ),
+        message_id="msg-x",
+    )
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._startup_restore_in_progress = False
+    runner._scale_to_zero_note_real_inbound = lambda: None
+    runner._is_user_authorized = lambda source: False
+
+    with patch("hermes_cli.plugins.invoke_hook", return_value=[]):
+        result = await runner._handle_message(event)
+
+    assert result is None
+    assert event.turn_admitted is False
+
+
+@pytest.mark.asyncio
+async def test_session_resolution_stage_does_not_admit_turn():
+    """Turn admission is deferred until session resolution AND inbound
+    preprocessing succeed. A failure during early session resolution (here,
+    Telegram topic recovery) must leave the message UNadmitted, so a deferred
+    adapter commit never fires for a turn that never reached the agent.
+
+    (The positive path — reaching the agent run marks the turn admitted — is
+    covered end-to-end in tests/gateway/test_turn_admission_lifecycle.py.)"""
+    from gateway.run import GatewayRunner
+
+    event = _event("run the report")
+    assert event.turn_admitted is False
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+
+    def _stop_here(source):
+        raise RuntimeError("stop-before-admission")
+
+    # Raising in the first session-resolution step proves admission has NOT
+    # yet been marked at this early stage.
+    runner._recover_telegram_topic_thread_id = _stop_here
+
+    with pytest.raises(RuntimeError, match="stop-before-admission"):
+        await GatewayRunner._handle_message_with_agent(
+            runner, event, event.source, "session-k", 1
+        )
+
+    assert event.turn_admitted is False
+
+
+# ---------------------------------------------------------------------------
+# Clarify reply that carries unseen channel_context — never commit over it
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_accepted_clarify_reply_with_context_drops_staged_watermark():
+    """A clarify reply may carry freshly-fetched channel_context that the
+    clarify resolver never delivers to the waiting agent (only the reply text
+    is passed through). Committing the staged thread-watermark would mark that
+    unseen backfill consumed — silently dropping it from every future refresh.
+    The staged commit must be dropped so the context stays refresh-eligible."""
+    _clear_clarify_state()
+    from gateway.platforms.base import STAGED_WATERMARK_COMMIT_KEY
+    from gateway.run import GatewayRunner
+    from tools import clarify_gateway as cm
+
+    adapter = _ClarifyBypassAdapter()
+    event = MessageEvent(
+        text="the missing details",
+        message_type=MessageType.TEXT,
+        source=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="12345",
+            chat_type="private",
+            user_id="user1",
+        ),
+        message_id="msg1",
+        channel_context="[Recent channel messages]\n[Alice] unseen backfill",
+        metadata={STAGED_WATERMARK_COMMIT_KEY: {"watermark_ts": "123.456"}},
+    )
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._startup_restore_in_progress = False
+    runner._scale_to_zero_note_real_inbound = lambda: None
+    runner._is_user_authorized = lambda source: True
+    runner._session_key_for_source = lambda source: "clarify-ctx"
+    runner._adapter_for_source = lambda source: adapter
+    runner._update_prompt_pending = {}
+
+    cm.register("clarify-ctx-1", "clarify-ctx", "What is missing?", None)
+    try:
+        with patch("hermes_cli.plugins.invoke_hook", return_value=[]):
+            result = await runner._handle_message(event)
+    finally:
+        _clear_clarify_state()
+
+    # Reply still accepted and admitted — only the unseen-context commit is cut.
+    assert result == ""
+    assert event.turn_admitted is True
+    assert STAGED_WATERMARK_COMMIT_KEY not in event.metadata
+
+
+@pytest.mark.asyncio
+async def test_accepted_clarify_reply_without_context_keeps_staged_watermark():
+    """A clarify reply with NO recovered channel_context has nothing unseen —
+    its staged watermark must survive so the thread watermark still advances
+    (steady-state) and the reply isn't re-injected later."""
+    _clear_clarify_state()
+    from gateway.platforms.base import STAGED_WATERMARK_COMMIT_KEY
+    from gateway.run import GatewayRunner
+    from tools import clarify_gateway as cm
+
+    adapter = _ClarifyBypassAdapter()
+    event = MessageEvent(
+        text="the missing details",
+        message_type=MessageType.TEXT,
+        source=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="12345",
+            chat_type="private",
+            user_id="user1",
+        ),
+        message_id="msg1",
+        channel_context=None,
+        metadata={STAGED_WATERMARK_COMMIT_KEY: {"watermark_ts": "123.456"}},
+    )
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._startup_restore_in_progress = False
+    runner._scale_to_zero_note_real_inbound = lambda: None
+    runner._is_user_authorized = lambda source: True
+    runner._session_key_for_source = lambda source: "clarify-noctx"
+    runner._adapter_for_source = lambda source: adapter
+    runner._update_prompt_pending = {}
+
+    cm.register("clarify-noctx-1", "clarify-noctx", "What is missing?", None)
+    try:
+        with patch("hermes_cli.plugins.invoke_hook", return_value=[]):
+            result = await runner._handle_message(event)
+    finally:
+        _clear_clarify_state()
+
+    assert result == ""
+    assert event.turn_admitted is True
+    assert STAGED_WATERMARK_COMMIT_KEY in event.metadata
+
+
+@pytest.mark.asyncio
+async def test_unauthorized_clarify_reply_with_context_not_admitted():
+    """An unauthorized sender's reply is rejected before the clarify-accept
+    path — it is never admitted, so its staged watermark commit never fires
+    (the deferred commit is gated on turn_admitted downstream)."""
+    _clear_clarify_state()
+    from gateway.platforms.base import STAGED_WATERMARK_COMMIT_KEY
+    from gateway.run import GatewayRunner
+
+    event = MessageEvent(
+        text="the missing details",
+        message_type=MessageType.TEXT,
+        source=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="G-1",
+            chat_type="group",
+            user_id="intruder",
+        ),
+        message_id="msg-x",
+        channel_context="[Recent channel messages]\n[Alice] unseen backfill",
+        metadata={STAGED_WATERMARK_COMMIT_KEY: {"watermark_ts": "123.456"}},
+    )
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._startup_restore_in_progress = False
+    runner._scale_to_zero_note_real_inbound = lambda: None
+    runner._is_user_authorized = lambda source: False
+
+    with patch("hermes_cli.plugins.invoke_hook", return_value=[]):
+        result = await runner._handle_message(event)
+
+    assert result is None
+    assert event.turn_admitted is False

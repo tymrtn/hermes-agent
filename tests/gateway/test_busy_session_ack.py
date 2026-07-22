@@ -123,6 +123,30 @@ class TestBusySessionAck:
         running_agent.interrupt.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_queued_busy_followup_is_not_turn_admitted(self):
+        """A busy-queued follow-up was NOT consumed as a turn yet — the
+        runner must not mark it admitted, so deferred adapter commits
+        (e.g. Slack thread watermarks) wait for its real turn (the drain
+        re-dispatches it through _handle_message later)."""
+        from gateway.run import GatewayRunner
+
+        runner, _sentinel = _make_runner()
+        adapter = _make_adapter()
+
+        event = _make_event(text="follow up while busy")
+        sk = build_session_key(event.source)
+
+        runner._busy_input_mode = "queue"
+        runner._running_agents[sk] = MagicMock()
+        runner.adapters[event.source.platform] = adapter
+
+        result = await GatewayRunner._handle_message(runner, event)
+
+        assert result is None
+        assert sk in adapter._pending_messages
+        assert event.turn_admitted is False
+
+    @pytest.mark.asyncio
     async def test_telegram_grace_followups_respect_queue_fifo(self, monkeypatch):
         """Rapid Telegram text follow-ups in queue mode must not merge."""
         from gateway.run import GatewayRunner
