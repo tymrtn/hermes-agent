@@ -16,11 +16,12 @@ name: Supply Chain Audit
 # ``review-labels.yml`` so it can be rerun independently.
 #
 # Outputs:
-#   review_status  — JSON array of status objects consumed by the review
-#                    comment assembler (scripts/ci/assemble_review_comment.py).
-#                    Each job (``scan``, ``dep-bounds``) emits its own
-#                    array; an ``aggregate`` job merges them into the
-#                    workflow-level output.
+#   review_status      — JSON array of status objects consumed by the review
+#                         comment assembler (scripts/ci/assemble_review_comment.py).
+#   critical_findings  — "true" when the narrow critical-pattern scan found
+#                         something. The review-label gate consumes this and
+#                         owns the action-required result, so adding
+#                         ``ci-reviewed`` can heal the run on rerun.
 
 on:
   workflow_call:
@@ -41,6 +42,9 @@ on:
       review_status:
         description: JSON array of review status objects for the review comment assembler.
         value: ${{ jobs.aggregate.outputs.review_status }}
+      critical_findings:
+        description: Whether the critical-pattern scan found a risk requiring maintainer review.
+        value: ${{ jobs.aggregate.outputs.critical_findings }}
 
 permissions:
   pull-requests: read
@@ -54,6 +58,7 @@ jobs:
     timeout-minutes: 15
     outputs:
       review_status: ${{ steps.emit-status.outputs.review_status }}
+      critical_findings: ${{ steps.scan.outputs.found }}
     steps:
       - name: Check ci-reviewed label
         id: label-check
@@ -170,6 +175,10 @@ jobs:
           FOUND: ${{ steps.scan.outputs.found }}
           REVIEWED: ${{ steps.label-check.outputs.ci_reviewed }}
         run: |
+          # The review-label gate owns the action-required result (so adding
+          # ci-reviewed can rerun the gate without rerunning the scanner);
+          # this status only carries the finding detail into the review
+          # comment via the hardened helper script.
           set -euo pipefail
           ARGS=(--output "$GITHUB_OUTPUT")
           if [ "$FOUND" = "true" ]; then
@@ -179,12 +188,6 @@ jobs:
             ARGS+=(--reviewed)
           fi
           python3 scripts/ci/supply_chain_status.py "${ARGS[@]}"
-
-      - name: Fail on critical findings
-        if: steps.emit-status.outputs.blocking == 'true'
-        run: |
-          echo "::error::CRITICAL supply chain risk patterns detected in this PR. See the review comment for details."
-          exit 1
 
   dep-bounds:
     name: Check PyPI dependency upper bounds
@@ -272,12 +275,14 @@ jobs:
     timeout-minutes: 15
     outputs:
       review_status: ${{ steps.merge.outputs.review_status }}
+      critical_findings: ${{ steps.merge.outputs.critical_findings }}
     steps:
       - name: Merge review statuses
         id: merge
         env:
           SCAN_STATUS: ${{ needs.scan.outputs.review_status }}
           DEP_STATUS: ${{ needs.dep-bounds.outputs.review_status }}
+          CRITICAL_FINDINGS: ${{ needs.scan.outputs.critical_findings }}
         run: |
           python3 - <<'PYEOF'
           import json, os
@@ -296,4 +301,5 @@ jobs:
 
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
               f.write(f"review_status={json.dumps(merged)}\n")
+              f.write("critical_findings=" + os.environ.get("CRITICAL_FINDINGS", "false") + "\n")
           PYEOF
