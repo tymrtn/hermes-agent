@@ -338,6 +338,17 @@ locales = ["locales/*.yaml"]
 # entry; tests/test_packaging_metadata.py enforces an entry per optional-mcps/<name>.
 "optional-mcps/linear" = ["optional-mcps/linear/manifest.yaml"]
 "optional-mcps/n8n" = ["optional-mcps/n8n/manifest.yaml"]
+# native/fts5_cjk — loadable CJK-bigram FTS5 tokenizer. build.sh compiles
+# libfts5_cjk.so from these sources into ~/.hermes/lib/. native/ is a bare data
+# directory (no __init__.py), invisible to packages.find/package-data, so — same
+# as locales/ above — the sources must ship as data-files (wheel) and be grafted
+# in MANIFEST.in (sdist); otherwise downstream packagers can never build the
+# extension and CJK session search falls back to LIKE scans. One target per
+# directory because data-files flattens globs into a single target dir. The *.so
+# glob ships a locally-built library only if one is present — the .so is
+# gitignored, so clean builds match nothing and the wheel stays pure.
+"native/fts5_cjk" = ["native/fts5_cjk/*.c", "native/fts5_cjk/*.so", "native/fts5_cjk/build.sh", "native/fts5_cjk/README.md"]
+"native/fts5_cjk/vendor" = ["native/fts5_cjk/vendor/*.h"]
 
 [tool.setuptools.package-data]
 hermes_cli = ["web_dist/**/*", "tui_dist/**/*", "scripts/install.sh", "scripts/install.ps1"]

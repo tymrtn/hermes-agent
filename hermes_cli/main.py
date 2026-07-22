@@ -690,6 +690,16 @@ try:
                 _early_redact = _early_sec_cfg.get("redact_secrets")
                 if _early_redact is not None:
                     os.environ["HERMES_REDACT_SECRETS"] = str(_early_redact).lower()
+        # Bridge sessions.cjk_fts / sessions.search_slow_ms to their env carriers
+        # before any standalone `hermes sessions ...` command opens a SessionDB.
+        # The gateway/cli.py surfaces already bridge these; this covers the
+        # primary hermes_cli entrypoint. Config-authoritative; a raw env carrier
+        # survives when config omits the knob.
+        try:
+            from hermes_cli.config import apply_session_index_env_bridge
+            apply_session_index_env_bridge(_early_cfg_raw)
+        except Exception:
+            pass  # best-effort — carriers fall back to hermes_state defaults
         _early_net_cfg = _early_cfg_raw.get("network", {})
         if isinstance(_early_net_cfg, dict) and _early_net_cfg.get("force_ipv4"):
             _FORCE_IPV4_EARLY = True
@@ -6405,6 +6415,10 @@ def _print_fts_optimize_available_notice() -> None:
             or db._conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' "
                 "AND name LIKE 'fts\\_v22\\_trash\\_%' ESCAPE '\\' LIMIT 1"
+            ).fetchone()
+            or db._conn.execute(
+                "SELECT 1 FROM state_meta WHERE key IN "
+                "('fts_cjk_rebuild_high_water', 'fts_cjk_stale') LIMIT 1"
             ).fetchone()
         )
     except Exception:

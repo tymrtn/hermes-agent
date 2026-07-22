@@ -267,6 +267,64 @@ def test_locale_catalogs_ship_in_both_wheel_and_sdist():
     assert on_disk, "expected locales/*.yaml catalogs on disk"
 
 
+def test_native_fts5_cjk_sources_ship_in_both_wheel_and_sdist():
+    """The CJK-bigram FTS5 tokenizer sources must reach packaged installs.
+
+    native/fts5_cjk/ holds the loadable-extension C source, vendored SQLite
+    headers, and build.sh (which compiles libfts5_cjk.so into ~/.hermes/lib/).
+    native/ is a bare data directory (no __init__.py), invisible to
+    packages.find and package-data, so — like locales/ — it must be declared as
+    setuptools data-files (wheel) AND grafted in MANIFEST.in (sdist). Otherwise
+    downstream packagers building from the wheel/sdist can never build the
+    extension and CJK session search silently falls back to LIKE scans.
+
+    Binaries are never committed (the .so is gitignored); packaging ships the
+    SOURCE, plus a *.so pattern that picks up a locally-built library only if
+    one is present.
+    """
+    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    data_files = data["tool"]["setuptools"].get("data-files", {})
+
+    # Wheel channel: the top-level source dir and the vendored-headers dir each
+    # need their own data-files target (data-files flattens globs into one dir).
+    top = data_files.get("native/fts5_cjk", [])
+    assert any(g.endswith("*.c") for g in top), (
+        "data-files 'native/fts5_cjk' must ship the *.c extension source (wheel)"
+    )
+    assert any(g.endswith("build.sh") for g in top), (
+        "data-files 'native/fts5_cjk' must ship build.sh (wheel)"
+    )
+    assert any(g.endswith("*.so") for g in top), (
+        "data-files 'native/fts5_cjk' must carry the *.so pattern so a "
+        "locally-built runtime library is shipped when generated (wheel)"
+    )
+    vendor = data_files.get("native/fts5_cjk/vendor", [])
+    assert any(g.endswith("*.h") for g in vendor), (
+        "data-files 'native/fts5_cjk/vendor' must ship the vendored *.h "
+        "SQLite headers (wheel)"
+    )
+
+    # Sdist channel: MANIFEST.in must graft the native/ tree.
+    manifest = (REPO_ROOT / "MANIFEST.in").read_text(encoding="utf-8")
+    assert "graft native" in manifest, (
+        "MANIFEST.in must `graft native` so the sdist ships the fts5_cjk sources"
+    )
+
+    # The globs must actually match on-disk sources.
+    root = REPO_ROOT / "native" / "fts5_cjk"
+    assert list(root.glob("*.c")), "expected native/fts5_cjk/*.c on disk"
+    assert (root / "build.sh").exists(), "expected native/fts5_cjk/build.sh on disk"
+    assert list((root / "vendor").glob("*.h")), (
+        "expected native/fts5_cjk/vendor/*.h on disk"
+    )
+
+    # No committed binary: the generated .so must stay gitignored.
+    gitignore = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8")
+    assert "native/fts5_cjk/*.so" in gitignore, (
+        "the generated libfts5_cjk.so must remain gitignored (no committed binary)"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Dependency-pin consistency: pyproject extras <-> tools/lazy_deps.py
 #

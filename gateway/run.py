@@ -91,6 +91,7 @@ _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"|no\s+auxiliary\s+llm\s+provider\s+configured"
     r"|auto-lowered\s+compression\s+threshold"
     r"|compacting\s+context\s+[—-]\s+summarizing\s+earlier\s+conversation"
+    r"|resumed\s+after\s+\d+s\s+idle\s+[—-]\s+compacting"
     r"|preflight\s+compression"
     r"|session\s+compressed\s+\d+\s+times"
     r"|rate\s+limited\.\s+waiting\s+\d"
@@ -1604,6 +1605,14 @@ def _bridge_max_turns_from_config(home: "Path") -> None:
     agent_cfg = cfg.get("agent", {})
     if isinstance(agent_cfg, dict) and "max_turns" in agent_cfg:
         os.environ["HERMES_MAX_ITERATIONS"] = str(agent_cfg["max_turns"])
+    # config-authoritative knobs for the session-search index (config.yaml
+    # sessions.* wins over stale env; env stays the cross-process carrier).
+    sessions_cfg = cfg.get("sessions", {})
+    if isinstance(sessions_cfg, dict):
+        if "cjk_fts" in sessions_cfg:
+            os.environ["HERMES_CJK_FTS"] = str(sessions_cfg["cjk_fts"])
+        if "search_slow_ms" in sessions_cfg:
+            os.environ["HERMES_SEARCH_SLOW_MS"] = str(sessions_cfg["search_slow_ms"])
 
 
 def _current_max_iterations() -> int:
@@ -1885,6 +1894,16 @@ if _config_path.exists():
             if "gateway_auto_continue_freshness" in _agent_cfg:
                 os.environ["HERMES_AUTO_CONTINUE_FRESHNESS"] = str(
                     _agent_cfg["gateway_auto_continue_freshness"]
+                )
+        # config-authoritative knobs for the session-search index; same
+        # bridge semantics as the agent settings above.
+        _sessions_cfg = _cfg.get("sessions", {})
+        if _sessions_cfg and isinstance(_sessions_cfg, dict):
+            if "cjk_fts" in _sessions_cfg:
+                os.environ["HERMES_CJK_FTS"] = str(_sessions_cfg["cjk_fts"])
+            if "search_slow_ms" in _sessions_cfg:
+                os.environ["HERMES_SEARCH_SLOW_MS"] = str(
+                    _sessions_cfg["search_slow_ms"]
                 )
         _display_cfg = _cfg.get("display", {})
         if _display_cfg and isinstance(_display_cfg, dict):
@@ -19206,10 +19225,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         ("compression", "enabled"),
         ("compression", "threshold"),
         ("compression", "model_thresholds"),
+        ("compression", "threshold_tokens"),
         ("compression", "codex_gpt55_autoraise"),
         ("compression", "codex_app_server_auto"),
         ("compression", "target_ratio"),
         ("compression", "protect_last_n"),
+        ("compression", "idle_compact_after_seconds"),
         ("agent", "disabled_toolsets"),
         ("memory", "provider"),
         ("checkpoints", "enabled"),
@@ -20096,6 +20117,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         turn makes its first API call (#9051).
         """
         if interrupt_depth == 0:
+            # Anchor the idle-compaction gap (agent/turn_context.py) on the
+            # PREVIOUS turn's last activity before we reset the watchdog clock
+            # below. Without this, resetting _last_activity_ts to now zeroes the
+            # gap and idle compaction (compression.idle_compact_after_seconds)
+            # could never fire in the gateway — the trigger only ever saw a
+            # fresh timestamp.
+            agent._idle_gap_anchor_ts = getattr(agent, "_last_activity_ts", None)
             agent._last_activity_ts = time.time()
             agent._last_activity_desc = "starting new turn (cached)"
             # Reset the SessionDB flush cursor so the new turn's messages are
@@ -20103,6 +20131,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # cause `_flush_messages_to_session_db` to skip new rows (#44327).
             if hasattr(agent, "_last_flushed_db_idx"):
                 agent._last_flushed_db_idx = 0
+        else:
+            # Interrupt-recursive turn (depth > 0): _last_activity_ts is
+            # deliberately preserved above so the watchdog keeps accumulating
+            # stuck-turn idle time. But a nested turn is NOT a fresh resume, so
+            # pin the idle anchor to now — otherwise the prologue would measure
+            # the pre-resume idle gap and idle-compact mid-interrupt.
+            agent._idle_gap_anchor_ts = time.time()
         agent._api_call_count = 0
 
     def _commit_memory_before_soft_evict(self, agent: Any, key: str) -> None:
