@@ -31,7 +31,11 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional
 
-from agent.conversation_compression import conversation_history_after_compression
+from agent.conversation_compression import (
+    IDLE_COMPACTION_STATUS_TEMPLATE,
+    PREFLIGHT_COMPRESSION_STATUS_TEMPLATE,
+    conversation_history_after_compression,
+)
 from agent.iteration_budget import IterationBudget
 from agent.memory_manager import build_memory_context_block
 from agent.model_metadata import (
@@ -371,6 +375,7 @@ def build_turn_context(
         set_runtime_main(
             getattr(agent, "provider", "") or "",
             getattr(agent, "model", "") or "",
+            requested_provider=getattr(agent, "requested_provider", "") or "",
             base_url=getattr(agent, "base_url", "") or "",
             api_key=getattr(agent, "api_key", "") or "",
             api_mode=getattr(agent, "api_mode", "") or "",
@@ -668,8 +673,9 @@ def build_turn_context(
                     agent.session_id or "none",
                 )
                 agent._emit_status(
-                    f"💤 Resumed after {int(_idle_gap)}s idle — compacting "
-                    f"~{_idle_tokens:,} tokens before continuing."
+                    IDLE_COMPACTION_STATUS_TEMPLATE.format(
+                        idle_seconds=int(_idle_gap), tokens=_idle_tokens
+                    )
                 )
                 _idle_input = messages
                 messages, active_system_prompt = agent._compress_context(
@@ -776,9 +782,10 @@ def build_turn_context(
                 f"{_compressor.context_length:,}",
             )
             agent._emit_status(
-                f"📦 Preflight compression: ~{_preflight_tokens:,} tokens "
-                f">= {_compressor.threshold_tokens:,} threshold. "
-                "This may take a moment."
+                PREFLIGHT_COMPRESSION_STATUS_TEMPLATE.format(
+                    tokens=_preflight_tokens,
+                    threshold=_compressor.threshold_tokens,
+                )
             )
             # Preflight passes honor the same configured per-turn cap
             # (compression.max_attempts) as the loop's compression sites;

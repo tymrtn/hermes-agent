@@ -30,6 +30,8 @@ _PROCESS_ID = uuid.uuid4().hex
 
 
 def _connect() -> sqlite3.Connection:
+    from hermes_state import apply_wal_with_fallback
+
     db_path = Path(EXECUTIONS_FILE)
     if db_path == _INITIAL_EXECUTIONS_FILE:
         db_path = get_hermes_home().resolve() / "cron" / "executions.db"
@@ -37,7 +39,7 @@ def _connect() -> sqlite3.Connection:
     conn = sqlite3.connect(db_path, timeout=5)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout=5000")
-    conn.execute("PRAGMA journal_mode=WAL")
+    apply_wal_with_fallback(conn, db_label="cron/executions.db")
     conn.execute("PRAGMA synchronous=FULL")
     conn.execute(
         """CREATE TABLE IF NOT EXISTS executions (

@@ -284,6 +284,7 @@ async def test_streaming_delivery_blocks_media_path_outside_allowed_roots(tmp_pa
     # 2026-05; this test pins strict on explicitly.)
     monkeypatch.setenv("HERMES_MEDIA_DELIVERY_STRICT", "1")
     monkeypatch.setenv("HERMES_MEDIA_TRUST_RECENT_FILES", "0")
+    monkeypatch.delenv("HERMES_MEDIA_ALLOW_DIRS", raising=False)
     adapter = SimpleNamespace(
         name="test",
         extract_media=BasePlatformAdapter.extract_media,
