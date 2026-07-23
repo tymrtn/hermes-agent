@@ -960,6 +960,15 @@ def kanban_command(args: argparse.Namespace) -> int:
             )
         return 0
 
+    # Fast-fail for clearer CLI UX only. The durable trust boundary is lower in
+    # hermes_cli.kanban_db, because children can import DB mutators directly.
+    if _is_delegated_child_cli_mutation(args):
+        print(
+            "kanban: delegate_task child contexts cannot mutate Kanban tasks via the CLI",
+            file=sys.stderr,
+        )
+        return 1
+
     # Board-management commands operate on board metadata and the persisted
     # current-board pointer itself. They must ignore the shared `--board`
     # task-routing override; otherwise `/kanban --board beta boards show`
@@ -1055,11 +1064,15 @@ def kanban_command(args: argparse.Namespace) -> int:
         # every `hermes kanban repair` into "could not initialize database"
         # without ever reaching the repair path.
         if action == "repair":
-            return _cmd_repair(args)
+            try:
+                return _cmd_repair(args)
+            finally:
+                _restore_board_env()
         try:
             kb.init_db()
         except Exception as exc:
             print(f"kanban: could not initialize database: {exc}", file=sys.stderr)
+            _restore_board_env()
             return 1
 
         handlers = {
@@ -1170,6 +1183,66 @@ def _emit_board_scope_notice(args: argparse.Namespace, *, explicit_board: bool) 
             "cross-board mutation explicit.",
             file=sys.stderr,
         )
+
+_DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
+    "init",
+    "create",
+    "swarm",
+    "assign",
+    "reclaim",
+    "reassign",
+    "link",
+    "unlink",
+    "claim",
+    "comment",
+    "attach",
+    "attach-rm",
+    "complete",
+    "edit",
+    "block",
+    "schedule",
+    "unblock",
+    "promote",
+    "archive",
+    "dispatch",
+    "daemon",
+    "repair",
+    "heartbeat",
+    "notify-subscribe",
+    "notify-unsubscribe",
+    "specify",
+    "decompose",
+    "gc",
+})
+
+_DELEGATED_CHILD_DENIED_BOARD_ACTIONS: frozenset[str] = frozenset({
+    "create",
+    "new",
+    "rm",
+    "remove",
+    "delete",
+    "switch",
+    "use",
+    "rename",
+    "set-default-workdir",
+})
+
+
+def _is_delegated_child_cli_mutation(args: argparse.Namespace) -> bool:
+    action = getattr(args, "kanban_action", None)
+    if action == "boards":
+        boards_action = getattr(args, "boards_action", None) or "list"
+        if boards_action not in _DELEGATED_CHILD_DENIED_BOARD_ACTIONS:
+            return False
+    elif action not in _DELEGATED_CHILD_DENIED_ACTIONS:
+        return False
+    try:
+        from agent.delegation_context import is_delegated_child_process_context
+
+        return is_delegated_child_process_context()
+    except Exception:
+        return bool(os.environ.get("HERMES_DELEGATED_CHILD_CONTEXT"))
+
 
 # ---------------------------------------------------------------------------
 # Boards management (hermes kanban boards …)

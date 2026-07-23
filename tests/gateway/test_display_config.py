@@ -259,6 +259,35 @@ class TestPlatformDefaults:
         for plat in ("signal", "bluebubbles", "weixin", "wecom", "dingtalk"):
             assert resolve_display_setting({}, plat, "tool_progress") == "off", plat
 
+    def test_photon_defaults_to_low_tier(self):
+        """Photon (managed iMessage) is a permanent-message mobile inbox like
+        BlueBubbles, so it must default to TIER_LOW: tool progress off, no
+        interim scratch commentary, no heartbeats, no busy-ack iteration detail.
+        Regression guard for the Photon launch shipping without a
+        _PLATFORM_DEFAULTS entry, which left it inheriting the noisy global
+        ('all') defaults and spamming the iMessage thread."""
+        from gateway.display_config import resolve_display_setting
+
+        assert resolve_display_setting({}, "photon", "tool_progress") == "off"
+        assert resolve_display_setting({}, "photon", "interim_assistant_messages") is False
+        assert resolve_display_setting({}, "photon", "long_running_notifications") is False
+        assert resolve_display_setting({}, "photon", "busy_ack_detail") is False
+        assert resolve_display_setting({}, "photon", "streaming") is False
+
+    def test_whatsapp_cloud_locked_to_low_tier_until_edit_message_lands(self):
+        """Regression guard: ``whatsapp_cloud`` must stay TIER_LOW until the
+        adapter implements edit_message. Without an edit endpoint, raising
+        the tier to MEDIUM would spam separate WhatsApp messages for every
+        tool-progress update, which is the exact failure mode this entry
+        exists to avoid.
+
+        When/if Cloud's edit_message lands, update _PLATFORM_DEFAULTS to
+        TIER_MEDIUM and update this test to assert ``"new"`` accordingly.
+        """
+        from gateway.display_config import resolve_display_setting
+        assert resolve_display_setting({}, "whatsapp_cloud", "tool_progress") == "off"
+        assert resolve_display_setting({}, "whatsapp_cloud", "streaming") is False
+
     def test_minimal_tier_platforms(self):
         """Email, SMS, webhook default to 'off' tool progress."""
         from gateway.display_config import resolve_display_setting

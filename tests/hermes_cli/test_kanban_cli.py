@@ -361,6 +361,32 @@ def test_board_override_restores_prior_env_value(kanban_home, monkeypatch):
     assert os.environ.get("HERMES_KANBAN_BOARD") == "default"
 
 
+def test_board_override_restores_env_after_repair(kanban_home, monkeypatch):
+    kb.create_board("alpha")
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    monkeypatch.setattr(kc, "_cmd_repair", lambda _args: 0)
+    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
+    sub = parser.add_subparsers(dest="command")
+    kc.build_parser(sub)
+
+    args = parser.parse_args(["kanban", "--board", "alpha", "repair"])
+    assert kc.kanban_command(args) == 0
+    assert os.environ.get("HERMES_KANBAN_BOARD") is None
+
+
+def test_board_override_restores_env_when_init_fails(kanban_home, monkeypatch):
+    kb.create_board("alpha")
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    monkeypatch.setattr(kb, "init_db", lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
+    sub = parser.add_subparsers(dest="command")
+    kc.build_parser(sub)
+
+    args = parser.parse_args(["kanban", "--board", "alpha", "list"])
+    assert kc.kanban_command(args) == 1
+    assert os.environ.get("HERMES_KANBAN_BOARD") is None
+
+
 # ---------------------------------------------------------------------------
 # Integration with the COMMAND_REGISTRY
 # ---------------------------------------------------------------------------
