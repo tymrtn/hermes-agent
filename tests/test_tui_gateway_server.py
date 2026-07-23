@@ -5997,6 +5997,8 @@ def test_compress_session_history_passes_force():
     agent.context_compressor = None  # keep _get_usage on the simple path
     compressed = [{"role": "user", "content": "summary"}]
     agent._compress_context.return_value = (compressed, "")
+    # Explicit non-lock-skip: MagicMock getattr would return a truthy mock.
+    agent._compression_skipped_due_to_lock = False
     session = _session(
         agent=agent,
         history=[
@@ -6027,6 +6029,8 @@ def test_compress_session_history_works_when_auto_compaction_disabled():
     agent.context_compressor = None  # keep _get_usage on the simple path
     compressed = [{"role": "user", "content": "summary"}]
     agent._compress_context.return_value = (compressed, "")
+    # Explicit non-lock-skip: MagicMock getattr would return a truthy mock.
+    agent._compression_skipped_due_to_lock = False
     session = _session(
         agent=agent,
         history=[
