@@ -3586,6 +3586,26 @@ def test_connect_falls_back_to_delete_on_locking_protocol(tmp_path, monkeypatch,
     # Clear module cache so a fresh connect() is attempted
     kb._INITIALIZED_PATHS.clear()
 
+    # Pin the non-vulnerable SQLite branch: on builds with the WAL-reset bug
+    # apply_wal_with_fallback short-circuits to DELETE before ever attempting
+    # WAL, so the locking-protocol path under test is unreachable. Re-arm the
+    # once-per-process warning dedup for kanban labels — earlier tests in this
+    # file have already consumed it (same idiom as
+    # tests/test_hermes_state_wal_fallback.py).
+    import hermes_state as _hermes_state
+
+    monkeypatch.setattr(
+        _hermes_state,
+        "is_sqlite_wal_reset_vulnerable",
+        lambda version_info=None: False,
+    )
+    for _warned in (
+        _hermes_state._wal_fallback_warned_paths,
+        _hermes_state._wal_reset_bug_warned_paths,
+    ):
+        for _label in [label for label in _warned if "kanban.db" in label]:
+            _warned.discard(_label)
+
     real_connect = _sqlite3.connect
 
     class _WalBlockingConnection(_sqlite3.Connection):

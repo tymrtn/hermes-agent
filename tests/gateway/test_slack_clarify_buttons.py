@@ -440,6 +440,204 @@ class TestSlackClarifyOtherFlow:
 
 
 # ===========================================================================
+# Multi-workspace scoping — send/action route through the workspace client
+# and use (team_id, ts) markers (d)
+# ===========================================================================
+
+class TestSlackClarifyMultiWorkspace:
+    def setup_method(self):
+        _clear_clarify_state()
+
+    def _make_two_team_adapter(self):
+        adapter = _make_adapter()
+        adapter._team_clients["T2"] = AsyncMock()
+        return adapter
+
+    @pytest.mark.asyncio
+    async def test_send_routes_to_metadata_team_client_and_stores_scoped_marker(self):
+        """Metadata team id must pick the workspace client (not the channel
+        map / primary fallback) and the double-click marker must be scoped."""
+        adapter = self._make_two_team_adapter()
+        t2_client = adapter._team_clients["T2"]
+        t2_client.chat_postMessage = AsyncMock(return_value={"ts": "77.88"})
+        t1_client = adapter._team_clients["T1"]
+        t1_client.chat_postMessage = AsyncMock(return_value={"ts": "0.0"})
+
+        # C9 is deliberately absent from _channel_team: only the metadata
+        # team id can route this send to the right workspace token.
+        result = await adapter.send_clarify(
+            chat_id="C9",
+            question="Which?",
+            choices=["a", "b"],
+            clarify_id="cidW",
+            session_key="sk-w",
+            metadata={"slack_team_id": "T2"},
+        )
+
+        assert result.success is True
+        t2_client.chat_postMessage.assert_called_once()
+        t1_client.chat_postMessage.assert_not_called()
+        assert adapter._clarify_resolved.get(("T2", "77.88")) is False
+        assert "77.88" not in adapter._clarify_resolved
+
+    @pytest.mark.asyncio
+    async def test_action_consumes_scoped_marker_and_updates_via_team_client(self):
+        from tools import clarify_gateway as cm
+
+        adapter = self._make_two_team_adapter()
+        _attach_auth_runner(adapter)
+        cm.register("cidW2", "sk-w2", "Pick", ["red", "green"])
+        adapter._clarify_resolved[("T2", "10.1")] = False
+
+        t2_client = adapter._team_clients["T2"]
+        t2_client.chat_update = AsyncMock()
+        t1_client = adapter._team_clients["T1"]
+        t1_client.chat_update = AsyncMock()
+
+        ack = AsyncMock()
+        body = {
+            "team": {"id": "T2"},
+            "message": {"ts": "10.1", "blocks": [
+                {"type": "section", "text": {"type": "mrkdwn", "text": "❓ Pick"}},
+            ]},
+            "channel": {"id": "C9"},
+            "user": {"name": "norbert", "id": "U_N"},
+        }
+        action = {"action_id": "hermes_clarify_choice_1", "value": "cidW2|1"}
+
+        await adapter._handle_clarify_action(ack, body, action)
+
+        with cm._lock:
+            entry = cm._entries.get("cidW2")
+        assert entry is not None
+        assert entry.response == "green"
+        assert entry.event.is_set()
+        assert adapter._clarify_resolved[("T2", "10.1")] is True
+        t2_client.chat_update.assert_called_once()
+        t1_client.chat_update.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_action_authorizes_with_team_scope(self):
+        adapter = self._make_two_team_adapter()
+        captured = {}
+
+        def _capture_auth(source):
+            captured["source"] = source
+            return True
+
+        _attach_auth_runner(adapter, auth_fn=_capture_auth)
+        adapter._clarify_resolved[("T2", "11.1")] = False
+        adapter._team_clients["T2"].chat_update = AsyncMock()
+
+        ack = AsyncMock()
+        body = {
+            "team": {"id": "T2"},
+            "message": {"ts": "11.1", "blocks": []},
+            "channel": {"id": "C9"},
+            "user": {"name": "n", "id": "U_N"},
+        }
+        action = {"action_id": "hermes_clarify_other", "value": "cidAuthW|other"}
+
+        await adapter._handle_clarify_action(ack, body, action)
+
+        assert captured["source"].scope_id == "T2"
+
+    @pytest.mark.asyncio
+    async def test_action_ignores_colliding_marker_from_other_workspace(self):
+        """A click from workspace T2 must not consume T1's marker for the
+        same (workspace-local) message timestamp."""
+        from tools import clarify_gateway as cm
+
+        adapter = self._make_two_team_adapter()
+        _attach_auth_runner(adapter)
+        cm.register("cidCol", "sk-col", "Pick", ["x"])
+        adapter._clarify_resolved[("T1", "12.1")] = False
+
+        t1_client = adapter._team_clients["T1"]
+        t1_client.chat_update = AsyncMock()
+        t2_client = adapter._team_clients["T2"]
+        t2_client.chat_update = AsyncMock()
+
+        ack = AsyncMock()
+        body = {
+            "team": {"id": "T2"},
+            "message": {"ts": "12.1", "blocks": []},
+            "channel": {"id": "C9"},
+            "user": {"name": "n", "id": "U_N"},
+        }
+        action = {"action_id": "hermes_clarify_choice_0", "value": "cidCol|0"}
+
+        await adapter._handle_clarify_action(ack, body, action)
+
+        with cm._lock:
+            entry = cm._entries.get("cidCol")
+        assert not entry.event.is_set()
+        assert adapter._clarify_resolved.get(("T1", "12.1")) is False
+        t1_client.chat_update.assert_not_called()
+        t2_client.chat_update.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_action_bare_marker_fallback_for_metadata_poor_send(self):
+        """A clarify stored without a team id (metadata-poor send) must still
+        resolve when the click event carries one (mirrors approval)."""
+        from tools import clarify_gateway as cm
+
+        adapter = self._make_two_team_adapter()
+        _attach_auth_runner(adapter)
+        cm.register("cidBare", "sk-bare", "Pick", ["only"])
+        adapter._clarify_resolved["13.1"] = False
+
+        t1_client = adapter._team_clients["T1"]
+        t1_client.chat_update = AsyncMock()
+
+        ack = AsyncMock()
+        body = {
+            "team": {"id": "T1"},
+            "message": {"ts": "13.1", "blocks": []},
+            "channel": {"id": "C1"},
+            "user": {"name": "n", "id": "U_N"},
+        }
+        action = {"action_id": "hermes_clarify_choice_0", "value": "cidBare|0"}
+
+        await adapter._handle_clarify_action(ack, body, action)
+
+        with cm._lock:
+            entry = cm._entries.get("cidBare")
+        assert entry.event.is_set()
+        assert adapter._clarify_resolved["13.1"] is True
+        t1_client.chat_update.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_scoped_marker_wins_when_bare_marker_coexists(self):
+        """A scoped prompt must not consume or later fall through to an
+        unrelated metadata-poor prompt with the same Slack-local timestamp."""
+        from tools import clarify_gateway as cm
+
+        adapter = self._make_two_team_adapter()
+        _attach_auth_runner(adapter)
+        cm.register("cidBoth", "sk-both", "Pick", ["only"])
+        adapter._clarify_resolved[("T2", "14.1")] = False
+        adapter._clarify_resolved["14.1"] = False
+        adapter._team_clients["T2"].chat_update = AsyncMock()
+
+        ack = AsyncMock()
+        body = {
+            "team": {"id": "T2"},
+            "message": {"ts": "14.1", "blocks": []},
+            "channel": {"id": "C9"},
+            "user": {"name": "n", "id": "U_N"},
+        }
+        action = {"action_id": "hermes_clarify_choice_0", "value": "cidBoth|0"}
+
+        await adapter._handle_clarify_action(ack, body, action)
+        await adapter._handle_clarify_action(ack, body, action)
+
+        assert adapter._clarify_resolved[("T2", "14.1")] is True
+        assert adapter._clarify_resolved["14.1"] is False
+        adapter._team_clients["T2"].chat_update.assert_awaited_once()
+
+
+# ===========================================================================
 # Base text-fallback unchanged for platforms without an override (e)
 # ===========================================================================
 
