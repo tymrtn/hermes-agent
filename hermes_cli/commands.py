@@ -118,6 +118,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("subgoal", "Add or manage extra criteria on the active goal", "Session",
                args_hint="[text | remove N | clear]"),
     CommandDef("status", "Show session, model, token, and context info", "Session"),
+    CommandDef("egress", "Show Docker egress proxy status", "Session",
+               args_hint="[status]", subcommands=("status",)),
     CommandDef("whoami", "Show your slash command access (admin / user)", "Info"),
     CommandDef("profile", "Show active profile name and home directory", "Info"),
     CommandDef("sethome", "Set this chat as the home channel", "Session",
@@ -565,6 +567,7 @@ _TELEGRAM_MENU_PRIORITY = (
     "new",
     "stop",
     "status",
+    "egress",
     "resume",
     "sessions",
     "model",
@@ -1174,7 +1177,8 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #   - debug: the log/report upload surface; reached via /hermes debug on Slack.
 #   - version: available through /hermes version; keeping it non-native avoids
 #     displacing an action command at Slack's 50-command cap.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "version"})
+#   - egress: Docker-only proxy status; reachable as /hermes egress on Slack.
+_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "version", "egress"})
 
 
 def _sanitize_slack_name(raw: str) -> str:

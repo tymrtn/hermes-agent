@@ -259,12 +259,7 @@ def _load_dotenv_with_fallback(path: Path, *, override: bool) -> None:
 def _sanitize_env_file_if_needed(path: Path) -> None:
     """Pre-sanitize a .env file before python-dotenv reads it.
 
-    python-dotenv does not handle corrupted lines where multiple
-    KEY=VALUE pairs are concatenated on a single line (missing newline).
-    This produces mangled values — e.g. a bot token duplicated 8×
-    (see #8908).
-
-    Also strips embedded null bytes which crash ``os.environ[k] = v``
+    Strips embedded null bytes which crash ``os.environ[k] = v``
     with ``ValueError: embedded null byte`` — typically introduced by
     copy-pasting API keys from terminals or rich-text editors.
 
@@ -274,9 +269,8 @@ def _sanitize_env_file_if_needed(path: Path) -> None:
     to the errors=replace corruption path. Order of BOM checks matters:
     UTF-32-LE's BOM starts with UTF-16-LE's FF FE.
 
-    We delegate to ``hermes_cli.config._sanitize_env_lines`` which
-    already knows all valid Hermes env-var names and can split
-    concatenated lines correctly.
+    ``hermes_cli.config._sanitize_env_lines`` normalizes line endings while
+    treating content after the first ``=`` as opaque for boundary discovery.
     """
     if not path.exists():
         return
@@ -405,7 +399,7 @@ def load_hermes_dotenv(
     if user_env not in env_paths:
         env_paths.append(user_env)
 
-    # Fix corrupted .env files before python-dotenv parses them (#8908).
+    # Normalize safe formatting and remove invalid NUL bytes before parsing.
     for env_path in env_paths:
         if env_path.exists():
             _sanitize_env_file_if_needed(env_path)
