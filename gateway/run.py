@@ -6315,10 +6315,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # still small enough to never threaten memory.
     _BUSY_QUEUE_MAX_PENDING = 32
 
-    def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> None:
+    def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> bool:
         adapter = self._adapter_for_source(event.source)
         if not adapter:
-            return
+            return False
         # #28503 — Previously this called ``merge_pending_message_event``
         # with the default ``merge_text=False``, which silently OVERWROTE
         # the single pending slot when consecutive text messages arrived
@@ -6342,7 +6342,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 event,
                 merge_text=event.message_type == MessageType.TEXT,
             )
-            return
+            return True
 
         if self._queue_depth(session_key, adapter=adapter) >= self._BUSY_QUEUE_MAX_PENDING:
             logger.warning(
@@ -6350,9 +6350,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key,
                 self._BUSY_QUEUE_MAX_PENDING,
             )
-            return
+            return False
 
         self._enqueue_fifo(session_key, event, adapter)
+        return True
 
     async def _handle_busy_slash_command_followup(self, event: MessageEvent, session_key: str) -> None:
         """Treat a blocked mid-run slash command as an intentional follow-up."""
@@ -6383,8 +6384,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_key: str,
         *,
         force_busy_ack: bool = False,
+        already_queued: bool = False,
     ) -> bool:
-        # --- Authorization gate (#17775) ---
+        # ``force_busy_ack`` / ``already_queued`` are set only by the clarify-
+        # supersede path in _handle_message. ``already_queued`` means the caller
+        # durably queued the event before releasing the clarify waiter, so this
+        # handler may interrupt/ack but must not enqueue or redirect it again.
+
         # The cold path (_handle_message) checks _is_user_authorized before
         # creating a session.  The busy path must enforce the same check;
         # otherwise unauthorized users in shared threads (Slack/Telegram/Discord)
@@ -6564,7 +6570,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             and effective_mode != "steer"
             and not force_busy_ack
         ):
-            return False
+            if not force_busy_ack:
+                return False
+            # Clarify-supersede path: honor the text-queue preference here
+            # (FIFO queue + queue ack below) instead of deferring to the base
+            # adapter, which is not in the call chain for this message.
+            effective_mode = "queue"
+
+        if already_queued and effective_mode == "steer":
+            # The follow-up is already durably queued as the next turn and the
+            # current turn is an ending clarify wait — steering into it is
+            # meaningless.  Collapse to queue; interrupt mode still interrupts.
+            effective_mode = "queue"
 
         # Steer mode: inject mid-run via running_agent.steer() instead of
         # queueing + interrupting.  If the agent isn't running yet
@@ -6624,6 +6641,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 effective_mode = "queue"
         elif (
             effective_mode == "interrupt"
+            and not already_queued
             and event.message_type == MessageType.TEXT
             and not event.media_urls
             and not event.media_types
@@ -6653,7 +6671,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # turn (#43066 sub-bug 2). The FIFO path gives each text its own
         # turn in arrival order while still preserving photo-burst / album
         # merge semantics for media.
-        if not steered and not redirected:
+        #
+        # already_queued: the clarify-supersede caller pre-enqueued this event
+        # (durably claiming it before releasing the clarify waiter), so we must
+        # not enqueue it a second time.
+        if not steered and not redirected and not already_queued:
             self._queue_or_replace_pending_event(session_key, event)
 
         is_queue_mode = effective_mode == "queue"
@@ -12333,17 +12355,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         except Exception:
             _pending_clarify = None
-        if _pending_clarify is not None and _clarify_mod is not None:
+        if (
+            not is_internal
+            and _pending_clarify is not None
+            and _clarify_mod is not None
+        ):
             _raw_clarify_reply = (event.text or "").strip()
             # Skip slash commands — the user clearly wanted to issue a
             # command, not answer the clarify.  Leave the clarify pending
             # so the user can retry; if it times out, the agent unblocks
             # with an empty response.
             if _raw_clarify_reply and not _raw_clarify_reply.startswith("/"):
-                _resolved = _clarify_mod.resolve_text_response_for_session(
-                    _quick_key, _raw_clarify_reply,
+                _clarify_outcome = _clarify_mod.resolve_or_classify_text_response(
+                    _quick_key,
+                    _raw_clarify_reply,
+                    claim_unrelated=(
+                        not self._draining
+                        and _quick_key in getattr(self, "_running_agents", {})
+                    ),
+                    clarify_id=_pending_clarify.clarify_id,
                 )
-                if _resolved:
+                if _clarify_outcome == _clarify_mod.TEXT_RESOLVED:
                     logger.info(
                         "Gateway intercepted clarify text response (session=%s, id=%s)",
                         _quick_key, _pending_clarify.clarify_id,
@@ -12386,6 +12418,86 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Acknowledge with empty string so adapters that emit
                     # the agent's response don't double-post.  The agent
                     # itself will produce the next user-facing message.
+                    return ""
+                if _clarify_outcome == _clarify_mod.TEXT_INVALID_SELECTION:
+                    # A mistyped / out-of-range numbered selection (e.g. "3" for
+                    # a 2-choice prompt, or a malformed multi-select "1,9"). The
+                    # user is trying to answer, so keep the clarify PENDING for a
+                    # retry — do NOT supersede it, and do NOT strand this reply
+                    # behind the blocked turn. Intercept it silently; the buttons
+                    # stay visible so the user can pick a valid option.
+                    logger.info(
+                        "Gateway retained pending clarify after invalid selection "
+                        "reply (session=%s, id=%s)",
+                        _quick_key, _pending_clarify.clarify_id,
+                    )
+                    return ""
+                # Unrelated prose during a pending NATIVE button/choice clarify
+                # (buttons rendered, awaiting_text=False). #62034 keeps it from
+                # being swallowed as the answer — but the agent worker thread is
+                # still blocked on the clarify Event (up to the 1h clarify
+                # timeout). Falling through here would queue the prose *behind*
+                # that blocked turn. ``resolve_or_classify_text_response``
+                # atomically claims the unresolved prompt before returning
+                # TEXT_UNRELATED, excluding racing button/Other callbacks. Then:
+                #
+                #   1. durably queue the follow-up exactly once;
+                #   2. apply canonical busy interrupt/ack semantics while the
+                #      clarify waiter is still blocked; and
+                #   3. release the claimed clarify with the established empty
+                #      no-response sentinel. If queue admission fails, cancel the
+                #      claim and leave the prompt pending for a safe retry.
+                #
+                # Auth was already enforced above, so an unauthorized sender
+                # never reaches this supersede. We only hand off when the session
+                # is genuinely busy (agent blocked on the clarify); a stale entry
+                # with no running agent falls through to a normal fresh turn.
+                if (
+                    _clarify_outcome == _clarify_mod.TEXT_UNRELATED
+                    and not self._draining
+                    and not _pending_clarify.awaiting_text
+                    and _pending_clarify.choices
+                    and _quick_key in getattr(self, "_running_agents", {})
+                ):
+                    _queued = self._queue_or_replace_pending_event(_quick_key, event)
+                    if not _queued:
+                        _clarify_mod.cancel_claimed_choice_clarify(
+                            _quick_key, _pending_clarify.clarify_id,
+                        )
+                        logger.warning(
+                            "Could not queue prose that would supersede clarify "
+                            "for session %s; leaving prompt pending",
+                            _quick_key,
+                        )
+                        return (
+                            "Queue is full — answer the pending prompt or use /stop, "
+                            "then resend."
+                        )
+                    _clarify_adapter = self._adapter_for_source(source)
+                    if _clarify_adapter:
+                        try:
+                            _clarify_adapter.resume_typing_for_chat(source.chat_id)
+                        except Exception:
+                            logger.debug(
+                                "Failed to resume typing after clarify supersede",
+                                exc_info=True,
+                            )
+                    try:
+                        await self._handle_active_session_busy_message(
+                            event, _quick_key, force_busy_ack=True, already_queued=True,
+                        )
+                    finally:
+                        _superseded = int(
+                            _clarify_mod.release_claimed_choice_clarify(
+                                _quick_key, _pending_clarify.clarify_id,
+                            )
+                        )
+                    logger.info(
+                        "Gateway superseded pending native-choice clarify with "
+                        "unrelated prose (session=%s, id=%s, superseded=%d); "
+                        "prose queued as the next turn",
+                        _quick_key, _pending_clarify.clarify_id, _superseded,
+                    )
                     return ""
 
         # Intercept messages that are responses to a pending /reload-mcp
@@ -12499,6 +12611,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._release_running_agent_state(_quick_key)
 
         if _quick_key in self._running_agents:
+            if is_internal:
+                # Synthetic completions are cascading turns, never user
+                # steering.  Queue them silently before the active-session
+                # command/interrupt path; this remains true while a clarify is
+                # pending and prevents background output from cancelling or
+                # interrupting the waiting turn.
+                self._queue_or_replace_pending_event(_quick_key, event)
+                return None
+
             if event.get_command() == "status":
                 return await self._handle_status_command(event)
 

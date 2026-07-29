@@ -369,6 +369,246 @@ class TestCoverageGaps:
         assert cm.get_notify("unregistered") is None
 
 
+class TestResolveOrClassifyTextResponse:
+    """Three-way classification of a typed reply against a pending clarify:
+    resolved / invalid_selection / unrelated / no_pending."""
+
+    def setup_method(self):
+        _clear_clarify_state()
+
+    def test_no_pending_returns_no_pending(self):
+        from tools import clarify_gateway as cm
+
+        assert cm.resolve_or_classify_text_response("sk-none", "hi") == cm.TEXT_NO_PENDING
+
+    def test_numeric_selection_resolves(self):
+        from tools import clarify_gateway as cm
+
+        cm.register("id-r", "sk-r", "Pick", ["X", "Y"])
+        assert cm.resolve_or_classify_text_response("sk-r", "2") == cm.TEXT_RESOLVED
+        assert cm.wait_for_response("id-r", timeout=0.1) == "Y"
+
+    def test_exact_label_resolves(self):
+        from tools import clarify_gateway as cm
+
+        cm.register("id-l", "sk-l", "Pick", ["Alpha", "Beta"])
+        assert cm.resolve_or_classify_text_response("sk-l", "beta") == cm.TEXT_RESOLVED
+        assert cm.wait_for_response("id-l", timeout=0.1) == "Beta"
+
+    def test_open_ended_free_text_resolves(self):
+        from tools import clarify_gateway as cm
+
+        cm.register("id-o", "sk-o", "Name it?", None)  # awaiting_text
+        assert cm.resolve_or_classify_text_response("sk-o", "hermes-ux") == cm.TEXT_RESOLVED
+        assert cm.wait_for_response("id-o", timeout=0.1) == "hermes-ux"
+
+    def test_out_of_range_keeps_entry_unresolved(self):
+        from tools import clarify_gateway as cm
+
+        entry = cm.register("id-oob2", "sk-oob2", "Pick", ["X", "Y"])
+        assert (
+            cm.resolve_or_classify_text_response("sk-oob2", "3")
+            == cm.TEXT_INVALID_SELECTION
+        )
+        assert not entry.event.is_set()  # waiter not released
+
+    def test_malformed_multiselect_is_invalid_selection(self):
+        from tools import clarify_gateway as cm
+
+        entry = cm.register("id-ms", "sk-ms", "Pick some", ["A", "B"], multi_select=True)
+        assert (
+            cm.resolve_or_classify_text_response("sk-ms", "1,9")
+            == cm.TEXT_INVALID_SELECTION
+        )
+        assert not entry.event.is_set()
+
+    def test_prose_is_unrelated(self):
+        from tools import clarify_gateway as cm
+
+        entry = cm.register("id-p", "sk-p", "Pick", ["X", "Y"])
+        assert (
+            cm.resolve_or_classify_text_response("sk-p", "just checking the UI")
+            == cm.TEXT_UNRELATED
+        )
+        # Classification must NOT resolve or release the entry.
+        assert not entry.event.is_set()
+
+    def test_prose_containing_a_digit_is_unrelated(self):
+        from tools import clarify_gateway as cm
+
+        cm.register("id-p2", "sk-p2", "Pick", ["X", "Y"])
+        assert (
+            cm.resolve_or_classify_text_response("sk-p2", "present 3 buttons")
+            == cm.TEXT_UNRELATED
+        )
+
+    def test_already_resolved_entry_is_no_longer_pending(self):
+        from tools import clarify_gateway as cm
+
+        cm.register("id-done", "sk-done", "Pick", ["X", "Y"])
+        assert cm.resolve_gateway_clarify("id-done", "X") is True
+        assert (
+            cm.resolve_or_classify_text_response("sk-done", "3")
+            == cm.TEXT_NO_PENDING
+        )
+
+    def test_stale_observed_id_never_claims_newer_prompt(self):
+        from tools import clarify_gateway as cm
+
+        first = cm.register("id-first", "sk-fifo", "First", ["A", "B"])
+        second = cm.register("id-second", "sk-fifo", "Second", ["C", "D"])
+        assert cm.resolve_gateway_clarify(first.clarify_id, "A") is True
+        assert (
+            cm.resolve_or_classify_text_response(
+                "sk-fifo",
+                "new direction",
+                claim_unrelated=True,
+                clarify_id=first.clarify_id,
+            )
+            == cm.TEXT_NO_PENDING
+        )
+        assert second.superseding is False
+        assert not second.event.is_set()
+
+    def test_looks_like_selection_attempt_variants(self):
+        from tools import clarify_gateway as cm
+
+        assert cm._looks_like_selection_attempt("3") is True
+        assert cm._looks_like_selection_attempt("1,9") is True
+        assert cm._looks_like_selection_attempt("1 3") is True
+        assert cm._looks_like_selection_attempt("2.") is True
+        assert cm._looks_like_selection_attempt("-1") is True
+        assert cm._looks_like_selection_attempt("+3") is True
+        assert cm._looks_like_selection_attempt("3)") is True
+        assert cm._looks_like_selection_attempt("1.5") is True
+        assert cm._looks_like_selection_attempt("2026-07-29") is False
+        assert cm._looks_like_selection_attempt("3:30") is False
+        assert cm._looks_like_selection_attempt("buttons") is False
+        assert cm._looks_like_selection_attempt("present 3 buttons") is False
+        assert cm._looks_like_selection_attempt("") is False
+
+
+class TestSupersedePendingChoiceClarify:
+    """supersede_pending_choice_clarify must release ONLY unresolved entries
+    with the empty sentinel and never clobber a resolved answer (button race)."""
+
+    def setup_method(self):
+        _clear_clarify_state()
+
+    def test_supersedes_unresolved_entry(self):
+        from tools import clarify_gateway as cm
+
+        cm.register("s-1", "sk-s1", "Pick", ["A", "B"])
+        result_box = {}
+
+        def waiter():
+            result_box["r"] = cm.wait_for_response("s-1", timeout=5.0)
+
+        t = threading.Thread(target=waiter)
+        t.start()
+        time.sleep(0.05)
+
+        assert cm.supersede_pending_choice_clarify("sk-s1", "s-1") == 1
+        t.join(timeout=5.0)
+        assert not t.is_alive()
+        assert result_box["r"] == ""  # empty/no-response sentinel
+        with cm._lock:
+            assert cm._entries.get("s-1") is None
+
+    def test_does_not_clobber_button_resolved_entry(self):
+        """A button tap resolved the entry (event+response set) but the waiter
+        has not yet removed it from the index. A racing supersede must preserve
+        the real button answer, not overwrite it with ''."""
+        from tools import clarify_gateway as cm
+
+        cm.register("s-2", "sk-s2", "Pick", ["A", "B"])
+        # Button tap resolves the entry; the waiter has not run cleanup yet.
+        assert cm.resolve_gateway_clarify("s-2", "B") is True
+
+        # Racing prose follow-up tries to supersede — must be a no-op.
+        assert cm.supersede_pending_choice_clarify("sk-s2", "s-2") == 0
+
+        with cm._lock:
+            entry = cm._entries.get("s-2")
+        assert entry is not None
+        assert entry.event.is_set()
+        assert entry.response == "B"  # button choice preserved, not ""
+
+    def test_button_resolution_and_supersede_are_atomic(self):
+        """Force the old interleaving: supersede races while button set() is paused."""
+        from tools import clarify_gateway as cm
+
+        entry = cm.register("s-race", "sk-race", "Pick", ["A", "B"])
+        original_set = entry.event.set
+        resolver_entered = threading.Event()
+        release_resolver = threading.Event()
+
+        def blocked_set():
+            resolver_entered.set()
+            assert release_resolver.wait(timeout=2.0)
+            original_set()
+
+        entry.event.set = blocked_set
+        results = {}
+        resolver = threading.Thread(
+            target=lambda: results.setdefault(
+                "resolved", cm.resolve_gateway_clarify("s-race", "B")
+            )
+        )
+        resolver.start()
+        assert resolver_entered.wait(timeout=2.0)
+
+        superseder = threading.Thread(
+            target=lambda: results.setdefault(
+                "superseded",
+                cm.supersede_pending_choice_clarify("sk-race", "s-race"),
+            )
+        )
+        superseder.start()
+        # The resolver owns the clarify lock until response + event publication.
+        time.sleep(0.05)
+        assert superseder.is_alive()
+
+        release_resolver.set()
+        resolver.join(timeout=2.0)
+        superseder.join(timeout=2.0)
+        assert not resolver.is_alive()
+        assert not superseder.is_alive()
+        assert results == {"resolved": True, "superseded": 0}
+        assert entry.response == "B"
+        assert entry.event.is_set()
+
+    def test_other_cannot_switch_to_text_after_supersede_claim(self):
+        from tools import clarify_gateway as cm
+
+        entry = cm.register("s-other", "sk-other", "Pick", ["A", "B"])
+        assert (
+            cm.resolve_or_classify_text_response(
+                "sk-other", "new direction", claim_unrelated=True
+            )
+            == cm.TEXT_UNRELATED
+        )
+        assert entry.superseding is True
+        assert cm.mark_awaiting_text("s-other") is False
+        assert entry.awaiting_text is False
+        assert cm.release_claimed_choice_clarify("sk-other", "s-other") is True
+        assert entry.event.is_set()
+
+    def test_only_targets_named_clarify_id(self):
+        from tools import clarify_gateway as cm
+
+        e1 = cm.register("s-a", "sk-multi", "Q1", ["A"])
+        e2 = cm.register("s-b", "sk-multi", "Q2", ["B"])
+        assert cm.supersede_pending_choice_clarify("sk-multi", "s-a") == 1
+        assert e1.event.is_set()
+        assert not e2.event.is_set()  # untouched
+
+    def test_returns_zero_for_unknown_session(self):
+        from tools import clarify_gateway as cm
+
+        assert cm.supersede_pending_choice_clarify("nope") == 0
+
+
 class TestClarifyTimeoutResolution:
     """resolve_clarify_timeout is the single source of truth for the clarify
     timeout, shared by the CLI, TUI/desktop, and messaging-gateway paths."""

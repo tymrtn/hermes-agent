@@ -32,6 +32,7 @@ Two delivery paths from the adapter:
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -55,6 +56,7 @@ class _ClarifyEntry:
     event: threading.Event = field(default_factory=threading.Event)
     response: Optional[str] = None
     awaiting_text: bool = False  # set when user picked "Other" or clarify is open-ended
+    superseding: bool = False  # two-phase prose handoff owns this unresolved prompt
 
     def signature(self) -> Dict[str, object]:
         return {
@@ -169,11 +171,15 @@ def resolve_gateway_clarify(clarify_id: str, response: str) -> bool:
     """
     with _lock:
         entry = _entries.get(clarify_id)
-        if entry is None:
+        if entry is None or entry.event.is_set() or entry.superseding:
             return False
-    entry.response = str(response) if response is not None else ""
-    entry.event.set()
-    return True
+        # Response assignment and event publication must be atomic with
+        # supersede_pending_choice_clarify().  Otherwise a racing prose
+        # follow-up can release the waiter with the empty sentinel after a
+        # button resolver has already claimed success.
+        entry.response = str(response) if response is not None else ""
+        entry.event.set()
+        return True
 
 
 def get_pending_for_session(
@@ -195,6 +201,8 @@ def get_pending_for_session(
         for cid in ids:
             entry = _entries.get(cid)
             if entry is None:
+                continue
+            if entry.event.is_set() or entry.superseding:
                 continue
             if include_choice_prompts or entry.awaiting_text:
                 return entry
@@ -334,6 +342,168 @@ def resolve_text_response_for_session(session_key: str, response: str) -> bool:
     )
 
 
+def _looks_like_selection_attempt(response: str) -> bool:
+    """True when a typed reply reads as an attempt to pick numbered choices.
+
+    A selection attempt is one or more integers separated by commas and/or
+    whitespace (``"3"``, ``"1,9"``, ``"1 3"``, ``"2."``) — the shape a user
+    types to pick from a numbered list.  Anything containing words is prose,
+    not a selection.  Callers use this to keep a clarify *pending* when the
+    reply is a mistyped/out-of-range selection (so the user can retry) while
+    letting genuine prose supersede it.
+    """
+    stripped = str(response).strip()
+    # Restrict this to recognizable numbered-choice syntax. Signed numbers,
+    # decimal-looking typos, trailing list punctuation, comma lists, and
+    # whitespace lists remain retryable selection attempts. Dates, times,
+    # ticket identifiers, and prose containing digits are unrelated input and
+    # must supersede rather than disappear behind the pending prompt.
+    token = r"[+-]?\d+(?:\.\d+)?[.)]?"
+    return bool(stripped) and re.fullmatch(rf"{token}(?:[\s,]+{token})*", stripped) is not None
+
+
+# Outcomes returned by :func:`resolve_or_classify_text_response`.
+TEXT_RESOLVED = "resolved"
+TEXT_INVALID_SELECTION = "invalid_selection"
+TEXT_UNRELATED = "unrelated"
+TEXT_NO_PENDING = "no_pending"
+
+
+def resolve_or_classify_text_response(
+    session_key: str,
+    response: str,
+    *,
+    claim_unrelated: bool = False,
+    clarify_id: Optional[str] = None,
+) -> str:
+    """Atomically resolve, classify, and optionally claim typed prose.
+
+    ``claim_unrelated=True`` reserves an unrelated native-choice prompt for the
+    gateway's prose handoff before this function releases ``_lock``.  This makes
+    a racing button tap or ``Other`` callback mutually exclusive with the
+    handoff while leaving the clarify waiter blocked until the prose is queued.
+    ``clarify_id`` pins classification to the entry observed by the caller, so
+    cleanup of that entry cannot accidentally claim a newer prompt in the same
+    session.
+    """
+    with _lock:
+        entry = None
+        candidate_ids = (
+            [clarify_id]
+            if clarify_id is not None
+            else list(_session_index.get(session_key, []) or [])
+        )
+        for cid in candidate_ids:
+            candidate = _entries.get(cid)
+            if (
+                candidate is not None
+                and candidate.session_key == session_key
+                and not candidate.event.is_set()
+                and not candidate.superseding
+            ):
+                entry = candidate
+                break
+        if entry is None:
+            return TEXT_NO_PENDING
+
+        coerced = _coerce_text_response(entry, response)
+        if coerced is not None:
+            entry.response = str(coerced)
+            entry.event.set()
+            return TEXT_RESOLVED
+
+        if _looks_like_selection_attempt(response):
+            return TEXT_INVALID_SELECTION
+        if (
+            claim_unrelated
+            and entry.choices
+            and not entry.awaiting_text
+        ):
+            entry.superseding = True
+        return TEXT_UNRELATED
+
+
+def claim_pending_choice_clarify(session_key: str, clarify_id: str) -> bool:
+    """Atomically reserve one unresolved native-choice prompt for supersede.
+
+    Claiming does not release the waiter.  The gateway can therefore queue the
+    replacement prose and apply busy/interrupt semantics while the old turn is
+    still safely blocked, then call :func:`release_claimed_choice_clarify`.
+    A racing button resolution and this claim are mutually exclusive.
+    """
+    with _lock:
+        if clarify_id not in (_session_index.get(session_key) or []):
+            return False
+        entry = _entries.get(clarify_id)
+        if (
+            entry is None
+            or entry.event.is_set()
+            or entry.superseding
+            or not entry.choices
+            or entry.awaiting_text
+        ):
+            return False
+        entry.superseding = True
+        return True
+
+
+def cancel_claimed_choice_clarify(session_key: str, clarify_id: str) -> bool:
+    """Return an unreleased supersede claim to normal pending state."""
+    with _lock:
+        entry = _entries.get(clarify_id)
+        if entry is None or entry.session_key != session_key or not entry.superseding:
+            return False
+        if entry.event.is_set():
+            return False
+        entry.superseding = False
+        return True
+
+
+def release_claimed_choice_clarify(session_key: str, clarify_id: str) -> bool:
+    """Finish a successful supersede claim and release its waiter with ``""``."""
+    with _lock:
+        entry = _entries.get(clarify_id)
+        if entry is None or entry.session_key != session_key or not entry.superseding:
+            return False
+        entry.response = ""
+        entry.event.set()
+        _entries.pop(clarify_id, None)
+        remaining = _session_index.get(session_key)
+        if remaining and clarify_id in remaining:
+            remaining.remove(clarify_id)
+            if not remaining:
+                _session_index.pop(session_key, None)
+        return True
+
+
+def supersede_pending_choice_clarify(
+    session_key: str, clarify_id: Optional[str] = None
+) -> int:
+    """Supersede pending clarify entries for a session by unblocking their
+    waiter with the established empty/no-response sentinel — but ONLY entries
+    that have not already been resolved.
+
+    Unlike :func:`clear_session`, this never overwrites a set event/response.
+    A concurrent button tap (or a prior text reply) may have already called
+    ``resolve_gateway_clarify`` — setting ``entry.response`` and ``entry.event``
+    — while the waiter has not yet removed the entry from ``_session_index``.
+    An immediate prose follow-up must not clobber that real answer with ``""``.
+
+    When ``clarify_id`` is given, only that entry is considered.  Returns the
+    number of entries actually superseded (0 if the matching entry was already
+    resolved or absent).
+    """
+    with _lock:
+        ids = list(_session_index.get(session_key, []) or [])
+    superseded = 0
+    for cid in ids:
+        if clarify_id is not None and cid != clarify_id:
+            continue
+        if claim_pending_choice_clarify(session_key, cid):
+            superseded += int(release_claimed_choice_clarify(session_key, cid))
+    return superseded
+
+
 def mark_awaiting_text(clarify_id: str) -> bool:
     """Flip an entry into text-capture mode (user picked the 'Other' button).
 
@@ -341,7 +511,7 @@ def mark_awaiting_text(clarify_id: str) -> bool:
     """
     with _lock:
         entry = _entries.get(clarify_id)
-        if entry is None:
+        if entry is None or entry.event.is_set() or entry.superseding:
             return False
         entry.awaiting_text = True
         return True
@@ -351,7 +521,11 @@ def has_pending(session_key: str) -> bool:
     """Return True when this session has at least one pending clarify entry."""
     with _lock:
         ids = _session_index.get(session_key) or []
-        return any(_entries.get(cid) is not None for cid in ids)
+        return any(
+            entry is not None and not entry.event.is_set() and not entry.superseding
+            for cid in ids
+            if (entry := _entries.get(cid)) is not None
+        )
 
 
 def clear_session(session_key: str) -> int:
