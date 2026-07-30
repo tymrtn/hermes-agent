@@ -10,7 +10,9 @@ Architecture (two transports):
   **Local backend (UDS):**
   1. Parent generates a `hermes_tools.py` stub module with UDS RPC functions
   2. Parent opens a Unix domain socket and starts an RPC listener thread
-  3. Parent spawns a child process that runs the LLM's script
+  3. Parent spawns a stable per-profile launcher (``<HERMES_HOME>/helpers/
+     <profile>.py``) and streams the LLM's program to it over stdin, so every
+     local run reuses one script path / OS-permission identity (issue #6037)
   4. Tool calls travel over the UDS back to the parent for dispatch
 
   **Remote backends (file-based RPC):**
@@ -34,6 +36,7 @@ import json
 import logging
 import os
 import platform
+import re
 import secrets
 import shlex
 import socket
@@ -1182,6 +1185,173 @@ def _execute_remote(
 
 
 # ---------------------------------------------------------------------------
+# Stable per-profile launcher (macOS TCC identity — issue #6037)
+# ---------------------------------------------------------------------------
+#
+# Local execute_code used to spawn ``python <mkdtemp>/script.py`` with a brand
+# new script path on every call. macOS TCC (Transparency, Consent & Control)
+# keys privacy grants on the responsible program's identity. Presenting a fresh
+# script path on every call denies the OS a reusable identity and can produce
+# repeated Documents/Desktop/app-data prompts.
+#
+# We now materialize ONE stable, minimal launcher per profile under
+# ``<HERMES_HOME>/helpers/<profile>.py`` and spawn ``python <launcher>`` on every
+# call, feeding the generated program over stdin. The launcher path remains
+# stable for OS attribution. The generated ``hermes_tools.py`` and the user
+# program stay ephemeral (tmpdir + stdin); only the tiny launcher persists.
+
+# Minimal, stable launcher. The first process reads the real program from stdin
+# and caches those bytes in an ephemeral, non-executable sidecar. Spawn-based
+# multiprocessing children inherit the sidecar path and reload it while still
+# entering through this same stable launcher. Notes on the moving parts:
+#   * It strips its own directory from ``sys.path`` first so a launcher named
+#     ``hermes.py`` can never shadow the real ``hermes`` package; the generated
+#     ``hermes_tools`` module still resolves from the tmpdir on PYTHONPATH.
+#   * The program is compiled under the synthetic name ``<execute_code>`` (not
+#     the launcher path) so it can't collide with the launcher's own frames, and
+#     its source is registered in ``linecache`` so tracebacks show the user's
+#     real lines even though the code arrived over stdin.
+#   * A ``sys.excepthook`` formats uncaught errors via the ``traceback`` module
+#     (which honors linecache) instead of the C default excepthook, which on
+#     Python <= 3.12 reads source straight from disk by filename and would show
+#     nothing for ``<execute_code>``. It also drops its own wrapper frame so the
+#     traceback shows only user code, matching the old direct-script behavior.
+_LAUNCHER_SOURCE = (
+    "# Hermes execute_code launcher — generated, stable per profile. Do not edit.\n"
+    "# Runs the program supplied on stdin so repeated local runs share one file\n"
+    "# path (macOS TCC / OS-permission identity). See tools/code_execution_tool.py.\n"
+    "import os, sys, linecache, traceback\n"
+    "_self_dir = os.path.dirname(os.path.abspath(__file__))\n"
+    "sys.path[:] = [p for p in sys.path if not p or os.path.abspath(p) != _self_dir]\n"
+    "_source_path = os.environ.get('HERMES_EXECUTE_CODE_SOURCE', '')\n"
+    "_payload = sys.stdin.buffer.read()\n"
+    "if _payload:\n"
+    "    _src = _payload.decode('utf-8')\n"
+    "    if _source_path:\n"
+    "        with open(_source_path, 'wb') as _source_file:\n"
+    "            _source_file.write(_payload)\n"
+    "elif _source_path:\n"
+    "    with open(_source_path, 'rb') as _source_file:\n"
+    "        _src = _source_file.read().decode('utf-8')\n"
+    "else:\n"
+    "    raise RuntimeError('execute_code launcher received no program')\n"
+    "_name = '<execute_code>'\n"
+    "linecache.cache[_name] = (len(_src), None, _src.splitlines(keepends=True), _name)\n"
+    "def _excepthook(_et, _e, _tb):\n"
+    "    traceback.print_exception(\n"
+    "        _et, _e, _tb.tb_next if _tb is not None and _tb.tb_next is not None else _tb)\n"
+    "sys.excepthook = _excepthook\n"
+    "exec(compile(_src, _name, 'exec'), globals(), globals())\n"
+)
+
+_HELPER_STEM_RE = re.compile(r"[^a-z0-9_-]+")
+
+
+def _sanitize_helper_stem(name: str) -> str:
+    """Reduce a profile name to a safe, stable launcher filename stem."""
+    stem = _HELPER_STEM_RE.sub("-", str(name).strip().lower()).strip("-_")
+    return stem[:64]
+
+
+def _helper_launcher_stem() -> str:
+    """Return the launcher filename stem for the active profile.
+
+    Named profiles get their own stem (``nagatha`` -> ``nagatha.py``) so the
+    stable identity is human-recognizable and isolated per profile. The
+    ``default`` profile and unrecognized/custom (Docker) homes fall back to
+    ``hermes`` — those homes are already distinct directories, so the shared
+    stem stays unambiguous.
+    """
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+        name = get_active_profile_name()
+    except Exception:
+        name = "default"
+    stem = _sanitize_helper_stem(name)
+    if stem in ("", "default", "custom", "hermes"):
+        return "hermes"
+    return stem
+
+
+def _resolve_helper_launcher_path():
+    """Resolve the stable launcher path under the active profile's HERMES_HOME."""
+    from hermes_constants import get_hermes_home
+    return get_hermes_home() / "helpers" / f"{_helper_launcher_stem()}.py"
+
+
+def _tighten_launcher_permissions(path) -> None:
+    """Keep an existing launcher private without churning unchanged metadata."""
+    if os.name == "nt":
+        return
+    for target, desired_mode in ((path.parent, 0o700), (path, 0o600)):
+        try:
+            if target.stat().st_mode & 0o777 != desired_mode:
+                os.chmod(target, desired_mode)
+        except OSError:
+            pass
+
+
+def _materialize_launcher(path) -> None:
+    """Create/refresh the stable launcher atomically and idempotently.
+
+    - Skips the write entirely when the on-disk bytes already match (the common
+      case after the first call) so the file is never churned under concurrent
+      runs.
+    - Writes via a unique temp file + ``os.replace`` (atomic on POSIX and
+      Windows) so a concurrent child that is mid-exec always sees a complete,
+      valid launcher — never a partially written file.
+    - Uses owner-only dir/file modes.
+    """
+    from pathlib import Path
+    path = Path(path)
+    desired = _LAUNCHER_SOURCE.encode("utf-8")
+
+    try:
+        if not path.is_symlink() and path.read_bytes() == desired:
+            _tighten_launcher_permissions(path)
+            return
+    except (FileNotFoundError, NotADirectoryError):
+        pass
+    except OSError:
+        pass  # unreadable (perms/race) — fall through and try to (re)write
+
+    helpers_dir = path.parent
+    helpers_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(helpers_dir, 0o700)
+    except OSError:
+        pass  # best-effort on filesystems/platforms without POSIX modes
+
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{path.stem}-", suffix=".tmp", dir=str(helpers_dir),
+    )
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(desired)
+            f.flush()
+            os.fsync(f.fileno())
+        try:
+            os.chmod(tmp_name, 0o600)
+        except OSError:
+            pass
+        os.replace(tmp_name, str(path))
+        _tighten_launcher_permissions(path)
+    except OSError:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        # Another process may have materialized identical bytes between our read
+        # and our write; accept that rather than failing the execute_code call.
+        try:
+            if path.read_bytes() == desired:
+                return
+        except OSError:
+            pass
+        raise
+
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
@@ -1269,7 +1439,7 @@ def execute_code(
     if not sandbox_tools:
         sandbox_tools = SANDBOX_ALLOWED_TOOLS
 
-    # --- Set up temp directory with hermes_tools.py and script.py ---
+    # --- Set up temp directory with the ephemeral hermes_tools.py stub ---
     tmpdir = tempfile.mkdtemp(prefix="hermes_sandbox_")
     # Use /tmp on macOS to avoid the long /var/folders/... path that pushes
     # Unix domain socket paths past the 104-byte macOS AF_UNIX limit.
@@ -1312,9 +1482,9 @@ def execute_code(
         with open(os.path.join(tmpdir, "hermes_tools.py"), "w", encoding="utf-8") as f:
             f.write(tools_src)
 
-        # Write the user's script
-        with open(os.path.join(tmpdir, "script.py"), "w", encoding="utf-8") as f:
-            f.write(code)
+        # The user's program is NOT written to a named file — it is streamed to
+        # the stable launcher over stdin below, so no fresh script path is
+        # presented to the OS each call (issue #6037).
 
         # --- Start RPC server ---
         rpc_token = secrets.token_urlsafe(32)
@@ -1363,6 +1533,12 @@ def execute_code(
         child_env = _scrub_child_env(os.environ)
         child_env["HERMES_RPC_SOCKET"] = rpc_endpoint
         child_env["HERMES_RPC_TOKEN"] = rpc_token
+        # The stable launcher caches stdin here so multiprocessing's spawn mode
+        # (the default on macOS and Windows) can reconstruct ``__main__`` in a
+        # child process without changing the executable script path.  The
+        # sidecar is data, not a Python argv target, and lives only as long as
+        # this invocation's already-isolated staging directory.
+        child_env["HERMES_EXECUTE_CODE_SOURCE"] = os.path.join(tmpdir, "program.source")
         child_env["PYTHONDONTWRITEBYTECODE"] = "1"
         # Force UTF-8 for the child's stdio and default file encoding.
         #
@@ -1413,18 +1589,63 @@ def execute_code(
         _mode = _get_execution_mode()
         _child_python = _resolve_child_python(_mode)
         _child_cwd = _resolve_child_cwd(_mode, tmpdir, task_id=task_id or "")
-        _script_path = os.path.join(tmpdir, "script.py")
+
+        # Prefer the stable per-profile launcher and stream the actual program
+        # to it over stdin. Reusing one launcher path gives macOS TCC / other OS
+        # permission systems a consistent identity across calls (issue #6037).
+        # Read-only or restricted HERMES_HOME installations remain supported by
+        # falling back to the previous invocation-local script behavior.
+        _launcher_path = _resolve_helper_launcher_path()
+        _stdin_payload = None
+        try:
+            _materialize_launcher(_launcher_path)
+            _stdin_payload = code.encode("utf-8")
+        except OSError as exc:
+            logger.warning(
+                "execute_code: could not materialize stable launcher at %s (%s); "
+                "falling back to an invocation-local script",
+                _launcher_path, exc,
+            )
+            _launcher_path = os.path.join(tmpdir, "script.py")
+            with open(_launcher_path, "w", encoding="utf-8") as f:
+                f.write(code)
+            child_env.pop("HERMES_EXECUTE_CODE_SOURCE", None)
 
         proc = subprocess.Popen(
-            [_child_python, _script_path],
+            [_child_python, os.fspath(_launcher_path)],
             cwd=_child_cwd,
             env=child_env,
+            stdin=subprocess.PIPE if _stdin_payload is not None else subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            stdin=subprocess.DEVNULL,
             start_new_session=True,
             creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
         )
+
+        # Feed the program to the launcher's stdin from a dedicated thread so a
+        # program larger than the OS pipe buffer can't deadlock the parent while
+        # the child is still starting up. Closing stdin gives the launcher EOF;
+        # any stdin the user program then reads is empty (matching the old
+        # DEVNULL wiring).
+        def _feed_stdin(pipe, data):
+            try:
+                pipe.write(data)
+            except (OSError, ValueError):
+                pass
+            finally:
+                try:
+                    pipe.close()
+                except (OSError, ValueError):
+                    pass
+
+        stdin_writer = None
+        if _stdin_payload is not None:
+            stdin_writer = threading.Thread(
+                target=_feed_stdin,
+                args=(proc.stdin, _stdin_payload),
+                daemon=True,
+            )
+            stdin_writer.start()
 
         # --- Poll loop: watch for exit, timeout, and interrupt ---
         deadline = time.monotonic() + timeout
@@ -1537,6 +1758,8 @@ def execute_code(
         # Wait for readers to finish draining
         stdout_reader.join(timeout=3)
         stderr_reader.join(timeout=3)
+        if stdin_writer is not None:
+            stdin_writer.join(timeout=3)
 
         stderr_text = b"".join(stderr_chunks).decode("utf-8", errors="replace")
 
@@ -1956,6 +2179,9 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
         "Limits: 5-minute timeout, 50KB stdout cap, max 50 tool calls per script. "
         "terminal() is foreground-only (no background or pty).\n\n"
         f"{cwd_note}\n\n"
+        "Local runs execute through a stable per-profile launcher, giving OS "
+        "file/app permission systems (including macOS privacy controls) one "
+        "reusable script identity instead of a fresh path on every call.\n\n"
         "Print your final result to stdout. Use Python stdlib (json, re, math, csv, "
         "datetime, collections, etc.) for processing between tool calls.\n\n"
         "Also available (no import needed — built into hermes_tools):\n"
