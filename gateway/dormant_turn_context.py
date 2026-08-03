@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import math
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Optional, Tuple
@@ -375,6 +376,8 @@ def sanitize_event_epoch(
     """
     epoch = coerce_message_timestamp(event_ts, tz=tz)
     if epoch is None:
+        return None
+    if not math.isfinite(epoch):
         return None
     if epoch > now_epoch + _FUTURE_SKEW_TOLERANCE_S:
         return None

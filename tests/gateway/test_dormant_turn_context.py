@@ -384,6 +384,9 @@ def test_classify_gap_boundaries():
 def test_sanitize_event_epoch_coerces_and_rejects_malformed():
     assert sanitize_event_epoch(None, NOW) is None
     assert sanitize_event_epoch("not-a-time", NOW) is None
+    assert sanitize_event_epoch(float("nan"), NOW) is None
+    assert sanitize_event_epoch(float("inf"), NOW) is None
+    assert sanitize_event_epoch(float("-inf"), NOW) is None
     assert sanitize_event_epoch(NOW - 100, NOW) == NOW - 100
     dt = datetime(2026, 4, 28, 13, 38, 0, tzinfo=MADRID)
     assert sanitize_event_epoch(dt, NOW) == dt.timestamp()

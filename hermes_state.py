@@ -19,6 +19,7 @@ import atexit
 import contextlib
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -10570,6 +10571,10 @@ class SessionDB:
         event unable to regress the anchor, and the read+write being one
         transaction keeps concurrent turns for the same principal from racing.
         """
+        new_epoch = float(new_epoch)
+        if not math.isfinite(new_epoch):
+            raise ValueError("principal activity epoch must be finite")
+
         def _do(conn):
             row = conn.execute(
                 "SELECT value FROM state_meta WHERE key = ?", (key,)
@@ -10579,6 +10584,8 @@ class SessionDB:
                 raw = row["value"] if isinstance(row, sqlite3.Row) else row[0]
                 try:
                     prior = float(raw)
+                    if not math.isfinite(prior):
+                        prior = None
                 except (TypeError, ValueError):
                     prior = None
             store = new_epoch if prior is None else max(prior, new_epoch)

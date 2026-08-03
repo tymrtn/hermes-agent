@@ -77,6 +77,26 @@ def test_record_principal_activity_no_db_is_safe(tmp_path):
     assert store.record_principal_activity("principal-c", 1.0) is None
 
 
+def test_record_principal_activity_rejects_non_finite_without_poisoning(tmp_path):
+    store = _store(tmp_path)
+    key = "principal-non-finite"
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        assert store.record_principal_activity(key, bad) is None
+
+    assert store.record_principal_activity(key, 1000.0) is None
+    assert store.record_principal_activity(key, 2000.0) == 1000.0
+
+
+def test_record_principal_activity_heals_existing_non_finite_anchor(tmp_path):
+    store = _store(tmp_path)
+    key = "principal-existing-nan"
+    assert store._db is not None
+    store._db.set_meta(key, "nan")
+
+    assert store.record_principal_activity(key, 1000.0) is None
+    assert store.record_principal_activity(key, 2000.0) == 1000.0
+
+
 def test_compute_note_first_then_strong_end_to_end(tmp_path):
     store = _store(tmp_path)
     async_store = AsyncSessionStore(store)
