@@ -123,6 +123,48 @@ def test_compute_ineligible_group_never_records_anchor(tmp_path):
     assert store.record_principal_activity(key, NOW + 1) is None
 
 
+def test_malformed_enabled_writes_no_anchor(tmp_path):
+    """A malformed ``enabled`` (e.g. YAML ``"false"``) never injects nor records.
+
+    ``resolve_config`` fails such a config closed to ``None``; ``compute_dormant_turn_note``
+    must then short-circuit before any store access, so the principal anchor stays
+    absent even after an otherwise-eligible verified DM turn.
+    """
+    store = _store(tmp_path)
+    async_store = AsyncSessionStore(store)
+    # Unique sender: the process-shared state.db is namespaced by principal, so a
+    # dedicated id keeps this test independent of the others in this module.
+    sender = "malformed-enabled-user"
+    src = SessionSource(
+        platform=Platform.TELEGRAM, chat_id="c", chat_type="dm", user_id=sender
+    )
+
+    for bad in ("false", "true", 1, 0, None, "False"):
+        cfg = resolve_config(
+            {
+                "gateway": {
+                    "dormant_turn_context": {
+                        "enabled": bad,
+                        "verified_user_ids": {"telegram": [sender]},
+                    }
+                }
+            }
+        )
+        assert cfg is None, bad
+
+        async def run():
+            return await compute_dormant_turn_note(
+                async_store, source=src, is_internal=False, profile=None,
+                event_ts=NOW, now_epoch=NOW, tz=MADRID, config=cfg,
+            )
+
+        assert asyncio.run(run()) is None
+
+    # No anchor was ever written: a fresh record on this principal returns None.
+    key = principal_hash("default", "telegram", sender)
+    assert store.record_principal_activity(key, NOW + 1) is None
+
+
 def test_compute_future_spoofed_event_does_not_create_or_reset_anchor(tmp_path):
     """gap 3: a far-future event neither injects nor mutates the anchor.
 

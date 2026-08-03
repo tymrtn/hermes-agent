@@ -154,7 +154,11 @@ def resolve_config(user_config: Optional[dict]) -> Optional[DormantTurnConfig]:
     raw = gw.get("dormant_turn_context")
     if not isinstance(raw, dict):
         return None
-    if not bool(raw.get("enabled", False)):
+    # Privacy-sensitive opt-in: require an EXACT boolean ``True``. ``bool(...)``
+    # would fail OPEN on a truthy non-bool — YAML ``enabled: "false"`` parses to
+    # the string ``"false"`` (truthy), and ``enabled: 1`` to an int — so anything
+    # that is not literally ``True`` must fail closed and leave the feature off.
+    if raw.get("enabled", False) is not True:
         return None
 
     scope = raw.get("scope", _SCOPE_VERIFIED_DM)
@@ -209,6 +213,21 @@ def resolve_config(user_config: Optional[dict]) -> Optional[DormantTurnConfig]:
         )
     except Exception:  # pragma: no cover — defensive; construction is total.
         return None
+
+
+def resolve_clock_tz(config: DormantTurnConfig):
+    """Return the ``ZoneInfo`` for the config's clock authority, or ``None``.
+
+    The note's ``It is now …`` timestamp renders in the SAME top-level
+    ``timezone`` clock authority that gates the location clause, so the render
+    zone and the location gate can never disagree. ``None`` — config timezone
+    unset or invalid — means server-local, matching ``build_dormant_turn_note``'s
+    ``tz=None`` path. Because the zone is derived from the (profile-local)
+    resolved config rather than a process-cached ambient clock, a multiplexed
+    gateway renders each profile's own zone instead of whichever profile warmed
+    the cache first.
+    """
+    return _valid_zone(config.clock_timezone)
 
 
 # ---------------------------------------------------------------------------

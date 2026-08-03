@@ -73,6 +73,66 @@ def test_resolve_config_disabled_by_default():
     )
 
 
+@pytest.mark.parametrize(
+    "enabled_value",
+    [
+        "false",  # YAML enabled: "false" → the truthy string "false"
+        "true",   # even a quoted "true" is not a real bool → fail closed
+        "False",
+        "yes",
+        0,
+        1,        # int 1 is truthy but not the bool True
+        1.0,
+        [],
+        {},
+        None,
+    ],
+)
+def test_resolve_config_rejects_non_true_enabled(enabled_value):
+    """Privacy-sensitive opt-in fails closed unless ``enabled`` is EXACTLY True.
+
+    A quoted YAML boolean (``enabled: "false"``) parses to a truthy string and a
+    ``bool(...)`` gate would open the feature. Require the literal boolean so a
+    malformed value can never enable dormant-turn context.
+    """
+    assert (
+        resolve_config(
+            {"gateway": {"dormant_turn_context": {"enabled": enabled_value}}}
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize("enabled_value", [True])
+def test_resolve_config_true_bool_enables(enabled_value):
+    """A real boolean ``True`` (YAML ``true``/``yes``/``on`` all parse to it) opts in."""
+    cfg = resolve_config(
+        {"gateway": {"dormant_turn_context": {"enabled": enabled_value}}}
+    )
+    assert cfg is not None
+    assert cfg.enabled is True
+
+
+def test_resolve_config_false_bool_disables():
+    """A real boolean ``False`` (the shipped default) stays off."""
+    assert (
+        resolve_config({"gateway": {"dormant_turn_context": {"enabled": False}}})
+        is None
+    )
+
+
+def test_resolve_clock_tz_matches_config_authority():
+    """``resolve_clock_tz`` yields the config's clock zone, or None when unset/invalid."""
+    from zoneinfo import ZoneInfo
+    from gateway.dormant_turn_context import resolve_clock_tz
+
+    assert resolve_clock_tz(_cfg(clock_tz="Asia/Tokyo")) == ZoneInfo("Asia/Tokyo")
+    # No top-level timezone → server-local (None), matching build_dormant_turn_note.
+    assert resolve_clock_tz(_cfg(clock_tz=None)) is None
+    # A present-but-invalid IANA name resolves to None rather than raising.
+    assert resolve_clock_tz(_cfg(clock_tz="Not/AZone")) is None
+
+
 def test_resolve_config_defaults_when_enabled():
     cfg = resolve_config({"gateway": {"dormant_turn_context": {"enabled": True}}})
     assert cfg is not None

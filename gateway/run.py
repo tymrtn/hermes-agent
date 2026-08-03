@@ -21068,14 +21068,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             from gateway.dormant_turn_context import (
                 compute_dormant_turn_note,
+                resolve_clock_tz,
                 resolve_config,
             )
 
-            config = resolve_config(_load_gateway_config())
+            # Resolve config under the message source's EFFECTIVE profile so the
+            # dormant allow-list, location, and ``timezone`` clock authority come
+            # from THAT profile — never the default profile's (the leak a
+            # default-owned adapter routed to ``source.profile`` would otherwise
+            # hit), and never whichever profile warmed a process cache first.
+            # Single-profile gateways (multiplex off) take the unscoped load —
+            # byte-identical legacy behavior, and the only branch a focused unit
+            # harness with a minimal ``self`` ever reaches.
+            if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+                try:
+                    with _profile_runtime_scope(
+                        self._resolve_profile_home_for_source(source)
+                    ):
+                        user_config = _load_gateway_config()
+                except Exception:
+                    logger.debug(
+                        "dormant-turn profile-scoped config load failed; using unscoped",
+                        exc_info=True,
+                    )
+                    user_config = _load_gateway_config()
+            else:
+                user_config = _load_gateway_config()
+
+            config = resolve_config(user_config)
             if config is None:
                 return
-
-            from hermes_time import get_timezone
 
             note = await compute_dormant_turn_note(
                 self.async_session_store,
@@ -21084,7 +21106,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 profile=getattr(source, "profile", None),
                 event_ts=getattr(event, "timestamp", None),
                 now_epoch=time.time(),
-                tz=get_timezone(),
+                # Clock authority from the SAME profile-local config, never the
+                # process-cached ``get_timezone()`` (which returns whichever
+                # profile warmed the cache first — a cross-profile leak).
+                tz=resolve_clock_tz(config),
                 config=config,
             )
             if note:
