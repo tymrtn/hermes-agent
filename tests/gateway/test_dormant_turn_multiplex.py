@@ -198,3 +198,24 @@ def test_profiles_do_not_cross_leak_allow_lists(profiles, monkeypatch, user_id, 
         runner, dirs, user_id=user_id, profile=profile, monkeypatch=monkeypatch
     )
     assert notes == []
+
+
+def test_profile_resolution_failure_fails_closed(profiles, monkeypatch):
+    """A routed-profile lookup failure must never fall back to default config."""
+    runner, dirs = profiles
+    monkeypatch.setattr(gwrun, "_hermes_home", dirs["default"])
+    runner._resolve_profile_home_for_source = MagicMock(
+        side_effect=RuntimeError("profile lookup failed")
+    )
+    event = _dm("userA", "profB", SECOND)
+    notes: list = []
+
+    asyncio.run(
+        gwrun.GatewayRunner._maybe_append_dormant_turn_note(
+            runner, event, event.source, notes
+        )
+    )
+
+    # profA/default would authorize userA, so any unscoped fallback would leak
+    # a note here. Failing closed leaves the sidecar untouched.
+    assert notes == []

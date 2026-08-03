@@ -455,7 +455,12 @@ def _loc_note(prior_gap, *, clock_tz="Europe/Madrid", **loc):
     }
     location.update(loc)
     cfg = _cfg(location=location, clock_tz=clock_tz)
-    return build_dormant_turn_note(NOW, NOW - prior_gap, MADRID, cfg)
+    assert cfg is not None
+    from gateway.dormant_turn_context import resolve_clock_tz
+
+    return build_dormant_turn_note(
+        NOW, NOW - prior_gap, resolve_clock_tz(cfg), cfg
+    )
 
 
 def test_location_fresh_renders_manual_current_provenance_soft():
@@ -464,6 +469,20 @@ def test_location_fresh_renders_manual_current_provenance_soft():
     assert "Madrid" in note
     assert "manually set" in note
     assert "current as of 2026-04-28" in note
+
+
+def test_location_date_only_timestamp_uses_configured_timezone():
+    """Naive/date-only location provenance is local to location.timezone."""
+    note = _loc_note(
+        2 * 3600,
+        clock_tz="Asia/Tokyo",
+        city="Tokyo",
+        timezone="Asia/Tokyo",
+        updated_at="2026-04-28",
+    )
+    assert note is not None
+    assert "Tokyo" in note
+    assert "current as of 2026-04-28 00:00 JST" in note
 
 
 def test_location_stale_omitted_in_soft_layer():

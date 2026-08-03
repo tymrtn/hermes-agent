@@ -21088,10 +21088,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         user_config = _load_gateway_config()
                 except Exception:
                     logger.debug(
-                        "dormant-turn profile-scoped config load failed; using unscoped",
+                        "dormant-turn profile-scoped config load failed; disabling for this turn",
                         exc_info=True,
                     )
-                    user_config = _load_gateway_config()
+                    # Privacy-sensitive profile data must fail closed. Falling
+                    # back to the process/default profile here could borrow its
+                    # allow-list, location, or timezone for a routed profile.
+                    return
             else:
                 user_config = _load_gateway_config()
 

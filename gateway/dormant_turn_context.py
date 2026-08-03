@@ -429,14 +429,20 @@ def _location_clause(
     if not city:
         return ""
     loc_tz = config.location_timezone
-    if not loc_tz or _valid_zone(loc_tz) is None:
+    loc_zone = _valid_zone(loc_tz)
+    if not loc_tz or loc_zone is None:
         return ""
     # Disclose the city only when its timezone is the same as the top-level
     # clock authority; a mismatch means the record is out of sync with the
     # clock the note renders in, so we withhold it.
     if loc_tz != config.clock_timezone:
         return ""
-    updated_epoch = coerce_message_timestamp(config.location_updated_at)
+    # Naive/date-only manual timestamps are expressed in the configured
+    # location timezone, not the gateway host timezone.  The location zone is
+    # validated above and must match the profile clock authority.
+    updated_epoch = coerce_message_timestamp(
+        config.location_updated_at, tz=loc_zone
+    )
     if updated_epoch is None:
         return ""
     age = current_epoch - updated_epoch
