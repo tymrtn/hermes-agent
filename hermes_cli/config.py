@@ -3282,6 +3282,31 @@ DEFAULT_CONFIG = {
             "enabled": False,
         },
 
+        # Dormant-turn time/location context (opt-in, verified 1:1 DM only).
+        # When a quiet DM resumes after a long gap, a small orienting note
+        # ("it's been ~3 days; it is now Tuesday…") is appended to the current
+        # user message so the agent knows wall-clock time moved. Off by default.
+        # Verified 1:1 DMs only: native adapters require the sender in the
+        # per-platform ``verified_user_ids`` map; relay DMs are owner-authorized
+        # upstream. Identity is the platform sender (never a chat id) and is
+        # profile-local. Location is MANUAL only and never inferred; a city is
+        # shown only when its timezone matches the top-level ``timezone`` clock
+        # authority and ``updated_at`` is valid (see docs/session-lifecycle.md).
+        "dormant_turn_context": {
+            "enabled": False,
+            "idle_after_seconds": 3600,
+            "reorient_after_seconds": 86400,
+            "scope": "verified_dm",
+            # Per-platform allow-list: {telegram: ["123"], signal: ["uuid"]}.
+            "verified_user_ids": {},
+            "location": {
+                "city": "",
+                "timezone": "",
+                "updated_at": "",
+                "fresh_for_seconds": 86400,
+            },
+        },
+
         # Maximum bytes for an inbound image / audio / video payload the
         # gateway will buffer into memory and cache to disk. Inbound media is
         # read fully into RAM before being written, so an unbounded upload

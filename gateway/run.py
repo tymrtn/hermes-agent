@@ -15634,6 +15634,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception as _ts_err:
             logger.debug("Message timestamp injection failed (non-fatal): %s", _ts_err)
 
+        # Dormant-turn time/location context (opt-in, verified 1:1 DM only).
+        # When a quiet conversation resumes after a long gap, append a small
+        # orienting note ("it's been ~3 days; it is now Tuesday…") onto THIS
+        # user message via the same sidecar channel. Uses this admitted turn's
+        # own event time and the profile-local principal activity anchor;
+        # ineligible/first/malformed turns add nothing. Fully guarded — it must
+        # never break a turn.
+        await self._maybe_append_dormant_turn_note(event, source, turn_sidecar_notes)
+
         # Stage the collected must-deliver notes for this turn's agent run
         # (one-shot; consumed in run_sync).  Staged AFTER the message_text
         # early-out above so an aborted turn cannot leak its notes into the
@@ -21042,6 +21051,74 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return []
         staged = notes.pop(session_key, None)
         return list(staged) if isinstance(staged, list) else []
+
+    async def _maybe_append_dormant_turn_note(
+        self, event, source, turn_sidecar_notes: List[str]
+    ) -> None:
+        """Append a dormant-turn time/location note when one is warranted.
+
+        Opt-in and verified-1:1-DM only (default off). Reads the profile-local
+        principal-activity anchor atomically through the async SessionStore
+        facade (off the event loop) and appends the rendered note to
+        ``turn_sidecar_notes`` so it rides this turn's existing api_content
+        sidecar. Fully guarded: any failure is swallowed so the turn proceeds
+        normally with clean content. The cheap ``resolve_config`` gate returns
+        immediately for the common (disabled) case before any DB work.
+        """
+        try:
+            from gateway.dormant_turn_context import (
+                compute_dormant_turn_note,
+                resolve_clock_tz,
+                resolve_config,
+            )
+
+            # Resolve config under the message source's EFFECTIVE profile so the
+            # dormant allow-list, location, and ``timezone`` clock authority come
+            # from THAT profile — never the default profile's (the leak a
+            # default-owned adapter routed to ``source.profile`` would otherwise
+            # hit), and never whichever profile warmed a process cache first.
+            # Single-profile gateways (multiplex off) take the unscoped load —
+            # byte-identical legacy behavior, and the only branch a focused unit
+            # harness with a minimal ``self`` ever reaches.
+            if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+                try:
+                    with _profile_runtime_scope(
+                        self._resolve_profile_home_for_source(source)
+                    ):
+                        user_config = _load_gateway_config()
+                except Exception:
+                    logger.debug(
+                        "dormant-turn profile-scoped config load failed; disabling for this turn",
+                        exc_info=True,
+                    )
+                    # Privacy-sensitive profile data must fail closed. Falling
+                    # back to the process/default profile here could borrow its
+                    # allow-list, location, or timezone for a routed profile.
+                    return
+            else:
+                user_config = _load_gateway_config()
+
+            config = resolve_config(user_config)
+            if config is None:
+                return
+
+            note = await compute_dormant_turn_note(
+                self.async_session_store,
+                source=source,
+                is_internal=bool(getattr(event, "internal", False)),
+                profile=getattr(source, "profile", None),
+                event_ts=getattr(event, "timestamp", None),
+                now_epoch=time.time(),
+                # Clock authority from the SAME profile-local config, never the
+                # process-cached ``get_timezone()`` (which returns whichever
+                # profile warmed the cache first — a cross-profile leak).
+                tz=resolve_clock_tz(config),
+                config=config,
+            )
+            if note:
+                turn_sidecar_notes.append(note)
+        except Exception:
+            logger.debug("dormant-turn context note skipped (non-fatal)", exc_info=True)
 
     def _voice_channel_sidecar_note(self, event, source: SessionSource, session_key: str) -> Optional[str]:
         """Return a ``[Voice channel now: ...]`` note when VC state changed.
