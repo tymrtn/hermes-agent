@@ -614,6 +614,102 @@ When a session expires:
 
 ---
 
+## 12. Dormant-Turn Time/Location Context
+
+**Source:** `gateway/dormant_turn_context.py`, `GatewayRunner._maybe_append_dormant_turn_note`
+
+A replayed transcript hides wall-clock time: when a quiet 1:1 DM resumes after
+hours or days, the prior turn still reads as if it were seconds ago. This
+opt-in feature (default OFF) appends a small orienting note onto the **current**
+user message so the agent knows time has moved:
+
+- **Soft layer** (gap ≥ `idle_after_seconds`, default 1h): current local time,
+  rounded elapsed duration, timezone.
+- **Strong layer** (gap ≥ `reorient_after_seconds`, default 24h): weekday, full
+  date and time, elapsed duration, timezone.
+
+The note rides the existing per-turn `api_content` sidecar
+(`_gateway_turn_context_notes` → `agent/turn_context.py`), so **stored
+transcript content stays clean** and the exact bytes sent to the provider replay
+byte-for-byte on the next turn (the prompt-cache invariant). Multimodal (list)
+user content receives exactly one appended text part instead. It never mutates
+the system prompt and adds no core tool. The default lives in
+`hermes_cli/config.py` `DEFAULT_CONFIG` (no config version bump); a fresh install
+resolves to disabled.
+
+### Eligibility (fails closed)
+
+Only a real, admitted, verified 1:1 DM turn injects. Everything else — internal/
+synthetic/cron rows, groups/channels/threads/forums, bot senders, missing
+senders, and unknown/malformed config — is skipped and does **not** reset the gap.
+
+- **Native adapters** require the canonical sender in `verified_user_ids`
+  **under the current platform**. The allow-list is a `{platform: [ids]}` map,
+  so an id configured under one platform can never authorize the same-valued id
+  on another; an unknown/misspelled platform key is dropped (fails closed).
+- **Relay** DMs qualify on `delivered_via_upstream_relay` (owner-authorized
+  upstream by the connector).
+
+### Principal identity and the activity anchor
+
+The gap is measured between the **event** timestamps (`event.timestamp`, not
+processing time) of successive eligible turns. The per-principal "last activity"
+anchor is stored profile-locally in `state.db` `state_meta`, keyed by
+`sha256(profile + NUL + platform + NUL + canonical_sender)`. The canonical
+sender is `user_id_alt` then `user_id`, with WhatsApp alias canonicalization;
+**chat IDs never affect identity**, and different platforms/profiles stay
+separate (no cross-profile presence). Because the anchor spans a user's chats,
+the note is worded "previous admitted message from this user" — never "this
+conversation".
+
+The anchor is read-and-replaced atomically via
+`SessionStore.record_principal_activity` (a single `BEGIN IMMEDIATE`
+transaction, exposed to the event loop through the `AsyncSessionStore` facade so
+it never blocks). It stores `max(prior, new)`, so a duplicate or out-of-order
+timestamp can never regress the anchor. A timestamp more than a small tolerance
+(300 s) in the future is **rejected outright** — it injects nothing and does not
+write the anchor — so a spoofed/clock-skewed value can never fabricate a gap.
+The first turn (no prior anchor) injects nothing.
+
+### Location (manual only)
+
+Location is never inferred from IP/OS/device. A city renders only when all hold:
+`location.city` is set; `location.timezone` is a valid IANA zone that **equals
+the top-level `timezone` clock authority**; and `location.updated_at` is a
+parseable, non-future timestamp. Within `location.fresh_for_seconds` it renders
+with explicit manual/current provenance ("The user's location is Madrid
+(manually set, current as of …)"); once stale it appears only in the strong
+(24h+) layer as an explicit last-known value ("… last recorded location was …
+(manually set, as of <date>)"). There is no location-timezone setter here, so
+operators must set the top-level `timezone` and `location.timezone` **together**
+— a mismatch withholds the city. The top-level `timezone` remains the clock
+authority for the rendered timestamp; temporal (non-location) context still
+renders via `hermes_time` even when no location is configured.
+
+### Configuration
+
+Under `gateway.dormant_turn_context` in `config.yaml` (default OFF):
+
+```yaml
+timezone: Europe/Madrid           # top-level clock authority (shared with location)
+gateway:
+  dormant_turn_context:
+    enabled: false
+    idle_after_seconds: 3600
+    reorient_after_seconds: 86400
+    scope: verified_dm            # only supported scope; else disabled
+    verified_user_ids:            # per-platform native-adapter allow-list
+      telegram: ["123456789"]
+      signal: ["8f3c…-uuid"]
+    location:
+      city: ''
+      timezone: ''                # IANA; must equal the top-level timezone
+      updated_at: ''              # ISO 8601, non-future
+      fresh_for_seconds: 86400
+```
+
+---
+
 ## Appendix: Key Configuration
 
 | Config Key | Type | Default | Description |

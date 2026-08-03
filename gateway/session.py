@@ -1312,6 +1312,36 @@ class SessionStore:
             )
             return True
     
+    def record_principal_activity(
+        self, principal_hash: str, new_epoch: float
+    ) -> Optional[float]:
+        """Atomic read-and-replace of a dormant-turn principal-activity anchor.
+
+        ``principal_hash`` already encodes profile + platform + canonical
+        sender, so the anchor is profile-local by construction and shares no
+        cross-profile presence. Returns the prior activity epoch (``None`` when
+        there was no prior anchor or persistence is unavailable). Synchronous
+        and thread-safe — SessionDB owns its own write lock; the
+        :class:`AsyncSessionStore` facade offloads this to a worker thread so
+        the gateway event loop is never blocked.
+        """
+        if not principal_hash:
+            return None
+        db = getattr(self, "_db", None)
+        if db is None:
+            return None
+        recorder = getattr(db, "record_principal_activity", None)
+        if not callable(recorder):
+            return None
+        try:
+            return recorder(str(principal_hash), float(new_epoch))
+        except Exception:
+            logger.warning(
+                "record_principal_activity failed for a dormant-turn anchor",
+                exc_info=True,
+            )
+            return None
+
     def _ensure_loaded(self) -> None:
         """Load sessions index from disk if not already loaded."""
         with self._lock:

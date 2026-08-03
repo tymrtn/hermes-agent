@@ -705,6 +705,51 @@ max_concurrent_sessions: null
 group_sessions_per_user: true
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Gateway — dormant-turn time/location context
+# ─────────────────────────────────────────────────────────────────────────────
+# When a quiet 1:1 DM resumes after a long silence, the replayed transcript
+# makes the prior turn look like it happened seconds ago — the agent has no
+# in-band signal that hours or days have passed. This adds a small orienting
+# note ("It's been about 3 days since the previous admitted message from this
+# user. It is now Tuesday, 28 April 2026 at 13:40 CEST.") onto the CURRENT user
+# message only. Stored transcript content stays clean; the note rides the same
+# per-turn api_content sidecar the gateway already uses for must-deliver notes.
+#
+# Opt-in and conservative by design:
+#   - Verified 1:1 DMs only. Native adapters require the sender to be listed in
+#     verified_user_ids UNDER THAT PLATFORM; relay-delivered DMs are already
+#     owner-authorized upstream. Group/channel/thread audiences and bot senders
+#     never qualify.
+#   - Identity is the platform sender (never a chat ID) and is profile-local —
+#     no presence is shared across profiles. The note is scoped to this user
+#     across their chats, not to one conversation thread.
+#   - A far-future (clock-skewed / spoofed) event timestamp is rejected: it
+#     neither injects a note nor updates the stored activity anchor.
+#   - Location is MANUAL only and never inferred from IP/device/OS. A city is
+#     shown only when city + a valid IANA location timezone THAT MATCHES the
+#     top-level `timezone:` clock authority + a valid, non-future updated_at are
+#     all set. Within `fresh_for_seconds` it reads as manually set / current as
+#     of <time>; once stale it is only surfaced (as "last recorded … as of
+#     <date>") after the 24h reorientation threshold. Set BOTH the top-level
+#     `timezone:` and `location.timezone` together — a mismatch hides the city.
+#
+# gateway:
+#   dormant_turn_context:
+#     enabled: false                 # master switch (default OFF)
+#     idle_after_seconds: 3600        # >= this gap → soft note (current time + elapsed)
+#     reorient_after_seconds: 86400   # >= this gap → strong note (weekday + full date)
+#     scope: verified_dm              # only supported scope; anything else disables
+#     # Per-platform allow-list — an id is only honored on its own platform:
+#     verified_user_ids:
+#       telegram: ["123456789"]
+#       signal: ["8f3c…-uuid"]
+#     location:
+#       city: ''                      # e.g. "Madrid" — shown verbatim, never guessed
+#       timezone: ''                  # e.g. "Europe/Madrid" — must equal top-level timezone
+#       updated_at: ''                # ISO 8601, e.g. "2026-04-28T12:40:00+02:00"
+#       fresh_for_seconds: 86400      # within this age → current; older → last-known (24h+ only)
+
+# ─────────────────────────────────────────────────────────────────────────────
 # API Server — per-client model routing
 # ─────────────────────────────────────────────────────────────────────────────
 # Route different API clients to different models/providers on a single

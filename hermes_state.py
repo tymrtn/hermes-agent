@@ -10558,6 +10558,38 @@ class SessionDB:
             )
         self._execute_write(_do)
 
+    def record_principal_activity(
+        self, key: str, new_epoch: float
+    ) -> Optional[float]:
+        """Atomically read-and-replace a dormant-turn principal-activity anchor.
+
+        Reads the prior epoch stored under ``key`` in ``state_meta`` and writes
+        ``max(prior, new_epoch)`` back inside a single ``BEGIN IMMEDIATE`` write
+        transaction, returning the prior value (``None`` when there was none or
+        it was corrupt). Storing the max makes an out-of-order / older / spoofed
+        event unable to regress the anchor, and the read+write being one
+        transaction keeps concurrent turns for the same principal from racing.
+        """
+        def _do(conn):
+            row = conn.execute(
+                "SELECT value FROM state_meta WHERE key = ?", (key,)
+            ).fetchone()
+            prior: Optional[float] = None
+            if row is not None:
+                raw = row["value"] if isinstance(row, sqlite3.Row) else row[0]
+                try:
+                    prior = float(raw)
+                except (TypeError, ValueError):
+                    prior = None
+            store = new_epoch if prior is None else max(prior, new_epoch)
+            conn.execute(
+                "INSERT INTO state_meta (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, repr(float(store))),
+            )
+            return prior
+        return self._execute_write(_do)
+
     def apply_telegram_topic_migration(self) -> None:
         """Create Telegram DM topic-mode tables on explicit /topic opt-in.
 
