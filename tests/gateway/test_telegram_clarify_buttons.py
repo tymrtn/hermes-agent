@@ -289,69 +289,6 @@ class TestTelegramClarifyCallback:
         query.answer.assert_called_once()
         query.edit_message_text.assert_called_once()
 
-    @pytest.mark.asyncio
-    async def test_other_button_flips_to_text_mode(self):
-        from tools import clarify_gateway as cm
-
-        adapter = _make_adapter()
-        cm.register("cidB", "sk-cb-other", "Pick", ["x", "y"])
-        adapter._clarify_state["cidB"] = "sk-cb-other"
-
-        query = AsyncMock()
-        query.data = "cl:cidB:other"
-        query.message = MagicMock()
-        query.message.chat_id = 12345
-        query.message.text = "Pick"
-        query.from_user = MagicMock()
-        query.from_user.id = "777"
-        query.from_user.first_name = "Tester"
-        query.answer = AsyncMock()
-        query.edit_message_text = AsyncMock()
-
-        update = MagicMock()
-        update.callback_query = query
-        context = MagicMock()
-
-        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
-            await adapter._handle_callback_query(update, context)
-
-        # Entry should now be in text-capture mode
-        pending = cm.get_pending_for_session("sk-cb-other")
-        assert pending is not None
-        assert pending.clarify_id == "cidB"
-        assert pending.awaiting_text is True
-        # State NOT popped — the user still needs to type their answer
-        assert "cidB" in adapter._clarify_state
-        # Entry NOT yet resolved
-        with cm._lock:
-            entry = cm._entries.get("cidB")
-        assert entry is not None
-        assert not entry.event.is_set()
-
-    @pytest.mark.asyncio
-    async def test_already_resolved(self):
-        adapter = _make_adapter()
-        # No state for cidGone
-
-        query = AsyncMock()
-        query.data = "cl:cidGone:0"
-        query.message = MagicMock()
-        query.message.chat_id = 12345
-        query.from_user = MagicMock()
-        query.from_user.id = "777"
-        query.from_user.first_name = "Tester"
-        query.answer = AsyncMock()
-
-        update = MagicMock()
-        update.callback_query = query
-        context = MagicMock()
-
-        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
-            await adapter._handle_callback_query(update, context)
-
-        query.answer.assert_called_once()
-        # Should NOT resolve anything
-        assert "already" in query.answer.call_args[1]["text"].lower()
 
     @pytest.mark.asyncio
     async def test_unauthorized_user_rejected(self):

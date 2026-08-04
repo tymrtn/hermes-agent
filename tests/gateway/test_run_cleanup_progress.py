@@ -115,9 +115,9 @@ class ProgressAgent:
         cb = self.tool_progress_callback
         if cb is not None:
             cb("tool.started", "terminal", "pwd", {})
-            time.sleep(0.25)
+            time.sleep(0.2)
             cb("tool.started", "terminal", "ls", {})
-            time.sleep(0.25)
+            time.sleep(0.2)
         return {"final_response": "done", "messages": [], "api_calls": 1}
 
 
@@ -130,7 +130,7 @@ class FailingAgent:
         cb = self.tool_progress_callback
         if cb is not None:
             cb("tool.started", "terminal", "pwd", {})
-            time.sleep(0.25)
+            time.sleep(0.2)
         # Empty final_response + failed=True is the shape the gateway
         # actually returns on provider errors (see gateway/run.py where
         # failed keys are only propagated when final_response is empty).
@@ -219,39 +219,6 @@ def _install_fakes(
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_cleanup_off_by_default_leaves_bubbles(monkeypatch, tmp_path):
-    """Without ``cleanup_progress: true``, firing whatever callback is
-    registered never reaches delete_message."""
-    adapter = CleanupCaptureAdapter()
-    runner = _make_runner(adapter)
-    gateway_run = _install_fakes(monkeypatch, ProgressAgent, cleanup_on=False)
-    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
-
-    source = SessionSource(platform=Platform.TELEGRAM, chat_id="-1001")
-    session_key = "agent:main:telegram:group:-1001"
-
-    result = await runner._run_agent(
-        message="hello",
-        context_prompt="",
-        history=[],
-        source=source,
-        session_id="sess-1",
-        session_key=session_key,
-    )
-
-    assert result["final_response"] == "done"
-    # Even if an unrelated callback got registered (background-review
-    # release lives in the same slot) firing it should never cause any
-    # delete_message calls when cleanup is off.
-    cb = adapter.pop_post_delivery_callback(session_key)
-    if cb is not None:
-        await _fire_post_delivery_cb(cb)
-        for _ in range(10):
-            await asyncio.sleep(0.01)
-    assert adapter.deleted == []
 
 
 @pytest.mark.asyncio

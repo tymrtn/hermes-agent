@@ -67,6 +67,8 @@ jobs:
             echo -e "$MISSING"
             echo ""
             echo "Add a mapping file (do NOT edit AUTHOR_MAP in release.py):"
+            echo "  python3 scripts/audit_pr_attribution.py --fix   # auto-resolve + create files"
+            echo "or manually:"
             echo -e "$MISSING" | while read -r line; do
               email=$(echo "$line" | sed 's/^ *//' | cut -d' ' -f1)
               [ -z "$email" ] && continue

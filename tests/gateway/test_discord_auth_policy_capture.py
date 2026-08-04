@@ -381,3 +381,56 @@ async def test_connect_single_profile_leaves_policy_none(monkeypatch):
     assert adapter._auth_policy is None
 
     await adapter.disconnect()
+
+
+# ---------------------------------------------------------------------------
+# 20260804 review: profile-YAML (PlatformConfig.extra) auth values must feed
+# the same gates as env — on the policy-less fallback accessors AND inside the
+# captured multiplex policy — so live, backfill, and component auth agree.
+# ---------------------------------------------------------------------------
+
+
+def test_accessor_fallback_honors_config_extra(monkeypatch):
+    adapter = object.__new__(DiscordAdapter)
+    adapter._auth_policy = None
+    adapter._gate_env_snapshot = None
+    adapter.config = SimpleNamespace(
+        extra={
+            "allow_all_users": "true",
+            "allowed_channels": "111,222",
+            "ignored_channels": "999",
+        }
+    )
+    assert adapter._auth_allow_all() is True
+    assert adapter._auth_allowed_channels() == frozenset({"111", "222"})
+    assert adapter._auth_ignored_channels() == frozenset({"999"})
+
+
+def test_accessor_fallback_env_beats_config_extra(monkeypatch):
+    adapter = object.__new__(DiscordAdapter)
+    adapter._auth_policy = None
+    adapter._gate_env_snapshot = None
+    adapter.config = SimpleNamespace(extra={"allowed_channels": "111"})
+    monkeypatch.setenv("DISCORD_ALLOWED_CHANNELS", "333")
+    assert adapter._auth_allowed_channels() == frozenset({"333"})
+
+
+def test_captured_policy_includes_config_extra_under_multiplex(monkeypatch):
+    import agent.secret_scope as secret_scope
+
+    monkeypatch.setattr(secret_scope, "is_multiplex_active", lambda: True)
+    adapter = object.__new__(DiscordAdapter)
+    # Empty snapshot == this profile's env has no gate values set.
+    adapter._gate_env_snapshot = {}
+    adapter.config = SimpleNamespace(
+        extra={
+            "allow_all_users": "true",
+            "allowed_channels": "222",
+            "ignored_channels": "888",
+        }
+    )
+    policy = adapter._maybe_capture_auth_policy()
+    assert policy is not None
+    assert policy.allow_all is True
+    assert policy.allowed_channels == frozenset({"222"})
+    assert policy.ignored_channels == frozenset({"888"})

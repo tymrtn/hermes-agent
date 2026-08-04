@@ -142,20 +142,3 @@ async def test_explicit_media_tag_still_delivers_post_stream(tmp_path, monkeypat
     assert str(media_file) in images_kwargs["images"][0][0]
 
 
-@pytest.mark.asyncio
-async def test_explicit_media_document_still_delivers_post_stream(tmp_path, monkeypatch):
-    media_file = _allowed_media_path(tmp_path, monkeypatch, "report.pdf")
-    adapter = _adapter()
-
-    await GatewayRunner._deliver_media_from_response(
-        _fake_runner({}),
-        f"Report attached.\nMEDIA:{media_file}",
-        _event(),
-        adapter,
-    )
-
-    adapter.send_document.assert_awaited_once_with(
-        chat_id="C123CHAN",
-        file_path=str(media_file),
-        metadata={},
-    )

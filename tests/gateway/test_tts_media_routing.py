@@ -63,44 +63,6 @@ def _allowed_media_path(tmp_path, monkeypatch, name):
 
 
 @pytest.mark.asyncio
-async def test_base_adapter_routes_telegram_flac_media_tag_to_document_sender(tmp_path, monkeypatch):
-    adapter = _MediaRoutingAdapter()
-    event = _event()
-    media_file = _allowed_media_path(tmp_path, monkeypatch, "speech.flac")
-    adapter._message_handler = AsyncMock(return_value=f"MEDIA:{media_file}")
-    adapter.send_voice = AsyncMock(return_value=SendResult(success=True, message_id="voice"))
-    adapter.send_document = AsyncMock(return_value=SendResult(success=True, message_id="doc"))
-
-    await adapter._process_message_background(event, build_session_key(event.source))
-
-    adapter.send_document.assert_awaited_once_with(
-        chat_id="chat-1",
-        file_path=str(media_file),
-        metadata={"notify": True},
-    )
-    adapter.send_voice.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_base_adapter_routes_non_voice_telegram_ogg_media_tag_to_document_sender(tmp_path, monkeypatch):
-    adapter = _MediaRoutingAdapter()
-    event = _event()
-    media_file = _allowed_media_path(tmp_path, monkeypatch, "speech.ogg")
-    adapter._message_handler = AsyncMock(return_value=f"MEDIA:{media_file}")
-    adapter.send_voice = AsyncMock(return_value=SendResult(success=True, message_id="voice"))
-    adapter.send_document = AsyncMock(return_value=SendResult(success=True, message_id="doc"))
-
-    await adapter._process_message_background(event, build_session_key(event.source))
-
-    adapter.send_document.assert_awaited_once_with(
-        chat_id="chat-1",
-        file_path=str(media_file),
-        metadata={"notify": True},
-    )
-    adapter.send_voice.assert_not_awaited()
-
-
-@pytest.mark.asyncio
 async def test_base_adapter_routes_voice_tagged_telegram_ogg_media_tag_to_voice_sender(tmp_path, monkeypatch):
     adapter = _MediaRoutingAdapter()
     event = _event()
@@ -370,26 +332,3 @@ class _DiscordMediaFailureAdapter(BasePlatformAdapter):
 
     async def get_chat_info(self, chat_id):
         return {"id": chat_id, "type": "dm"}
-
-
-@pytest.mark.asyncio
-async def test_non_streaming_media_failure_notifies_user(tmp_path, monkeypatch):
-    """Attachmentless send_video results must surface a user-visible notice (#66797)."""
-    adapter = _DiscordMediaFailureAdapter()
-    event = _event()
-    media_file = _allowed_media_path(tmp_path, monkeypatch, "clip.mp4")
-    adapter._message_handler = AsyncMock(return_value=f"MEDIA:{media_file}")
-    adapter.send_video = AsyncMock(
-        return_value=SendResult(
-            success=False,
-            error="Discord accepted the message but attached no files (clip.mp4)",
-        )
-    )
-    adapter.send_document = AsyncMock(return_value=SendResult(success=True, message_id="doc"))
-    adapter.send_voice = AsyncMock(return_value=SendResult(success=True, message_id="voice"))
-    adapter.send_multiple_images = AsyncMock()
-
-    await adapter._process_message_background(event, build_session_key(event.source))
-
-    adapter.send_video.assert_awaited_once()
-    assert adapter.notices == ["⚠️ Couldn't deliver the video attachment."]

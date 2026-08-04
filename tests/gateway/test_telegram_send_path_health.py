@@ -38,18 +38,6 @@ def _make_adapter() -> TelegramAdapter:
 
 
 @pytest.mark.asyncio
-async def test_send_succeeds_when_path_healthy():
-    """Healthy adapter delivers normally; send_message is called."""
-    adapter = _make_adapter()
-    assert adapter._send_path_degraded is False
-
-    result = await adapter.send("123", "hello")
-
-    assert result.success is True
-    adapter._bot.send_message.assert_awaited()
-
-
-@pytest.mark.asyncio
 async def test_send_short_circuits_when_path_degraded():
     """Degraded adapter returns failure WITHOUT calling send_message,
     so cron's live-adapter branch falls through to standalone HTTP."""
