@@ -112,83 +112,21 @@ def _release_singleton_lock(handle) -> None:
 class GatewayKanbanWatchersMixin:
     """Kanban watcher / notifier / dispatcher loops for GatewayRunner."""
 
-    @staticmethod
-    def _kanban_configured_board_slugs(raw: Any, _kb: Any) -> list[str] | None:
-        """Normalize a board scope; ``None`` represents an explicit wildcard."""
-        if raw is None or raw == "":
-            return []
-        if isinstance(raw, str):
-            parts = [part.strip() for part in raw.split(",")]
-        elif isinstance(raw, (list, tuple, set)):
-            parts = [str(part).strip() for part in raw]
-        else:
-            logger.warning(
-                "kanban dispatcher: invalid board scope %r; using profile default board",
-                raw,
-            )
-            return []
-
-        slugs: list[str] = []
-        seen: set[str] = set()
-        for part in parts:
-            if not part:
-                continue
-            if part == "*":
-                return None
-            try:
-                slug = _kb._normalize_board_slug(part)  # type: ignore[attr-defined]
-            except Exception:
-                logger.warning(
-                    "kanban dispatcher: ignoring invalid board scope entry %r", part
-                )
-                continue
-            if slug and slug not in seen:
-                seen.add(slug)
-                slugs.append(slug)
-        return slugs
-
     @classmethod
     def _kanban_scoped_board_slugs(
         cls, kanban_cfg: dict, key: str, _kb: Any
     ) -> list[str]:
-        """Resolve a profile-owned board scope without scanning other profiles."""
-        configured = cls._kanban_configured_board_slugs(kanban_cfg.get(key), _kb)
-        if configured is None:
-            try:
-                return [
-                    board.get("slug") or _kb.DEFAULT_BOARD
-                    for board in _kb.list_boards(include_archived=False)
-                ]
-            except Exception:
-                return [_kb.DEFAULT_BOARD]
-        if configured:
-            return configured
+        """Resolve a profile-owned board scope without scanning other profiles.
 
-        default_raw = kanban_cfg.get("default_board") or os.environ.get(
-            "HERMES_KANBAN_BOARD"
-        )
-        if not default_raw:
-            # No explicit scope anywhere: use the profile's home lane
-            # (configured-or-inferred via kanban_db.get_profile_default_board)
-            # so a secondary profile without kanban config dispatches from its
-            # own board, matching kanban_db's default-board resolution instead
-            # of pinning the literal shared "default" board.
-            try:
-                return [_kb.get_profile_default_board() or _kb.DEFAULT_BOARD]
-            except Exception:
-                return [_kb.DEFAULT_BOARD]
-        try:
-            return [
-                _kb._normalize_board_slug(default_raw)  # type: ignore[attr-defined]
-                or _kb.DEFAULT_BOARD
-            ]
-        except Exception:
-            logger.warning(
-                "kanban dispatcher: invalid kanban.default_board=%r; using %s",
-                default_raw,
-                _kb.DEFAULT_BOARD,
-            )
-            return [_kb.DEFAULT_BOARD]
+        Delegates to ``kanban_db.resolve_board_scope`` so the gateway, the
+        CLI, the dashboard dispatch nudge and the daemon all agree on what
+        ``kanban.<key>`` means — the caps only hold if every entry point
+        counts over the same set of boards. ``_kb`` is forwarded so tests
+        can substitute a stub board module.
+        """
+        from hermes_cli import kanban_db as _kanban_db
+
+        return _kanban_db.resolve_board_scope(kanban_cfg, key, _kb=_kb)
 
     def _owns_kanban_dispatcher_lock(self) -> bool:
         """Return whether this gateway currently owns the singleton lock."""
@@ -1148,30 +1086,18 @@ class GatewayKanbanWatchersMixin:
         if max_spawn is not None:
             logger.info("kanban dispatcher: max_spawn=%s", max_spawn)
 
-        # Cap the number of simultaneously running tasks so slow workers
-        # (local LLMs, resource-constrained hosts) don't pile up and time
-        # out. When set, the dispatcher skips spawning when the board
-        # already has this many tasks in 'running' status.
-        raw_max_in_progress = kanban_cfg.get("max_in_progress", None)
-        max_in_progress = None
-        if raw_max_in_progress is not None:
-            try:
-                max_in_progress = int(raw_max_in_progress)
-            except (TypeError, ValueError):
-                logger.warning(
-                    "kanban dispatcher: invalid kanban.max_in_progress=%r; ignoring",
-                    raw_max_in_progress,
-                )
-                max_in_progress = None
-            else:
-                if max_in_progress < 1:
-                    logger.warning(
-                        "kanban dispatcher: kanban.max_in_progress=%r is below 1; ignoring",
-                        raw_max_in_progress,
-                    )
-                    max_in_progress = None
-                else:
-                    logger.info("kanban dispatcher: max_in_progress=%s", max_in_progress)
+        # Cap simultaneously running tasks across every dispatched board so
+        # slow workers cannot pile up after a restart or lock handoff. Shared
+        # with the CLI / dashboard / daemon entry points — a cap only holds if
+        # every dispatcher resolves it identically.
+        max_in_progress, max_in_progress_per_profile = _kb.resolve_admission_caps(
+            kanban_cfg
+        )
+        logger.info(
+            "kanban dispatcher: max_in_progress=%s max_in_progress_per_profile=%s",
+            max_in_progress,
+            max_in_progress_per_profile,
+        )
 
         raw_failure_limit = kanban_cfg.get("failure_limit", _kb.DEFAULT_FAILURE_LIMIT)
         try:
@@ -1209,42 +1135,16 @@ class GatewayKanbanWatchersMixin:
         # instead of skipping them indefinitely (#27145). Empty string
         # (the schema default) means "no fallback, keep skipping" —
         # backward-compatible with existing installs.
-        default_assignee = (kanban_cfg.get("default_assignee") or "").strip() or None
+        # Shared normalizer: a non-string value here (``default_assignee: 42``)
+        # used to raise AttributeError on ``.strip()`` and abort the whole
+        # dispatcher watcher over one optional routing hint.
+        default_assignee = _kb.resolve_default_assignee(kanban_cfg)
         if default_assignee:
             logger.info(
                 "kanban dispatcher: default_assignee=%r (unassigned ready tasks "
                 "will route to this profile)",
                 default_assignee,
             )
-
-        # Read kanban.max_in_progress_per_profile — per-profile concurrency
-        # cap (#21582). When set, no single profile gets more than N
-        # workers running at once, even if the global max_in_progress
-        # would allow it. Prevents one profile's local model / API quota
-        # / browser pool from being overwhelmed by a fan-out.
-        raw_per_profile = kanban_cfg.get("max_in_progress_per_profile", None)
-        max_in_progress_per_profile = None
-        if raw_per_profile is not None:
-            try:
-                max_in_progress_per_profile = int(raw_per_profile)
-            except (TypeError, ValueError):
-                logger.warning(
-                    "kanban dispatcher: invalid kanban.max_in_progress_per_profile=%r; ignoring",
-                    raw_per_profile,
-                )
-                max_in_progress_per_profile = None
-            else:
-                if max_in_progress_per_profile < 1:
-                    logger.warning(
-                        "kanban dispatcher: kanban.max_in_progress_per_profile=%r is below 1; ignoring",
-                        raw_per_profile,
-                    )
-                    max_in_progress_per_profile = None
-                else:
-                    logger.info(
-                        "kanban dispatcher: max_in_progress_per_profile=%d",
-                        max_in_progress_per_profile,
-                    )
 
         # Initial delay so the gateway finishes wiring adapters before the
         # dispatcher spawns workers (those workers may hit gateway notify
@@ -1289,7 +1189,9 @@ class GatewayKanbanWatchersMixin:
                 or "database disk image is malformed" in msg
             )
 
-        def _tick_once_for_board(slug: str) -> "Optional[object]":
+        def _tick_once_for_board(
+            slug: str, admission_boards: "list[str]"
+        ) -> "Optional[object]":
             """Run one dispatch_once for a specific board.
 
             Runs in a worker thread via `asyncio.to_thread`. `board=slug`
@@ -1297,6 +1199,10 @@ class GatewayKanbanWatchersMixin:
             `_default_spawn` see the right paths. The per-board DB is
             opened explicitly so concurrent boards never share a
             connection handle or accidentally claim across each other.
+
+            ``admission_boards`` is wider than ``dispatch_boards`` on purpose
+            — see ``kanban_db.resolve_admission_boards``. This watcher chooses
+            what to dispatch; the cap counts what is running anywhere.
             """
             conn = None
             fingerprint = _board_db_fingerprint(slug)
@@ -1339,6 +1245,7 @@ class GatewayKanbanWatchersMixin:
                     stale_timeout_seconds=stale_timeout_seconds,
                     default_assignee=default_assignee,
                     max_in_progress_per_profile=max_in_progress_per_profile,
+                    admission_boards=admission_boards,
                 )
             except sqlite3.DatabaseError as exc:
                 if _is_corrupt_board_db_error(exc):
@@ -1379,9 +1286,13 @@ class GatewayKanbanWatchersMixin:
 
         def _tick_once() -> "list[tuple[str, Optional[object]]]":
             """Run one dispatch_once per configured/profile-owned board."""
+            # Re-resolved per tick, unlike dispatch_boards: a board created
+            # after the gateway started can hold running workers, and the cap
+            # only holds if they are counted.
+            admission_boards = _kb.resolve_admission_boards(kanban_cfg, _kb=_kb)
             out: list[tuple[str, "Optional[object]"]] = []
             for slug in dispatch_boards:
-                out.append((slug, _tick_once_for_board(slug)))
+                out.append((slug, _tick_once_for_board(slug, admission_boards)))
             return out
 
         def _ready_nonempty() -> bool:

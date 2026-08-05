@@ -10,6 +10,7 @@ dispatches from its own board, matching ``kb.get_current_board()``.
 from types import SimpleNamespace
 
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
+from hermes_cli import kanban_db
 
 
 def _fake_kb(profile_default="alpha", boards=None):
@@ -70,3 +71,51 @@ def test_profile_default_failure_falls_back_to_default_board(monkeypatch):
         {}, "dispatch_boards", kb
     )
     assert slugs == ["default"]
+
+
+def test_admission_scope_stays_wider_than_the_dispatch_scope(monkeypatch):
+    """The two scopes answer different questions and must not converge.
+
+    ``dispatch_boards`` picks what this gateway pulls work from; the global
+    cap counts what is running anywhere on the machine. Narrowing the count to
+    the dispatch scope lets an explicit out-of-scope dispatch (CLI, or the
+    dashboard's ``?board=`` nudge) run workers this gateway never sees, and the
+    fleet settles at the cap plus that board's load.
+    """
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    kb = _fake_kb(boards=["default", "alpha", "beta"])
+    cfg = {"dispatch_boards": "alpha"}
+
+    assert GatewayKanbanWatchersMixin._kanban_scoped_board_slugs(
+        cfg, "dispatch_boards", kb
+    ) == ["alpha"]
+    assert kanban_db.resolve_admission_boards(cfg, _kb=kb) == [
+        "default", "alpha", "beta",
+    ]
+
+
+def test_admission_scope_keeps_configured_boards_missing_from_disk(monkeypatch):
+    """A board the operator named still counts even if discovery misses it."""
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    kb = _fake_kb(boards=["default"])
+
+    assert kanban_db.resolve_admission_boards(
+        {"dispatch_boards": "alpha,beta"}, _kb=kb
+    ) == ["default", "alpha", "beta"]
+
+
+def test_admission_scope_falls_back_to_dispatch_scope_when_discovery_fails(
+    monkeypatch,
+):
+    """Unreadable board list degrades the count; it must not empty it."""
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    kb = _fake_kb()
+
+    def _boom(include_archived=False):
+        raise OSError("boards dir unreadable")
+
+    kb.list_boards = _boom
+
+    assert kanban_db.resolve_admission_boards({"dispatch_boards": "alpha"}, _kb=kb) == [
+        "alpha"
+    ]

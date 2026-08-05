@@ -38,3 +38,31 @@ Or set the env var: `HERMES_KANBAN_DISPATCH_IN_GATEWAY=false`
 Non-dispatch gateways still deliver messages for their own platform adapters
 (Telegram, Discord, etc.). They do not dispatch tasks, and they skip boards
 that have no subscriptions owned by their profiles.
+
+## Safe re-enable after an incident
+
+1. Keep every gateway's `kanban.dispatch_in_gateway` set to `false`.
+2. Configure the intended owner with conservative limits before enabling it:
+
+   ```yaml
+   kanban:
+     dispatch_in_gateway: false
+     max_in_progress: 4
+     max_in_progress_per_profile: 2
+   ```
+
+3. Confirm existing `running` tasks across every board. They count toward the
+   limits and are preserved; do not reclaim healthy workers to make room.
+4. Restart only the intended owner while it is idle, and verify its log still
+   says the dispatcher is disabled.
+5. Set `kanban.dispatch_in_gateway: true` on that owner, restart only that
+   gateway, and verify it holds `.dispatcher.lock` and logs the configured
+   limits. Leave all other gateways disabled.
+6. Observe one full dispatch interval. The total running count must stay at or
+   below `max_in_progress`, and no assignee may exceed
+   `max_in_progress_per_profile`, before re-enabling any fleet watchdog.
+
+Rollback is one config change: set `kanban.dispatch_in_gateway: false` on the
+owner and restart only that gateway. This stops new claims without terminating
+workers already running. Do not delete lock files or kill workers as rollback;
+the OS releases locks when the owning gateway exits.

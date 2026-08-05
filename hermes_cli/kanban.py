@@ -2534,36 +2534,24 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     # (#28805). Same semantics as the gateway dispatch path so behavior
     # matches whether the user runs the CLI directly or relies on the
     # gateway-embedded dispatcher.
-    try:
-        from hermes_cli.config import load_config
-        _cfg = load_config()
-        _kanban_cfg = _cfg.get("kanban", {}) if isinstance(_cfg, dict) else {}
-        default_assignee = (_kanban_cfg.get("default_assignee") or "").strip() or None
-
-        def _coerce_positive_int(value):
-            if value is None:
-                return None
-            try:
-                ival = int(value)
-            except (TypeError, ValueError):
-                return None
-            return ival if ival >= 1 else None
-
-        max_in_progress_per_profile = _coerce_positive_int(
-            _kanban_cfg.get("max_in_progress_per_profile")
-        )
-        max_in_progress = _coerce_positive_int(_kanban_cfg.get("max_in_progress"))
-        # CLI --max overrides config kanban.max_spawn when both are present;
-        # CLI is the more explicit signal so it wins.
-        cli_max = getattr(args, "max", None)
-        max_spawn = cli_max if cli_max is not None else _coerce_positive_int(
-            _kanban_cfg.get("max_spawn")
-        )
-    except Exception:
-        default_assignee = None
-        max_in_progress_per_profile = None
-        max_in_progress = None
-        max_spawn = getattr(args, "max", None)
+    _kanban_cfg = kb.load_kanban_config()
+    default_assignee = kb.resolve_default_assignee(_kanban_cfg)
+    max_in_progress, max_in_progress_per_profile = kb.resolve_admission_caps(
+        _kanban_cfg
+    )
+    # CLI --max overrides config kanban.max_spawn when both are present;
+    # CLI is the more explicit signal so it wins. Unlike the admission caps,
+    # an unusable max_spawn means "no per-tick spawn ceiling", not a default.
+    cli_max = getattr(args, "max", None)
+    if cli_max is not None:
+        max_spawn = cli_max
+    else:
+        try:
+            max_spawn = int(_kanban_cfg.get("max_spawn"))
+        except (TypeError, ValueError):
+            max_spawn = None
+        if max_spawn is not None and max_spawn < 1:
+            max_spawn = None
     with kb.connect_closing() as conn:
         res = kb.dispatch_once(
             conn,
@@ -2573,6 +2561,11 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            # Counting scope is every board, not kanban.dispatch_boards: this
+            # command dispatches whatever board it is pointed at, including one
+            # outside the configured scope, and those workers still have to be
+            # visible to the next in-scope tick or the cap leaks.
+            admission_boards=kb.resolve_admission_boards(_kanban_cfg),
         )
     if getattr(args, "json", False):
         print(json.dumps({
@@ -2593,8 +2586,16 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 for (tid, who, current) in res.skipped_per_profile_capped
             ],
             "auto_assigned_default": res.auto_assigned_default,
+            "uncounted_admission_boards": res.uncounted_admission_boards,
         }, indent=2))
         return 0
+    if res.uncounted_admission_boards:
+        # The global cap was enforced over fewer boards than it should have
+        # been. Silence here reads as "cap held" when it may not have.
+        print(
+            "WARNING: concurrency cap counted without these unreadable boards: "
+            f"{', '.join(res.uncounted_admission_boards)}"
+        )
     print(f"Reclaimed:    {res.reclaimed}")
     print(f"Crashed:      {len(res.crashed)}")
     if res.crashed:

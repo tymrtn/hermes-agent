@@ -87,7 +87,7 @@ import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any, Iterable, Mapping, Optional, Sequence
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
@@ -1608,7 +1608,7 @@ def _cross_process_init_lock(path: Path):
 
 
 @contextlib.contextmanager
-def _dispatch_tick_lock(db_path: Path):
+def _dispatch_tick_lock(db_path: Path, *, fail_closed: bool = False):
     """Non-blocking single-writer guard around one dispatcher tick.
 
     Yields ``True`` when this process holds the board's dispatch lock and
@@ -1634,9 +1634,9 @@ def _dispatch_tick_lock(db_path: Path):
 
     Board-scoped: the lock file is a ``.dispatch.lock`` sibling of the
     board's ``kanban.db``, so unrelated boards tick independently. On
-    platforms without ``fcntl``/``msvcrt`` the guard degrades to a no-op
-    (yields ``True``) — single-writer enforcement is best-effort and the
-    orphan-dispatcher scenario is specific to POSIX service managers.
+    platforms without ``fcntl``/``msvcrt`` the board guard normally degrades
+    to a no-op (yields ``True``). Callers that protect a safety invariant may
+    pass ``fail_closed=True``; an unavailable lock then skips the operation.
     """
     lock_path = db_path.with_name(db_path.name + ".dispatch.lock")
     handle = None
@@ -1666,8 +1666,10 @@ def _dispatch_tick_lock(db_path: Path):
                 acquired = False
     except OSError:
         # Could not even open the lock file (permissions, read-only FS).
-        # Degrade to a no-op so a probe failure never blocks dispatch.
-        acquired = True
+        # Board-local legacy callers degrade to a no-op. Global concurrency
+        # admission fails closed because proceeding could exceed the worker
+        # cap during a restart race.
+        acquired = not fail_closed
         handle = None
     try:
         yield acquired
@@ -1690,6 +1692,14 @@ def _dispatch_tick_lock(db_path: Path):
                 pass
             finally:
                 handle.close()
+
+
+@contextlib.contextmanager
+def _dispatch_admission_lock():
+    """Machine-global lock for cross-board count-and-claim admission."""
+    sentinel = kanban_home() / "kanban" / ".dispatch-admission"
+    with _dispatch_tick_lock(sentinel, fail_closed=True) as held:
+        yield held
 
 
 # Periodic WAL checkpoint state for the dispatcher tick path. The kanban
@@ -6890,6 +6900,10 @@ def schedule_task(
 DEFAULT_FAILURE_LIMIT = 2
 # Legacy alias — callers / tests still reference the old name.
 DEFAULT_SPAWN_FAILURE_LIMIT = DEFAULT_FAILURE_LIMIT
+# Conservative cross-board admission defaults. config_defaults.py repeats
+# these literals because it is intentionally a pure-data leaf module.
+DEFAULT_MAX_IN_PROGRESS = 4
+DEFAULT_MAX_IN_PROGRESS_PER_PROFILE = 2
 
 # Max bytes to keep in a single worker log file. The dispatcher truncates
 # and rotates on spawn if the file is larger than this at spawn time.
@@ -6994,6 +7008,16 @@ class DispatchResult:
     DB writes this tick — the lock holder is making progress on the same
     board. This is the steady-state signal that a single-writer guard is
     actively preventing two dispatchers from racing on ``kanban.db``."""
+    skipped_admission_locked: bool = False
+    """True when another dispatcher owns the machine-global cross-board
+    concurrency admission lock. The losing tick performs no board writes and
+    retries later; this is expected during overlapping manual/gateway ticks."""
+    uncounted_admission_boards: list[str] = field(default_factory=list)
+    """Boards in the admission scope whose DB could not be read while
+    counting running workers (corrupt file, permissions). Their workers are
+    missing from the cap arithmetic, so the operator needs to see them —
+    ``_count_running_across_boards`` also logs each one at ERROR, and
+    ``hermes kanban dispatch`` surfaces them in both output modes."""
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -8434,6 +8458,238 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     return False
 
 
+def load_kanban_config() -> dict:
+    """Return the ``kanban`` section of the user config, ``{}`` on failure.
+
+    Every dispatch entry point (CLI, gateway, dashboard API, daemon) needs
+    the same section, and the import is deferred because ``hermes_cli.config``
+    pulls in the whole config stack that spawned workers never touch.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+    except Exception:
+        _log.warning(
+            "kanban: config unreadable; falling back to built-in dispatch "
+            "defaults (max_in_progress=%d, max_in_progress_per_profile=%d)",
+            DEFAULT_MAX_IN_PROGRESS,
+            DEFAULT_MAX_IN_PROGRESS_PER_PROFILE,
+            exc_info=True,
+        )
+        return {}
+    section = cfg.get("kanban") if isinstance(cfg, dict) else None
+    return section if isinstance(section, dict) else {}
+
+
+def _coerce_cap(value: Any, default: int, key: str) -> Optional[int]:
+    """Coerce one configured concurrency cap; ``None`` means "uncapped"."""
+    if value is None:
+        return None
+    try:
+        cap = int(value)
+    except (TypeError, ValueError):
+        _log.warning(
+            "kanban dispatcher: invalid kanban.%s=%r; using default %d",
+            key, value, default,
+        )
+        return default
+    if cap < 1:
+        _log.warning(
+            "kanban dispatcher: kanban.%s=%r is below 1; using default %d",
+            key, value, default,
+        )
+        return default
+    return cap
+
+
+def resolve_admission_caps(
+    kanban_cfg: Optional[Mapping[str, Any]] = None,
+) -> tuple[Optional[int], Optional[int]]:
+    """Return the ``(global, per-assignee)`` worker admission caps.
+
+    Shared by every dispatch entry point so a cap configured once holds
+    whether the tick came from the gateway, the CLI, the dashboard's
+    dispatch nudge or the daemon. An explicit ``null`` in config still means
+    "uncapped"; anything unparseable falls back to the conservative default
+    rather than silently uncapping the fleet.
+    """
+    cfg = kanban_cfg if isinstance(kanban_cfg, Mapping) else {}
+    return (
+        _coerce_cap(
+            cfg.get("max_in_progress", DEFAULT_MAX_IN_PROGRESS),
+            DEFAULT_MAX_IN_PROGRESS,
+            "max_in_progress",
+        ),
+        _coerce_cap(
+            cfg.get(
+                "max_in_progress_per_profile",
+                DEFAULT_MAX_IN_PROGRESS_PER_PROFILE,
+            ),
+            DEFAULT_MAX_IN_PROGRESS_PER_PROFILE,
+            "max_in_progress_per_profile",
+        ),
+    )
+
+
+def resolve_default_assignee(
+    kanban_cfg: Optional[Mapping[str, Any]] = None,
+) -> Optional[str]:
+    """Return ``kanban.default_assignee``, or ``None`` when unusable.
+
+    The value is hand-edited YAML, so it arrives as whatever the operator
+    typed: ``default_assignee: 42`` parses to an int, a stray list stays a
+    list. ``(value or "").strip()`` raises ``AttributeError`` on both, and
+    in the dispatch entry points that exception aborts the whole tick —
+    nothing is dispatched at all because one optional routing hint has the
+    wrong type. A non-string is ignored with a warning instead, which is
+    the same behaviour as leaving it unset.
+    """
+    cfg = kanban_cfg if isinstance(kanban_cfg, Mapping) else {}
+    raw = cfg.get("default_assignee")
+    if raw is None or raw == "":
+        return None
+    if not isinstance(raw, str):
+        _log.warning(
+            "kanban dispatcher: ignoring non-string kanban.default_assignee=%r "
+            "(expected a profile name); unassigned ready tasks keep being skipped",
+            raw,
+        )
+        return None
+    return raw.strip() or None
+
+
+def _configured_board_slugs(raw: Any, _kb: Any) -> Optional[list[str]]:
+    """Normalize a configured board scope; ``None`` represents ``*``."""
+    if raw is None or raw == "":
+        return []
+    if isinstance(raw, str):
+        parts = [part.strip() for part in raw.split(",")]
+    elif isinstance(raw, (list, tuple, set)):
+        parts = [str(part).strip() for part in raw]
+    else:
+        _log.warning(
+            "kanban dispatcher: invalid board scope %r; using profile default board",
+            raw,
+        )
+        return []
+
+    slugs: list[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        if not part:
+            continue
+        if part == "*":
+            return None
+        try:
+            slug = _kb._normalize_board_slug(part)
+        except Exception:
+            _log.warning(
+                "kanban dispatcher: ignoring invalid board scope entry %r", part
+            )
+            continue
+        if slug and slug not in seen:
+            seen.add(slug)
+            slugs.append(slug)
+    return slugs
+
+
+def resolve_board_scope(
+    kanban_cfg: Optional[Mapping[str, Any]] = None,
+    key: str = "dispatch_boards",
+    *,
+    _kb: Any = None,
+) -> list[str]:
+    """Resolve a profile-owned board scope without scanning other profiles.
+
+    ``kanban.<key>`` accepts a CSV string, a list, or ``*`` for "every board
+    on disk". Unset falls back to a single board — ``kanban.default_board``,
+    then ``HERMES_KANBAN_BOARD``, then the profile's home lane — so an
+    install that never configured a scope dispatches from its own lane
+    instead of fanning out over every board it can find.
+
+    ``_kb`` lets the gateway pass the module it already imported (and lets
+    tests substitute a stub); it defaults to this module.
+    """
+    cfg = kanban_cfg if isinstance(kanban_cfg, Mapping) else {}
+    if _kb is None:
+        _kb = sys.modules[__name__]
+    configured = _configured_board_slugs(cfg.get(key), _kb)
+    if configured is None:
+        try:
+            return [
+                board.get("slug") or _kb.DEFAULT_BOARD
+                for board in _kb.list_boards(include_archived=False)
+            ]
+        except Exception:
+            return [_kb.DEFAULT_BOARD]
+    if configured:
+        return configured
+
+    default_raw = cfg.get("default_board") or os.environ.get("HERMES_KANBAN_BOARD")
+    if not default_raw:
+        try:
+            return [_kb.get_profile_default_board() or _kb.DEFAULT_BOARD]
+        except Exception:
+            return [_kb.DEFAULT_BOARD]
+    try:
+        return [_kb._normalize_board_slug(default_raw) or _kb.DEFAULT_BOARD]
+    except Exception:
+        _log.warning(
+            "kanban dispatcher: invalid kanban.default_board=%r; using %s",
+            default_raw,
+            _kb.DEFAULT_BOARD,
+        )
+        return [_kb.DEFAULT_BOARD]
+
+
+def resolve_admission_boards(
+    kanban_cfg: Optional[Mapping[str, Any]] = None,
+    *,
+    _kb: Any = None,
+) -> list[str]:
+    """Return every board whose running workers count against the global cap.
+
+    Deliberately wider than :func:`resolve_board_scope`, and the two must not
+    be conflated: ``kanban.dispatch_boards`` selects which boards a dispatcher
+    *pulls work from*, while ``kanban.max_in_progress`` is a ceiling on workers
+    running *on this machine*. Counting only the dispatch scope leaks the cap —
+    an explicit out-of-scope tick (``HERMES_KANBAN_BOARD=other hermes kanban
+    dispatch``, the dashboard's ``?board=other`` nudge) spawns workers that the
+    next in-scope tick cannot see, so the fleet settles at the cap *plus*
+    whatever the out-of-scope board is holding.
+
+    The scope is therefore every non-archived board, unioned with the
+    configured dispatch scope so a board the operator named explicitly still
+    counts even when it is archived or not yet on disk. Callers that tick in a
+    loop should re-resolve per tick: a board created after start-up can hold
+    workers too.
+    """
+    cfg = kanban_cfg if isinstance(kanban_cfg, Mapping) else {}
+    if _kb is None:
+        _kb = sys.modules[__name__]
+    try:
+        listed = [
+            board.get("slug") or _kb.DEFAULT_BOARD
+            for board in _kb.list_boards(include_archived=False)
+        ]
+    except Exception:
+        _log.warning(
+            "kanban dispatcher: board list unreadable; the global concurrency "
+            "cap is counted over the configured dispatch scope only",
+            exc_info=True,
+        )
+        listed = []
+
+    boards: list[str] = []
+    seen: set[str] = set()
+    for slug in (*listed, *resolve_board_scope(cfg, _kb=_kb)):
+        if slug and slug not in seen:
+            seen.add(slug)
+            boards.append(slug)
+    return boards or [_kb.DEFAULT_BOARD]
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -8447,6 +8703,7 @@ def dispatch_once(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    admission_boards: Optional[Sequence[str]] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -8459,10 +8716,331 @@ def dispatch_once(
     ``DispatchResult`` with ``skipped_locked=True`` and does no DB writes;
     the holder is already making progress on the same board.
 
-    The lock is keyed off the board's resolved DB path, so unrelated
-    boards tick in parallel. See :func:`_dispatch_tick_lock` for the
-    cross-process / cross-platform mechanics.
+    The WAL lock is keyed off the board's resolved DB path. When a concurrency
+    cap is configured, a machine-global admission lock additionally serializes
+    the cross-board count-and-claim boundary.
     """
+    if max_in_progress is not None or max_in_progress_per_profile is not None:
+        with _dispatch_admission_lock() as admitted:
+            if not admitted:
+                return DispatchResult(skipped_admission_locked=True)
+            global_running, global_by_profile, uncounted = (
+                _count_running_across_boards(
+                    conn,
+                    current_board=board,
+                    admission_boards=admission_boards,
+                )
+            )
+            result = _dispatch_once_board_locked(
+                conn,
+                spawn_fn=spawn_fn,
+                ttl_seconds=ttl_seconds,
+                dry_run=dry_run,
+                max_spawn=max_spawn,
+                max_in_progress=max_in_progress,
+                failure_limit=failure_limit,
+                stale_timeout_seconds=stale_timeout_seconds,
+                board=board,
+                default_assignee=default_assignee,
+                max_in_progress_per_profile=max_in_progress_per_profile,
+                existing_running_count=global_running,
+                existing_running_by_profile=global_by_profile,
+            )
+            result.uncounted_admission_boards = uncounted
+            return result
+    return _dispatch_once_board_locked(
+        conn,
+        spawn_fn=spawn_fn,
+        ttl_seconds=ttl_seconds,
+        dry_run=dry_run,
+        max_spawn=max_spawn,
+        max_in_progress=max_in_progress,
+        failure_limit=failure_limit,
+        stale_timeout_seconds=stale_timeout_seconds,
+        board=board,
+        default_assignee=default_assignee,
+        max_in_progress_per_profile=max_in_progress_per_profile,
+    )
+
+
+# Everything the admission pre-count needs from a board it is not
+# dispatching: the counts themselves, plus the columns
+# ``detect_crashed_workers`` and ``release_stale_claims`` use to decide a
+# worker is gone.
+_ADMISSION_RUNNING_SQL = (
+    "SELECT id, assignee, worker_pid, claim_lock, claim_expires, started_at "
+    "FROM tasks WHERE status = 'running'"
+)
+
+
+def _read_running_rows_readonly(path: Path) -> list[sqlite3.Row]:
+    """Read a board's ``running`` rows without creating or writing to it.
+
+    Mirrors :func:`count_notify_subs`: a read-only URI connection, so
+    counting a neighbour board never runs schema init, never applies the
+    additive migrations, and never takes a write lock on a board this tick
+    has no business writing to. A DB too old to have a ``tasks`` table holds
+    no workers, so it reads as empty rather than as a failure.
+    """
+    conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+    try:
+        conn.row_factory = sqlite3.Row
+        try:
+            return conn.execute(_ADMISSION_RUNNING_SQL).fetchall()
+        except sqlite3.OperationalError as exc:
+            if "no such table" in str(exc).lower():
+                return []
+            raise
+    finally:
+        conn.close()
+
+
+def _demonstrably_dead_running_rows(rows: Sequence[sqlite3.Row]) -> list[str]:
+    """Ids among ``rows`` whose worker process is provably gone.
+
+    Deliberately the same predicate as :func:`detect_crashed_workers`:
+    host-local claim, past the launch grace window, PID no longer alive. A
+    worker that is running, one claimed by another host, and one still
+    inside its launch window are all left alone — this decides whether a
+    write is warranted at all, so it must not be looser than the reaper it
+    gates.
+    """
+    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
+    grace = _resolve_crash_grace_seconds()
+    now = time.time()
+    dead: list[str] = []
+    for row in rows:
+        pid = row["worker_pid"]
+        if not pid:
+            continue
+        if not (row["claim_lock"] or "").startswith(host_prefix):
+            continue
+        started_at = row["started_at"]
+        if started_at is not None and now - started_at < grace:
+            continue
+        if _pid_alive(pid):
+            continue
+        dead.append(row["id"])
+    return dead
+
+
+def _expired_pidless_running_rows(rows: Sequence[sqlite3.Row]) -> list[str]:
+    """Ids among ``rows`` left ``running`` with no PID and an expired claim.
+
+    The crash reaper cannot see these at all: it selects ``worker_pid IS NOT
+    NULL``, because liveness is a question about a PID. A task takes its
+    claim in :func:`claim_task` and gets its PID only afterwards in
+    ``_set_worker_pid``, so a dispatcher killed between the two — or a spawn
+    that never returned a PID — leaves the row ``running`` with nothing able
+    to reap it. On an admission-only board that row then spends a slot of
+    the machine-global cap for good, the same debris
+    :func:`_demonstrably_dead_running_rows` covers for the crashed case.
+
+    The predicate is exactly the pidless subset of
+    :func:`release_stale_claims`'s ``WHERE`` clause — past TTL — so a claim
+    still inside its window is left counted and untouched, and a pidless row
+    always takes that function's reclaim branch (its extend branch needs a
+    live PID). This therefore never asks for a write the reaper it gates
+    would decline to make. Rows that *do* carry a PID stay with the crash
+    predicate above, which can check liveness instead of waiting out a TTL.
+    """
+    now = int(time.time())
+    return [
+        row["id"]
+        for row in rows
+        if not row["worker_pid"]
+        and row["claim_expires"] is not None
+        and row["claim_expires"] < now
+    ]
+
+
+def _reconcile_admission_board(slug: str, path: Path) -> bool:
+    """Reap dead workers on a board this tick is not dispatching.
+
+    A board can be inside the admission scope but outside
+    ``kanban.dispatch_boards`` — that is the normal state for every board
+    the operator did not put in scope. Nothing else ever opens those, so a
+    worker killed by a reboot, an OOM or a ``kill -9`` leaves its task
+    ``running`` forever, and every one of those rows permanently spends a
+    slot of the machine-global cap. The fleet then quietly shrinks to
+    ``max_in_progress`` minus the accumulated debris.
+
+    Runs the board's own tick steps wholesale — TTL release then crash
+    reap, the order and the functions ``_dispatch_once_locked`` uses —
+    rather than flipping a status column, so the board still gets its
+    ``reclaimed`` / ``crashed`` events, run outcomes, respawn guard and
+    failure accounting exactly as its own dispatcher would have produced
+    them. Both are needed because they cover disjoint debris: the crash
+    reaper only looks at rows that have a PID, and a claim abandoned before
+    ``_set_worker_pid`` ran has none, so only the TTL path can release it.
+    Neither touches a claim that is still live — ``release_stale_claims``
+    extends an unexpired or still-running worker instead of reclaiming it.
+
+    Skipped (returning ``False``) when the board's dispatch lock is
+    unavailable: the holder is that board's own dispatcher mid-tick, and it
+    reaps as step one of that tick. ``fail_closed`` for the same reason —
+    with no working lock this is a write into a board someone else may own,
+    and the cost of skipping is one delayed reconcile.
+    """
+    with _dispatch_tick_lock(path, fail_closed=True) as held:
+        if not held:
+            return False
+        board_conn = connect(board=slug)
+        try:
+            released = release_stale_claims(board_conn)
+            crashed = detect_crashed_workers(board_conn)
+        finally:
+            board_conn.close()
+    if released:
+        _log.info(
+            "kanban dispatcher: released %d stale claim(s) on admission-only "
+            "board %s — their TTL had expired and the rows were holding "
+            "global concurrency slots",
+            released, slug,
+        )
+    if crashed:
+        _log.info(
+            "kanban dispatcher: reclaimed %d crashed task(s) on admission-only "
+            "board %s (%s) — their workers are gone and the rows were holding "
+            "global concurrency slots",
+            len(crashed), slug, ", ".join(crashed),
+        )
+    return True
+
+
+def _count_admission_board(slug: str, path: Path) -> list[tuple[Optional[str], int]]:
+    """Return ``(assignee, count)`` pairs of running workers on one board.
+
+    A slug whose DB is not on disk counts as zero and is **not** created.
+    The admission scope is a union of every board with the configured
+    dispatch scope, so it routinely names boards that never existed (a typo
+    in ``kanban.dispatch_boards``) or no longer do (archived, deleted).
+    Routing those through :func:`connect` would materialise an empty board
+    directory, DB and lock file for each one on every tick, so counting
+    alone would grow the board list by one ghost per typo.
+    """
+    if not path.exists():
+        return []
+    rows = _read_running_rows_readonly(path)
+    reapable = _demonstrably_dead_running_rows(rows) or _expired_pidless_running_rows(
+        rows
+    )
+    if reapable and _reconcile_admission_board(slug, path):
+        rows = _read_running_rows_readonly(path)
+    counts: dict[Optional[str], int] = {}
+    for row in rows:
+        counts[row["assignee"]] = counts.get(row["assignee"], 0) + 1
+    return list(counts.items())
+
+
+def _count_running_across_boards(
+    conn: sqlite3.Connection,
+    *,
+    current_board: Optional[str],
+    admission_boards: Optional[Sequence[str]],
+) -> tuple[int, dict[str, int], list[str]]:
+    """Count canonical running tasks across the dispatcher board scope.
+
+    Returns ``(total, per_assignee, uncounted_boards)``.
+
+    Boards are deduplicated by **resolved DB path**, not by slug. Several
+    slugs routinely name one file: ``HERMES_KANBAN_DB`` pins every board to
+    a single database (the dispatcher→worker handoff and most test
+    harnesses), and board directories can be symlinked together. Counting
+    per slug would then multiply the same running workers by the number of
+    aliases and lock the fleet out at a fraction of the configured cap.
+
+    A *secondary* board that cannot be read (corrupt DB, permissions) is
+    recorded in ``uncounted_boards`` and skipped instead of raising. The
+    caller is ticking a different, healthy board; letting the neighbour's
+    corruption escape would make the gateway attribute the failure to — and
+    quarantine — the healthy board it was actually dispatching. A failure on
+    the current board still propagates, because that *is* the board the
+    caller must quarantine. A secondary board with no DB on disk is not a
+    failure at all: it holds zero workers and stays uncreated (see
+    :func:`_count_admission_board`).
+
+    Secondary boards are opened read-only, and written to only when that
+    read proves a worker is gone — those rows would otherwise hold cap slots
+    for good, because a board outside ``kanban.dispatch_boards`` never gets a
+    tick of its own to reap them.
+    """
+    resolved_current = _normalize_board_slug(current_board or get_current_board())
+    # Current board first so its DB path claims the dedup slot and any alias
+    # of it later in the scope collapses into the already-open ``conn``.
+    boards: list[str] = [resolved_current]
+    for raw in admission_boards or ():
+        try:
+            slug = _normalize_board_slug(raw)
+        except ValueError:
+            _log.warning(
+                "kanban dispatcher: ignoring invalid admission board %r", raw
+            )
+            continue
+        if slug and slug not in boards:
+            boards.append(slug)
+
+    total = 0
+    by_profile: dict[str, int] = {}
+    uncounted: list[str] = []
+    seen_paths: set[str] = set()
+    for slug in boards:
+        is_current = slug == resolved_current
+        try:
+            # ``path`` stays unexpanded: it is what the board's own dispatch
+            # lock is keyed off in ``_dispatch_once_board_locked``, and a
+            # reconcile has to contend for that same lock file.
+            path = kanban_db_path(board=slug)
+            db_key = str(path.expanduser().resolve())
+            if db_key in seen_paths:
+                continue
+            seen_paths.add(db_key)
+            if is_current:
+                counts = [
+                    (row["assignee"], int(row["n"]))
+                    for row in conn.execute(
+                        "SELECT assignee, COUNT(*) AS n FROM tasks "
+                        "WHERE status = 'running' GROUP BY assignee"
+                    )
+                ]
+            else:
+                counts = _count_admission_board(slug, path)
+            for assignee, count in counts:
+                total += count
+                if assignee:
+                    by_profile[assignee] = by_profile.get(assignee, 0) + count
+        except Exception:
+            if is_current:
+                raise
+            uncounted.append(slug)
+            _log.error(
+                "kanban dispatcher: board %s could not be read for concurrency "
+                "admission and is excluded from the running-worker count; "
+                "the cap is enforced over the remaining boards until it is "
+                "repaired",
+                slug,
+                exc_info=True,
+            )
+    return total, by_profile, uncounted
+
+
+def _dispatch_once_board_locked(
+    conn: sqlite3.Connection,
+    *,
+    spawn_fn=None,
+    ttl_seconds: Optional[int] = None,
+    dry_run: bool = False,
+    max_spawn: Optional[int] = None,
+    max_in_progress: Optional[int] = None,
+    failure_limit: int = DEFAULT_SPAWN_FAILURE_LIMIT,
+    stale_timeout_seconds: int = 0,
+    board: Optional[str] = None,
+    default_assignee: Optional[str] = None,
+    max_in_progress_per_profile: Optional[int] = None,
+    existing_running_count: Optional[int] = None,
+    existing_running_by_profile: Optional[dict[str, int]] = None,
+) -> DispatchResult:
+    """Acquire the board-local WAL guard and execute one dispatch tick."""
     try:
         db_path = kanban_db_path(board=board)
     except Exception:
@@ -8481,6 +9059,8 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            existing_running_count=existing_running_count,
+            existing_running_by_profile=existing_running_by_profile,
         )
     with _dispatch_tick_lock(db_path) as held:
         if not held:
@@ -8497,6 +9077,8 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            existing_running_count=existing_running_count,
+            existing_running_by_profile=existing_running_by_profile,
         )
         # Still under the dispatch lock: opportunistically truncate the WAL
         # at a coarse interval so it cannot grow unbounded between restarts.
@@ -8517,6 +9099,8 @@ def _dispatch_once_locked(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    existing_running_count: Optional[int] = None,
+    existing_running_by_profile: Optional[dict[str, int]] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -8582,13 +9166,14 @@ def _dispatch_once_locked(
     # board, since "running" tasks aren't reclaimed by completion alone —
     # they sit in status='running' until the worker calls
     # kanban_complete/kanban_block (or the dispatcher TTL-reclaims them).
-    running_count = 0
+    running_count = int(existing_running_count or 0)
     if max_spawn is not None:
-        running_count = int(
-            conn.execute(
-                "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
-            ).fetchone()[0]
-        )
+        if existing_running_count is None:
+            running_count = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
+                ).fetchone()[0]
+            )
 
     ready_rows = conn.execute(
         "SELECT id, assignee FROM tasks "
@@ -8599,16 +9184,24 @@ def _dispatch_once_locked(
     # tasks, skip spawning this tick so slow workers (local LLMs,
     # resource-constrained hosts) can finish what they have before more tasks
     # pile up and time out.
-    if max_in_progress is not None and ready_rows:
-        in_progress = conn.execute(
-            "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
-        ).fetchone()[0]
-        if in_progress >= max_in_progress:
+    if max_in_progress is not None:
+        if existing_running_count is None and max_spawn is None:
+            # Neither branch above populated ``running_count``; the spawn loop
+            # compares ``running_count + spawned`` against the ceiling, so it
+            # has to be the real count or the cap admits that many *extra*
+            # workers on top of the ones already running.
+            running_count = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
+                ).fetchone()[0]
+            )
+        if running_count >= max_in_progress:
             return result
-        # Only spawn enough to reach the cap, respecting max_spawn too.
-        remaining = max_in_progress - in_progress
-        if max_spawn is None or max_spawn > remaining:
-            max_spawn = remaining
+        # ``max_spawn`` is an absolute live-concurrency ceiling (the loop
+        # compares running + spawned against it), not a remaining-slot budget.
+        # Clamp the two absolute ceilings without subtracting running twice.
+        if max_spawn is None or max_spawn > max_in_progress:
+            max_spawn = max_in_progress
     spawned = 0
     # Per-profile concurrency cap (#21582): when set, track how many
     # workers each assignee already has in flight, and refuse to spawn
@@ -8622,14 +9215,15 @@ def _dispatch_once_locked(
         isinstance(max_in_progress_per_profile, int)
         and max_in_progress_per_profile > 0
     ) else None
-    _per_profile_running: dict[str, int] = {}
+    _per_profile_running: dict[str, int] = dict(existing_running_by_profile or {})
     if _per_profile_cap is not None:
-        for prow in conn.execute(
-            "SELECT assignee, COUNT(*) AS n FROM tasks "
-            "WHERE status = 'running' AND assignee IS NOT NULL "
-            "GROUP BY assignee"
-        ):
-            _per_profile_running[prow["assignee"]] = int(prow["n"])
+        if existing_running_by_profile is None:
+            for prow in conn.execute(
+                "SELECT assignee, COUNT(*) AS n FROM tasks "
+                "WHERE status = 'running' AND assignee IS NOT NULL "
+                "GROUP BY assignee"
+            ):
+                _per_profile_running[prow["assignee"]] = int(prow["n"])
     # Normalize default_assignee once: empty/whitespace string → None so the
     # rest of the loop can use ``if default_assignee:`` as a single check.
     # We also resolve profile_exists once here for the same reason.
@@ -8850,8 +9444,19 @@ def _dispatch_once_locked(
         if profile_exists is not None and not profile_exists(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
             continue
+        if _per_profile_cap is not None:
+            current = _per_profile_running.get(row["assignee"], 0)
+            if current >= _per_profile_cap:
+                result.skipped_per_profile_capped.append(
+                    (row["id"], row["assignee"], current)
+                )
+                continue
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
+            if _per_profile_cap is not None:
+                _per_profile_running[row["assignee"]] = (
+                    _per_profile_running.get(row["assignee"], 0) + 1
+                )
             continue
         claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
@@ -8896,6 +9501,10 @@ def _dispatch_once_locked(
                 _set_worker_pid(conn, claimed.id, int(pid))
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             spawned += 1
+            if _per_profile_cap is not None and claimed.assignee:
+                _per_profile_running[claimed.assignee] = (
+                    _per_profile_running.get(claimed.assignee, 0) + 1
+                )
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
@@ -9440,12 +10049,21 @@ def run_daemon(
     on SIGINT / SIGTERM so ``hermes kanban daemon`` is systemd-friendly.
     ``stop_event`` (a :class:`threading.Event`) and ``on_tick`` (a
     callable receiving the :class:`DispatchResult`) are test hooks.
+
+    Config is read once at start, matching the gateway's dispatcher watcher:
+    the concurrency caps this daemon admits under are the ones in effect when
+    it launched, and a config edit takes effect on restart. The admission board
+    scope is re-resolved every tick instead, because a board created while the
+    daemon runs can hold workers the cap has to count.
     """
     import signal
     import threading
 
     if stop_event is None:
         stop_event = threading.Event()
+
+    kanban_cfg = load_kanban_config()
+    max_in_progress, max_in_progress_per_profile = resolve_admission_caps(kanban_cfg)
 
     def _handle(_signum, _frame):
         stop_event.set()
@@ -9468,6 +10086,9 @@ def run_daemon(
                     conn,
                     max_spawn=max_spawn,
                     failure_limit=failure_limit,
+                    max_in_progress=max_in_progress,
+                    max_in_progress_per_profile=max_in_progress_per_profile,
+                    admission_boards=resolve_admission_boards(kanban_cfg),
                 )
             if on_tick is not None:
                 try:

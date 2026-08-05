@@ -2180,10 +2180,22 @@ def dispatch(
     board: Optional[str] = Query(None),
 ):
     board = _resolve_board(board)
+    # The nudge is a shortcut past the gateway's tick interval, and nothing
+    # else: it resolves the same configured global / per-assignee caps, and
+    # counts them over every board, so clicking dispatch on a board outside
+    # kanban.dispatch_boards can't admit workers past the fleet ceiling.
+    kanban_cfg = kanban_db.load_kanban_config()
+    max_in_progress, max_in_progress_per_profile = kanban_db.resolve_admission_caps(
+        kanban_cfg
+    )
+    admission_boards = kanban_db.resolve_admission_boards(kanban_cfg)
     conn = _conn(board=board)
     try:
         result = kanban_db.dispatch_once(
             conn, dry_run=dry_run, max_spawn=max_n, board=board,
+            max_in_progress=max_in_progress,
+            max_in_progress_per_profile=max_in_progress_per_profile,
+            admission_boards=admission_boards,
         )
         # DispatchResult is a dataclass.
         try:

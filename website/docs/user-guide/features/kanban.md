@@ -226,6 +226,8 @@ up on the next tick (60s by default).
 kanban:
   dispatch_in_gateway: true        # default
   dispatch_interval_seconds: 60    # default
+  max_in_progress: 4               # global across dispatched boards
+  max_in_progress_per_profile: 2   # global per assignee
 ```
 
 Override the config flag at runtime via `HERMES_KANBAN_DISPATCH_IN_GATEWAY=0`
@@ -755,14 +757,15 @@ All commands are also available as a slash command in the interactive CLI and in
 
 | Config key | Default | What it does |
 |------------|---------|--------------|
-| `kanban.max_in_progress` | unset (unlimited) | Caps the number of simultaneously running tasks. When the board already has N running, the dispatcher skips spawning more — useful for slow workers (local LLMs, resource-constrained hosts) so they finish what they have before more pile up and time out. Invalid or below-1 values log a warning and behave as unlimited. |
-| `kanban.max_in_progress_per_profile` | unset (unlimited) | Per-profile variant of `max_in_progress` — caps how many tasks any single assignee profile may run concurrently. Useful when one profile is slow or rate-limited but others should keep flowing. Applies alongside the board-wide `max_in_progress`; both must allow a spawn for it to proceed. |
+| `kanban.max_in_progress` | `4` | Caps simultaneously running tasks across all boards in the dispatcher's `dispatch_boards` scope. Running workers survive config changes and restarts; new claims wait until the fleet drops below the cap. |
+| `kanban.max_in_progress_per_profile` | `2` | Caps running tasks for one assignee across all dispatched boards. Applies alongside `max_in_progress`; both must allow a claim. Count-and-claim admission is serialized across gateway and manual dispatch ticks so overlapping dispatchers cannot exceed either cap. |
 | `kanban.auto_promote_children` | `true` | After `decompose_triage_task()` produces children with no parent-blocker dependencies, they're automatically promoted to `ready` so the dispatcher can pick them up. Set to `false` to require manual review — children stay in `todo` until you promote them. |
 | `kanban.default_workdir` | unset | Board-level default working directory applied to new tasks when neither `--workspace` nor the task itself overrides it. Per-task `workspace:` still wins. |
 
 ```yaml
 kanban:
-  max_in_progress: 2
+  max_in_progress: 4
+  max_in_progress_per_profile: 2
   auto_promote_children: false
   default_workdir: ~/work/active-project
 ```
