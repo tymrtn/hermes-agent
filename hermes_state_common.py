@@ -250,6 +250,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     -- schema_version/packet_id/content_hash/project_id/text).
     wake_packet_json TEXT,
     pinned INTEGER NOT NULL DEFAULT 0,
+    last_read_at REAL,
     FOREIGN KEY (parent_session_id) REFERENCES sessions(id),
     FOREIGN KEY (system_prompt_hash) REFERENCES system_prompts(hash)
 );

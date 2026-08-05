@@ -16308,19 +16308,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     time.time() - _started_at,
                     _quick_key,
                 )
-                adapter = self._adapter_for_source(source)
-                if adapter:
-                    # Grace-window text is burst reassembly: the user is still
-                    # composing one thought across rapid sends, so the parts
-                    # merge into a single pending turn regardless of
-                    # busy_input_mode. FIFO queue semantics apply only to
-                    # follow-ups that arrive after the grace window.
-                    merge_pending_message_event(
-                        adapter._pending_messages,
-                        _quick_key,
-                        event,
-                        merge_text=True,
-                    )
+                # A grace-window follow-up is still a distinct user message.
+                # Preserve queue-mode FIFO boundaries instead of newline-merging
+                # rapid messages into one synthetic turn.
+                self._queue_or_replace_pending_event(_quick_key, event)
                 return None
 
             _ra_state = self._peek_session_state(_quick_key)
