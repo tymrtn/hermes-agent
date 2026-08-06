@@ -1088,6 +1088,7 @@ class TestLifecycleGuardDataArgumentExemption:
 
     @pytest.mark.parametrize("command", [
         "psql -c \"\\copy t FROM PROGRAM 'systemctl restart hermes-gateway'\"",
+        "psql -c \"COPY t FROM PROGRAM 'systemctl restart hermes-gateway'\"",
         "grep 'systemctl restart hermes-gateway' cmds | /bin/sh",
         "grep 'hermes gateway restart' cmds | env sh",
         "grep 'hermes gateway restart' cmds | /usr/bin/env MODE=safe /bin/bash",

@@ -131,9 +131,10 @@ _DATA_SINK_EXECUTION_OPTIONS = {
 # psql backslash escapes (`\! ...`). Any hit disables masking for the whole
 # segment — fail closed to the plain regex verdict.
 _UNSAFE_DATA_ARG_MARKERS = ("`", "$(", "<(", ">(", "\\!")
-# psql's client-side ``\copy ... PROGRAM 'command'`` executes a local
-# process even though the SQL-looking argument would otherwise be data.
-_PSQL_COPY_PROGRAM = re.compile(r"(?is)\\copy\b.*\bprogram\b")
+# psql's client-side ``\copy ... PROGRAM`` and server-side ``COPY ...
+# PROGRAM`` forms execute a process even though the SQL-looking argument
+# would otherwise be treated as data.
+_PSQL_COPY_PROGRAM = re.compile(r"(?is)(?:\\copy|\bcopy)\b.*\bprogram\b")
 # A data sink piped into a shell/interpreter can feed matched lines straight
 # to execution (`grep 'systemctl restart hermes-gateway' f | sh`); never mask
 # such a line.
