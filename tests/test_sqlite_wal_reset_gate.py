@@ -239,7 +239,7 @@ class TestNoDowngradeUnderConcurrentOpeners:
                     conn.execute("PRAGMA journal_mode").fetchone()
                 with caplog.at_level("WARNING", logger="hermes_state"):
                     mode = apply_wal_with_fallback(conn, db_label="locked_wal.db")
-                assert mode == "wal"
+                assert mode == "unknown"
                 assert any(
                     "concurrent openers" in r.getMessage() for r in caplog.records
                 )

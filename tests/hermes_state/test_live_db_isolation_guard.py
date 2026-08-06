@@ -66,6 +66,13 @@ class TestProductionPathRefused:
         with pytest.raises(RuntimeError, match="live-system guard"):
             SessionDB()
 
+    def test_home_env_mutation_cannot_hide_production_root(self, tmp_path, monkeypatch):
+        """The deny root is captured independently of mutable HOME."""
+        monkeypatch.setenv("HOME", str(tmp_path / "fake-home"))
+        monkeypatch.setattr(hermes_state, "_STATE_DB_GUARD_EXTRA_DENY_ROOTS", ())
+        with pytest.raises(RuntimeError, match="live-system guard"):
+            hermes_state._ensure_test_isolation(REAL_ROOT / "state.db")
+
 
 class TestHermeticPathsAllowed:
     def test_tmp_db_path_works(self, tmp_path):

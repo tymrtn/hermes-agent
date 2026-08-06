@@ -322,13 +322,13 @@ _STATE_DB_GUARD_EXTRA_DENY_ROOTS: Tuple[Path, ...] = ()
 def _real_platform_state_root() -> Optional[Path]:
     """Resolve the REAL platform-default Hermes root for the guard.
 
-    Deliberately avoids ``Path.home()`` / ``hermes_constants``: tests
+    Deliberately avoids ``Path.home()`` / ``hermes_constants`` and, on
+    POSIX, the mutable ``HOME`` environment variable: tests
     routinely monkeypatch ``Path.home`` to a tempdir, and ``hermes_state``
     is often imported lazily *while* such a patch is active — resolving
     through the patched callable would misidentify the test's own hermetic
     home as "production" (false positive) or, worse, miss the real one
-    (false negative).  ``os.path.expanduser`` reads the HOME environment
-    variable / passwd entry, which the hermetic conftest never rewrites.
+    (false negative).
     """
     try:
         if sys.platform == "win32":
@@ -339,7 +339,9 @@ def _real_platform_state_root() -> Optional[Path]:
                 else Path(os.path.expanduser("~")) / "AppData" / "Local" / "hermes"
             )
         else:
-            root = Path(os.path.expanduser("~")) / ".hermes"
+            import pwd
+
+            root = Path(pwd.getpwuid(os.getuid()).pw_dir) / ".hermes"
         return root.resolve()
     except Exception:
         return None
@@ -353,9 +355,12 @@ def _running_under_pytest() -> bool:
     )
 
 
+_CAPTURED_PLATFORM_STATE_ROOT = _real_platform_state_root()
+
+
 def _production_state_roots() -> List[Path]:
     roots: List[Path] = []
-    real_root = _real_platform_state_root()
+    real_root = _CAPTURED_PLATFORM_STATE_ROOT
     if real_root is not None:
         roots.append(real_root)
     for extra in _STATE_DB_GUARD_EXTRA_DENY_ROOTS:
@@ -786,7 +791,8 @@ def apply_wal_with_fallback(
 ) -> str:
     """Set ``journal_mode=WAL`` on ``conn``, falling back to DELETE on failure.
 
-    Returns the journal mode actually set (``"wal"`` or ``"delete"``).
+    Returns the journal mode actually observed (``"wal"`` or ``"delete"``),
+    or ``"unknown"`` when a concurrent opener prevents a trustworthy probe.
 
     On WAL-incompatible filesystems (NFS, SMB, some FUSE, ZFS), SQLite either
     raises ``OperationalError("locking protocol")`` /
@@ -1032,7 +1038,7 @@ def _apply_delete_for_wal_reset_bug(
                 "this process does not exclusively own"
             )
         _log_wal_reset_bug_once(db_label, kept_wal=True, indeterminate=True)
-        return "wal"
+        return "unknown"
 
     actual = ""
     try:
