@@ -1097,6 +1097,7 @@ class TestLifecycleGuardDataArgumentExemption:
         "grep 'hermes gateway restart' cmds | /usr/bin/env MODE=safe /bin/bash",
         "grep 'hermes gateway restart' cmds | command sh",
         "sqlite3 :memory: $'select 1;\\n.shell systemctl restart hermes-gateway'",
+        "eval $(grep 'hermes gateway restart' cmds)",
     ])
     def test_data_sink_execution_escape_hatches_are_not_masked(self, command):
         assert self._scan(command) is True

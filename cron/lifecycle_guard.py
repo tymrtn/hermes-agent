@@ -263,7 +263,9 @@ def _mask_data_sink_arguments(text: str) -> str:
         # Once a data sink feeds a pipeline, an arbitrary downstream wrapper
         # can eventually execute the matched text (command/env/nice/timeout,
         # or a user script). Do not attempt an incomplete interpreter allowlist.
-        if "|" in line:
+        if "|" in line or any(
+            marker in line for marker in ("$(", "`", "<(", ">(")
+        ):
             lines_out.append(line)
             continue
         try:
