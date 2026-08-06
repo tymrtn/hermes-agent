@@ -119,6 +119,13 @@ _CONTROL_CHARS = frozenset(";&|()")
 _DATA_SINK_EXECUTABLES = frozenset(
     {"grep", "egrep", "fgrep", "rg", "ag", "ack", "journalctl", "sqlite3", "psql"}
 )
+# Some otherwise data-only tools have explicit command-execution options.
+# ripgrep's ``--pre COMMAND`` runs COMMAND once per searched file, so masking
+# its following argument would turn the lifecycle guard into an execution
+# bypass. Keep ordinary rg patterns exempt while failing closed on --pre.
+_DATA_SINK_EXECUTION_OPTIONS = {
+    "rg": frozenset({"--pre"}),
+}
 # Argument shapes that can smuggle execution back INTO a data sink: command
 # and process substitution anywhere, sqlite3 dot-commands (`.shell ...`),
 # psql backslash escapes (`\! ...`). Any hit disables masking for the whole
@@ -266,10 +273,18 @@ def _mask_data_sink_arguments(text: str) -> str:
             if not segment:
                 continue
             index = _command_token_index(segment)
-            if index is not None and Path(segment[index]).name in _DATA_SINK_EXECUTABLES:
+            executable = Path(segment[index]).name if index is not None else ""
+            if index is not None and executable in _DATA_SINK_EXECUTABLES:
                 arguments = segment[index + 1 :]
+                execution_options = _DATA_SINK_EXECUTION_OPTIONS.get(executable, ())
+                has_execution_option = any(
+                    argument in execution_options
+                    or any(argument.startswith(f"{option}=") for option in execution_options)
+                    for argument in arguments
+                )
                 if not any(
-                    argument.startswith(".")
+                    has_execution_option
+                    or argument.startswith(".")
                     or any(marker in argument for marker in _UNSAFE_DATA_ARG_MARKERS)
                     for argument in arguments
                 ):

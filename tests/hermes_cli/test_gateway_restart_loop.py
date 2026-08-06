@@ -1079,6 +1079,14 @@ class TestLifecycleGuardDataArgumentExemption:
         assert self._scan(command) is False
 
     @pytest.mark.parametrize("command", [
+        "rg --pre 'sh -c \"hermes gateway restart\"' pattern .",
+        "rg --pre='sh -c \"systemctl stop hermes-gateway\"' pattern .",
+    ])
+    def test_ripgrep_pre_command_is_not_masked(self, command):
+        """rg --pre executes its argument; it is not a data-only pattern."""
+        assert self._scan(command) is True
+
+    @pytest.mark.parametrize("command", [
         # Execution smuggled through or around a data sink must still block.
         'sqlite3 db ".shell hermes gateway restart"',
         'psql -c "\\! systemctl restart hermes-gateway"',
