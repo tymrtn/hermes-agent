@@ -131,11 +131,16 @@ _DATA_SINK_EXECUTION_OPTIONS = {
 # psql backslash escapes (`\! ...`). Any hit disables masking for the whole
 # segment — fail closed to the plain regex verdict.
 _UNSAFE_DATA_ARG_MARKERS = ("`", "$(", "<(", ">(", "\\!")
+# psql's client-side ``\copy ... PROGRAM 'command'`` executes a local
+# process even though the SQL-looking argument would otherwise be data.
+_PSQL_COPY_PROGRAM = re.compile(r"(?is)\\copy\b.*\bprogram\b")
 # A data sink piped into a shell/interpreter can feed matched lines straight
 # to execution (`grep 'systemctl restart hermes-gateway' f | sh`); never mask
 # such a line.
 _PIPE_TO_INTERPRETER = re.compile(
-    r"\|\s*&?\s*(?:sudo\s+)?(?:sh|bash|dash|ksh|zsh|xargs|eval|source)\b"
+    r"\|\s*&?\s*(?:sudo\s+)?"
+    r"(?:(?:\S*/)?env(?:\s+[A-Za-z_][A-Za-z0-9_]*=\S+)*\s+)?"
+    r"(?:\S*/)?(?:sh|bash|dash|ksh|zsh|xargs|eval|source)\b"
 )
 
 # Executable-image magic numbers: ELF, PE/COFF, Mach-O (universal + thin,
@@ -282,8 +287,13 @@ def _mask_data_sink_arguments(text: str) -> str:
                     or any(argument.startswith(f"{option}=") for option in execution_options)
                     for argument in arguments
                 )
+                has_psql_program = (
+                    executable == "psql"
+                    and any(_PSQL_COPY_PROGRAM.search(argument) for argument in arguments)
+                )
                 if not any(
                     has_execution_option
+                    or has_psql_program
                     or argument.startswith(".")
                     or any(marker in argument for marker in _UNSAFE_DATA_ARG_MARKERS)
                     for argument in arguments

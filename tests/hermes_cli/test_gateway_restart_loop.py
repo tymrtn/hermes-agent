@@ -1087,6 +1087,15 @@ class TestLifecycleGuardDataArgumentExemption:
         assert self._scan(command) is True
 
     @pytest.mark.parametrize("command", [
+        "psql -c \"\\copy t FROM PROGRAM 'systemctl restart hermes-gateway'\"",
+        "grep 'systemctl restart hermes-gateway' cmds | /bin/sh",
+        "grep 'hermes gateway restart' cmds | env sh",
+        "grep 'hermes gateway restart' cmds | /usr/bin/env MODE=safe /bin/bash",
+    ])
+    def test_data_sink_execution_escape_hatches_are_not_masked(self, command):
+        assert self._scan(command) is True
+
+    @pytest.mark.parametrize("command", [
         # Execution smuggled through or around a data sink must still block.
         'sqlite3 db ".shell hermes gateway restart"',
         'psql -c "\\! systemctl restart hermes-gateway"',
