@@ -584,16 +584,11 @@ def _capture_real_kanban_root() -> Path:
     """
     if _PRE_SANDBOX_KANBAN_OVERRIDE:
         return Path(_PRE_SANDBOX_KANBAN_OVERRIDE).expanduser().resolve()
-    if _PRE_SANDBOX_HERMES_HOME and not _hermes_home_points_at_production(
-        _PRE_SANDBOX_HERMES_HOME
-    ):
-        # HERMES_HOME was genuinely set to a CUSTOM root before the sandbox
-        # (production-pointing values are sandboxed away above, in which case
-        # the env still holds the tempdir and the resolver would be wrong) —
-        # honor it via the normal resolver (it may be a profile dir whose
-        # root matters).
-        from hermes_constants import get_default_hermes_root
-        return get_default_hermes_root().resolve()
+    if _PRE_SANDBOX_HERMES_HOME:
+        # The collection sandbox now replaces every inherited HERMES_HOME.
+        # Preserve the exact pre-sandbox path as a deny root; it may itself be
+        # a custom production or nested profile home.
+        return Path(_PRE_SANDBOX_HERMES_HOME).expanduser().resolve()
     # No pre-existing HERMES_HOME: the real root is the platform default,
     # NOT the sandbox tempdir now sitting in the env.
     return (Path.home() / ".hermes").resolve()

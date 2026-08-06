@@ -135,6 +135,10 @@ _UNSAFE_DATA_ARG_MARKERS = ("`", "$(", "<(", ">(", "\\!")
 # PROGRAM`` forms execute a process even though the SQL-looking argument
 # would otherwise be treated as data.
 _PSQL_COPY_PROGRAM = re.compile(r"(?is)(?:\\copy|\bcopy)\b.*\bprogram\b")
+# sqlite3 processes dot-commands at the start of any input line. ANSI-C shell
+# quoting may present the separator as either a real newline or ``\n`` while
+# this guard is still looking at source text.
+_SQLITE_DOT_COMMAND = re.compile(r"(?m)(?:^|\r?\n|\\n)[ \t]*\.")
 # A data sink piped into a shell/interpreter can feed matched lines straight
 # to execution (`grep 'systemctl restart hermes-gateway' f | sh`); never mask
 # such a line.
@@ -254,7 +258,10 @@ def _mask_data_sink_arguments(text: str) -> str:
     lines_out: list[str] = []
     changed = False
     for line in text.splitlines() or [text]:
-        if _PIPE_TO_INTERPRETER.search(line):
+        # Once a data sink feeds a pipeline, an arbitrary downstream wrapper
+        # can eventually execute the matched text (command/env/nice/timeout,
+        # or a user script). Do not attempt an incomplete interpreter allowlist.
+        if "|" in line:
             lines_out.append(line)
             continue
         try:
@@ -295,9 +302,14 @@ def _mask_data_sink_arguments(text: str) -> str:
                     executable == "psql"
                     and any(_PSQL_COPY_PROGRAM.search(argument) for argument in arguments)
                 )
+                has_sqlite_dot_command = (
+                    executable == "sqlite3"
+                    and any(_SQLITE_DOT_COMMAND.search(argument) for argument in arguments)
+                )
                 if not any(
                     has_execution_option
                     or has_psql_program
+                    or has_sqlite_dot_command
                     or argument.startswith(".")
                     or any(marker in argument for marker in _UNSAFE_DATA_ARG_MARKERS)
                     for argument in arguments
