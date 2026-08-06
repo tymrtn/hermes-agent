@@ -125,6 +125,8 @@ _DATA_SINK_EXECUTABLES = frozenset(
 # bypass. Keep ordinary rg patterns exempt while failing closed on --pre.
 _DATA_SINK_EXECUTION_OPTIONS = {
     "rg": frozenset({"--pre"}),
+    "ag": frozenset({"--pager"}),
+    "ack": frozenset({"--pager"}),
 }
 # Argument shapes that can smuggle execution back INTO a data sink: command
 # and process substitution anywhere, sqlite3 dot-commands (`.shell ...`),
