@@ -140,7 +140,10 @@ _PSQL_COPY_PROGRAM = re.compile(r"(?is)(?:\\copy|\bcopy)\b.*\bprogram\b")
 # such a line.
 _PIPE_TO_INTERPRETER = re.compile(
     r"\|\s*&?\s*(?:sudo\s+)?"
-    r"(?:(?:\S*/)?env(?:\s+[A-Za-z_][A-Za-z0-9_]*=\S+)*\s+)?"
+    # env accepts flags, unset-variable operands, and assignments before the
+    # command. Treat every token between env and the eventual interpreter as
+    # wrapper syntax; regex backtracking anchors the final shell token.
+    r"(?:(?:\S*/)?env(?:\s+\S+)*\s+)?"
     r"(?:\S*/)?(?:sh|bash|dash|ksh|zsh|xargs|eval|source)\b"
 )
 

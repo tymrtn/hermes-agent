@@ -60,36 +60,14 @@ _PRE_SANDBOX_KANBAN_OVERRIDE = os.environ.get("HERMES_KANBAN_HOME", "").strip()
 _PRE_SANDBOX_HERMES_HOME = os.environ.get("HERMES_HOME", "")
 
 
-def _hermes_home_points_at_production(value: str) -> bool:
-    """True when a pre-set HERMES_HOME resolves to the real production root.
-
-    Gateway-launched shells (and developer shells that ``export
-    HERMES_HOME=~/.hermes``) hand pytest the PRODUCTION home. Historically
-    the session sandbox below honored any pre-set value, so collection-time
-    imports (logging handlers, ``hermes_state.DEFAULT_DB_PATH``) froze paths
-    inside the real ``~/.hermes`` — the escape vector that landed pytest
-    fixture rows (chat-1 / wx-chat sessions, /tmp/pytest-of-* routing
-    scopes) in the live state.db and flipped its journal mode under the
-    WAL-mode gateway writer. Only a genuinely custom (non-production)
-    HERMES_HOME is honored now.
-    """
-    if not value:
-        return True
-    try:
-        resolved = Path(value).expanduser().resolve()
-        real_root = (Path.home() / ".hermes").resolve()
-    except Exception:
-        return True
-    if resolved == real_root:
-        return True
-    # Profile home directly under the production root: <root>/profiles/<name>
-    return resolved.parent.name == "profiles" and resolved.parent.parent == real_root
-
-
-if _hermes_home_points_at_production(os.environ.get("HERMES_HOME", "")):
-    _SESSION_HERMES_HOME = tempfile.mkdtemp(prefix="hermes-test-home-")
-    os.environ["HERMES_HOME"] = _SESSION_HERMES_HOME
-    atexit.register(shutil.rmtree, _SESSION_HERMES_HOME, True)
+# Always establish a fresh collection-time sandbox, even when the invoking
+# shell supplied a custom HERMES_HOME. A custom path can itself be production
+# state (including nested/multiplex profile homes), and collection imports run
+# before per-test fixtures or live-DB deny guards can protect it. Tests that
+# need a particular home set it explicitly inside their own fixture scope.
+_SESSION_HERMES_HOME = tempfile.mkdtemp(prefix="hermes-test-home-")
+os.environ["HERMES_HOME"] = _SESSION_HERMES_HOME
+atexit.register(shutil.rmtree, _SESSION_HERMES_HOME, True)
 
 #: HERMES_HOME as it stood when conftest was imported - i.e. before any test
 #: module could import code that configures logging. Recorded so the guard in

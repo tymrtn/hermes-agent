@@ -1091,6 +1091,7 @@ class TestLifecycleGuardDataArgumentExemption:
         "psql -c \"COPY t FROM PROGRAM 'systemctl restart hermes-gateway'\"",
         "grep 'systemctl restart hermes-gateway' cmds | /bin/sh",
         "grep 'hermes gateway restart' cmds | env sh",
+        "grep 'hermes gateway restart' cmds | env -i sh",
         "grep 'hermes gateway restart' cmds | /usr/bin/env MODE=safe /bin/bash",
     ])
     def test_data_sink_execution_escape_hatches_are_not_masked(self, command):
