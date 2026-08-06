@@ -120,3 +120,40 @@ async def test_attachments_alias_dispatches_without_interrupt_during_active_sess
     assert os.environ["HERMES_AUTO_ATTACH_LOCAL_PATHS"] == "1"
     cfg = yaml.safe_load((tmp_path / "config.yaml").read_text())
     assert cfg["gateway"]["auto_attach_local_paths"] is True
+
+
+@pytest.mark.asyncio
+async def test_attachments_multiplex_writes_source_profile_without_global_env_leak(
+    tmp_path, monkeypatch
+):
+    import gateway.run as run_mod
+
+    root_home = tmp_path / "root"
+    profile_home = tmp_path / "profiles" / "scorandum"
+    root_home.mkdir(parents=True)
+    profile_home.mkdir(parents=True)
+    (root_home / "config.yaml").write_text(
+        "gateway:\n  auto_attach_local_paths: true\n"
+    )
+    (profile_home / "config.yaml").write_text(
+        "gateway:\n  auto_attach_local_paths: true\n"
+    )
+    monkeypatch.setattr(run_mod, "_hermes_home", root_home)
+    monkeypatch.setenv("HERMES_AUTO_ATTACH_LOCAL_PATHS", "1")
+
+    runner = _make_runner()
+    runner.config.multiplex_profiles = True
+    runner._resolve_profile_home_for_source = lambda _source: profile_home
+    event = _make_event("/attachments off")
+    event.source.profile = "scorandum"
+
+    result = await runner._handle_attachments_command(event)
+
+    assert "scorandum" in result
+    assert os.environ["HERMES_AUTO_ATTACH_LOCAL_PATHS"] == "1"
+    assert yaml.safe_load((root_home / "config.yaml").read_text())["gateway"][
+        "auto_attach_local_paths"
+    ] is True
+    assert yaml.safe_load((profile_home / "config.yaml").read_text())["gateway"][
+        "auto_attach_local_paths"
+    ] is False

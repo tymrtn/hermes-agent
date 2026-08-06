@@ -116,11 +116,12 @@ COMMAND_REGISTRY: list[CommandDef] = [
                cli_only=True),
     CommandDef("save", "Save the current conversation", "Session",
                cli_only=True),
-    CommandDef("retry", "Retry the last message (resend to agent)", "Session"),
+    CommandDef("retry", "Retry the last message (resend to agent)", "Session",
+               busy_policy="dispatch", busy_handler="followup"),
     CommandDef("prompt", "Compose your next prompt in $EDITOR (markdown), then send it", "Session",
                cli_only=True, args_hint="[initial text]", aliases=("compose",)),
     CommandDef("undo", "Back up N user turns and re-prompt (default 1)", "Session",
-               args_hint="[N]"),
+               args_hint="[N]", busy_policy="dispatch", busy_handler="followup"),
     CommandDef("title", "Set a title for the current session", "Session",
                args_hint="[name]"),
     CommandDef("handoff", "Hand off this session to a messaging platform (Telegram, Discord, etc.)", "Session",
@@ -157,8 +158,14 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("steer", "Inject a message after the next tool call without interrupting", "Session",
                args_hint="<prompt>", busy_policy="dispatch", busy_handler="steer"),
     CommandDef("goal", "Set a standing goal Hermes works on across turns until achieved", "Session",
-               args_hint="[text | draft <text> | show | pause | resume | clear | status | wait <pid> | unwait]",
+               args_hint="[text | draft <text> | show | gate add <cmd> | pause | resume | clear | status | wait <pid> | unwait]",
                busy_policy="dispatch", busy_handler="goal"),
+    CommandDef("heartbeat", "Set a recurring prompt that re-enters this session when idle", "Session",
+               aliases=("hb",), args_hint="[every <interval> <prompt> | status | pause | resume | clear]",
+               subcommands=("status", "pause", "resume", "clear"),
+               busy_policy="dispatch"),
+    CommandDef("refine", "Review this conversation now and save lessons to memory/skills", "Session",
+               args_hint="[focus instructions]"),
     CommandDef("moa", "Run one prompt through the default Mixture of Agents preset, then restore your model", "Session",
                args_hint="<prompt>", busy_policy="reject", busy_handler="moa"),
     CommandDef("subgoal", "Add or manage extra criteria on the active goal", "Session",
@@ -188,11 +195,11 @@ COMMAND_REGISTRY: list[CommandDef] = [
                cli_only=True),
     CommandDef("model", "Switch model (session-scoped; --global to persist)", "Configuration",
                args_hint="[model] [--provider name] [--global|--session] [--refresh]",
-               busy_policy="reject", busy_handler="model"),
+               busy_policy="dispatch", busy_handler="followup"),
     CommandDef("codex-runtime", "Toggle codex app-server runtime for OpenAI/Codex models",
                "Configuration", aliases=("codex_runtime",),
                args_hint="[auto|codex_app_server]",
-               busy_policy="reject", busy_handler="codex-runtime"),
+               busy_policy="dispatch", busy_handler="followup"),
 
     CommandDef("personality", "Set a predefined personality", "Configuration",
                args_hint="[name]"),
@@ -228,10 +235,12 @@ COMMAND_REGISTRY: list[CommandDef] = [
                subcommands=("manual", "smart", "off")),
     CommandDef("reasoning", "Manage reasoning effort and display", "Configuration",
                args_hint="[level|show|hide|full|clamp] [--global]",
-               subcommands=("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra", "show", "hide", "on", "off", "full", "clamp", "--global")),
+               subcommands=("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra", "show", "hide", "on", "off", "full", "clamp", "--global"),
+               busy_policy="dispatch", busy_handler="followup"),
     CommandDef("fast", "Toggle fast mode — OpenAI Priority Processing / Anthropic Fast Mode (Normal/Fast)", "Configuration",
                args_hint="[normal|fast|status] [--global]",
-               subcommands=("normal", "fast", "status", "on", "off", "--global")),
+               subcommands=("normal", "fast", "status", "on", "off", "--global"),
+               busy_policy="dispatch", busy_handler="followup"),
     CommandDef("skin", "Show or change the display skin/theme", "Configuration",
                cli_only=True, args_hint="[name]"),
     CommandDef("indicator", "Pick the TUI busy-indicator style", "Configuration",
@@ -1269,7 +1278,12 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #     /hermes attachments on Slack. Without this entry it tips the registry
 #     past the 50-cap and silently clamps /platform off, breaking Telegram
 #     parity.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "attachments"})
+#   - heartbeat: session heartbeat management; reached via /hermes heartbeat
+#     on Slack. Added at the 50-cap — a native slot would clamp /insights.
+#   - refine: on-demand memory/skill review; reached via /hermes refine on
+#     Slack. Added at the 50-cap — a native slot would clamp an existing
+#     native slash.
+_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "attachments", "heartbeat", "refine"})
 
 
 def _sanitize_slack_name(raw: str) -> str:
@@ -2196,8 +2210,12 @@ class SlashCommandAutoSuggest(AutoSuggest):
 
         if len(parts) == 1 and not text.endswith(" "):
             # Still typing the command name: /upd → suggest "ate"
+            # Prefer the SHORTEST matching command so a short, high-frequency
+            # command keeps its ghost text when a longer command shares its
+            # prefix (e.g. /he → "lp" for /help, not "artbeat" for
+            # /heartbeat; type one more letter to steer).
             word = text[1:].lower()
-            for cmd in COMMANDS:
+            for cmd in sorted(COMMANDS, key=len):
                 if self._completer is not None and not self._completer._command_allowed(cmd):
                     continue
                 cmd_name = cmd[1:]  # strip leading /
