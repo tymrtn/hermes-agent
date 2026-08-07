@@ -191,19 +191,20 @@ def test_cap_is_a_ceiling_when_no_cross_board_count_was_supplied(fleet_home):
 
 
 # ---------------------------------------------------------------------------
-# A corrupt neighbour must not take down the board being dispatched
+# A corrupt neighbour must fail admission closed without corrupting this board
 # ---------------------------------------------------------------------------
 
 
-def test_corrupt_secondary_board_does_not_fail_the_healthy_current_board(
+def test_corrupt_secondary_board_fails_admission_closed(
     fleet_home, caplog
 ):
-    """Counting board-b's workers must not turn into a board-a failure.
+    """Unknown neighbour workers must never be treated as zero.
 
     The gateway wraps each tick in ``except ... _is_corrupt_board_db_error``
     and quarantines *the board it was ticking*. If a corrupt neighbour's
-    error escapes through admission counting, board-a — perfectly healthy —
-    is the one that stops dispatching, and the real culprit is never named.
+    error escapes, board-a is misidentified as corrupt. Admission therefore
+    returns a structured fail-closed result naming the real culprit while
+    leaving board-a's ready work untouched.
     """
     ready = _create_tasks("board-a", "alpha", 2, priority=100)
     _corrupt_board_db("board-b")
@@ -219,9 +220,14 @@ def test_corrupt_secondary_board_does_not_fail_the_healthy_current_board(
                 spawn_fn=lambda *_args, **_kwargs: os.getpid(),
             )
 
-    assert [task_id for task_id, _who, _ws in res.spawned] == ready
-    # Only the failed board is excluded, and it is named — not swallowed.
+    assert res.spawned == []
+    assert res.skipped_uncounted_admission is True
     assert res.uncounted_admission_boards == ["board-b"]
+    with kb.connect_closing(board="board-a") as conn:
+        rows = conn.execute(
+            "SELECT id FROM tasks WHERE status = 'ready' ORDER BY created_at, id"
+        ).fetchall()
+    assert [row["id"] for row in rows] == ready
     assert any(
         "board-b" in record.getMessage()
         for record in caplog.records

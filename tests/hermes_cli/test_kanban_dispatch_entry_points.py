@@ -304,7 +304,7 @@ def test_out_of_scope_dispatch_does_not_let_the_next_tick_exceed_the_cap(
 
 
 # ---------------------------------------------------------------------------
-# Uncounted boards are reported, not swallowed
+# Uncounted boards fail closed and are reported, not swallowed
 # ---------------------------------------------------------------------------
 
 
@@ -332,13 +332,15 @@ def test_cli_json_reports_boards_left_out_of_the_admission_count(
     _cli_dispatch(as_json=True)
 
     payload = json.loads(capsys.readouterr().out)
+    assert payload["spawned"] == []
+    assert payload["skipped_uncounted_admission"] is True
     assert payload["uncounted_admission_boards"] == ["board-c"]
 
 
 def test_cli_human_output_warns_about_boards_left_out_of_the_count(
     fleet_home, monkeypatch, capsys
 ):
-    """An operator reading the summary has to see the cap was degraded."""
+    """An operator has to see why dispatch failed closed."""
     monkeypatch.setattr(
         "hermes_cli.config.load_config", lambda: _config(max_in_progress=4)
     )
@@ -349,6 +351,7 @@ def test_cli_human_output_warns_about_boards_left_out_of_the_count(
 
     out = capsys.readouterr().out
     assert "WARNING" in out
+    assert "dispatch skipped" in out
     assert "board-c" in out
 
 

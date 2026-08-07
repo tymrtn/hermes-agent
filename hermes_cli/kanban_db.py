@@ -7012,12 +7012,17 @@ class DispatchResult:
     """True when another dispatcher owns the machine-global cross-board
     concurrency admission lock. The losing tick performs no board writes and
     retries later; this is expected during overlapping manual/gateway ticks."""
+    skipped_uncounted_admission: bool = False
+    """True when a configured concurrency cap could not be proven because at
+    least one admission-scope board was unreadable. The tick fails closed and
+    performs no board writes rather than admitting workers against an
+    incomplete count."""
     uncounted_admission_boards: list[str] = field(default_factory=list)
     """Boards in the admission scope whose DB could not be read while
-    counting running workers (corrupt file, permissions). Their workers are
-    missing from the cap arithmetic, so the operator needs to see them —
-    ``_count_running_across_boards`` also logs each one at ERROR, and
-    ``hermes kanban dispatch`` surfaces them in both output modes."""
+    counting running workers (corrupt file, permissions). Admission fails
+    closed when this list is non-empty; ``_count_running_across_boards`` also
+    logs each one at ERROR, and ``hermes kanban dispatch`` surfaces them in
+    both output modes."""
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -8731,6 +8736,11 @@ def dispatch_once(
                     admission_boards=admission_boards,
                 )
             )
+            if uncounted:
+                return DispatchResult(
+                    skipped_uncounted_admission=True,
+                    uncounted_admission_boards=uncounted,
+                )
             result = _dispatch_once_board_locked(
                 conn,
                 spawn_fn=spawn_fn,
@@ -9015,9 +9025,7 @@ def _count_running_across_boards(
             uncounted.append(slug)
             _log.error(
                 "kanban dispatcher: board %s could not be read for concurrency "
-                "admission and is excluded from the running-worker count; "
-                "the cap is enforced over the remaining boards until it is "
-                "repaired",
+                "admission; dispatch will fail closed until it is repaired",
                 slug,
                 exc_info=True,
             )

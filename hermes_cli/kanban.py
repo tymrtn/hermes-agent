@@ -2586,14 +2586,15 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 for (tid, who, current) in res.skipped_per_profile_capped
             ],
             "auto_assigned_default": res.auto_assigned_default,
+            "skipped_uncounted_admission": res.skipped_uncounted_admission,
             "uncounted_admission_boards": res.uncounted_admission_boards,
         }, indent=2))
         return 0
     if res.uncounted_admission_boards:
-        # The global cap was enforced over fewer boards than it should have
-        # been. Silence here reads as "cap held" when it may not have.
+        # The global cap cannot be proven while a board is unreadable, so the
+        # tick fails closed rather than admitting workers against partial data.
         print(
-            "WARNING: concurrency cap counted without these unreadable boards: "
+            "WARNING: dispatch skipped; concurrency admission could not read: "
             f"{', '.join(res.uncounted_admission_boards)}"
         )
     print(f"Reclaimed:    {res.reclaimed}")
