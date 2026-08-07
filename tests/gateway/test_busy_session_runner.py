@@ -344,6 +344,45 @@ class TestButtonTap:
         assert "Steered" in toast or REACTION_STEER in toast
 
     @pytest.mark.asyncio
+    async def test_steer_can_be_rearmed_and_used_twice_in_same_run(self):
+        from gateway.run import GatewayRunner
+
+        runner, _ = _make_runner()
+        runner._busy_text_mode = "queue"
+        adapter = _make_adapter()
+        first = _make_event(text="first correction", message_id="m1")
+        second = _make_event(text="second correction", message_id="m2")
+        second.source = first.source
+        sk = build_session_key(first.source)
+        runner.adapters[first.source.platform] = adapter
+
+        agent = MagicMock()
+        agent.steer = MagicMock(return_value=True)
+        runner._running_agents[sk] = agent
+
+        runner._tool_bubble_msg_ids[sk] = "tool-msg-1"
+        assert await GatewayRunner._handle_active_session_busy_message(
+            runner, first, sk
+        ) is True
+        await runner._handle_busy_session_button_tap(sk, PRIMITIVE_STEER, first.source)
+
+        # The active run continues and reaches another tool, which creates a
+        # fresh control anchor for a later correction in the same run.
+        runner._tool_bubble_msg_ids[sk] = "tool-msg-2"
+        assert await GatewayRunner._handle_active_session_busy_message(
+            runner, second, sk
+        ) is True
+        await runner._handle_busy_session_button_tap(sk, PRIMITIVE_STEER, second.source)
+
+        assert [call.args[0] for call in agent.steer.call_args_list] == [
+            "first correction",
+            "second correction",
+        ]
+        adapter.attach_busy_session_buttons.assert_any_await(sk, "tool-msg-1")
+        adapter.attach_busy_session_buttons.assert_any_await(sk, "tool-msg-2")
+        assert sk not in runner._pending_followups
+
+    @pytest.mark.asyncio
     async def test_steer_flushes_staged_debounce_and_uses_consolidated_text(self):
         runner, _ = _make_runner()
         adapter = _make_adapter()
