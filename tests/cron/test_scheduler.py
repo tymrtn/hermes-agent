@@ -1446,6 +1446,7 @@ class TestSilentDelivery:
              patch("cron.scheduler.run_job", return_value=(True, "# output", "visible result", None)), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
              patch("cron.scheduler._job_profile_context", side_effect=fake_profile_context), \
+             patch("cron.scheduler._cwd_lock_timeout_seconds", return_value=42.0), \
              patch("cron.scheduler._profile_env_lock") as profile_lock, \
              patch("cron.scheduler._deliver_result") as deliver_mock, \
              patch("cron.scheduler.mark_job_run"):
@@ -1455,7 +1456,7 @@ class TestSilentDelivery:
             tick(verbose=False, adapters={"telegram": live_adapter}, loop=live_loop)
 
         assert seen_contexts == [("monitor-job", "scorandum")]
-        profile_lock.acquire_write.assert_called_once_with()
+        profile_lock.acquire_write.assert_called_once_with(timeout=42.0)
         profile_lock.release_write.assert_called_once_with()
         profile_lock.acquire_read.assert_not_called()
         profile_lock.release_read.assert_not_called()
@@ -1465,6 +1466,45 @@ class TestSilentDelivery:
             adapters=None,
             loop=None,
         )
+
+    def test_profile_context_loads_env_before_no_agent_or_prerun_body(self, tmp_path):
+        from cron.scheduler import _job_profile_context
+
+        events = []
+        with patch("hermes_cli.profiles.normalize_profile_name", return_value="scorandum"), \
+             patch("hermes_cli.profiles.resolve_profile_env", return_value=str(tmp_path)), \
+             patch("hermes_cli.env_loader.reset_secret_source_cache", side_effect=lambda: events.append("reset")), \
+             patch("hermes_cli.env_loader.load_hermes_dotenv", side_effect=lambda **kw: events.append(("load", kw["hermes_home"]))):
+            with _job_profile_context("monitor-job", "scorandum"):
+                events.append("body")
+
+        assert events == ["reset", ("load", tmp_path.resolve()), "body"]
+
+    def test_profile_lock_timeout_fails_closed_before_job_execution(self):
+        """A wedged profile lane must not block manual/provider runs forever."""
+        from cron.scheduler import run_one_job_profiled
+
+        job = self._make_job()
+        job["profile"] = "scorandum"
+        with patch("cron.scheduler._cwd_lock_timeout_seconds", return_value=42.0), \
+             patch("cron.scheduler._profile_env_lock") as profile_lock, \
+             patch("cron.scheduler.create_execution", return_value={"id": "exec-1"}), \
+             patch("cron.scheduler.mark_execution_running") as running_mock, \
+             patch("cron.scheduler.mark_job_run") as mark_mock, \
+             patch("cron.scheduler.finish_execution") as finish_mock, \
+             patch("cron.scheduler.run_one_job") as run_mock:
+            profile_lock.acquire_write.return_value = False
+            assert run_one_job_profiled(job) is True
+
+        profile_lock.acquire_write.assert_called_once_with(timeout=42.0)
+        profile_lock.release_write.assert_not_called()
+        running_mock.assert_called_once_with("exec-1")
+        mark_mock.assert_called_once()
+        finish_mock.assert_called_once_with(
+            "exec-1", success=False,
+            error=mark_mock.call_args.args[2],
+        )
+        run_mock.assert_not_called()
 
     def test_output_saved_even_when_delivery_suppressed(self):
         with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
@@ -1755,7 +1795,7 @@ class TestParallelTick:
         barrier = threading.Barrier(2, timeout=5)
         call_order = []
 
-        def mock_run_job(job, *, defer_agent_teardown=None):
+        def mock_run_job(job, *, defer_agent_teardown=None, **kw):
             """Each job hits a barrier — both must be active simultaneously."""
             call_order.append(("start", job["id"]))
             barrier.wait()  # blocks until both threads reach here
@@ -1789,7 +1829,7 @@ class TestParallelTick:
         from gateway.session_context import get_session_env
         seen = {}
 
-        def mock_run_job(job, *, defer_agent_teardown=None):
+        def mock_run_job(job, *, defer_agent_teardown=None, **kw):
             origin = job.get("origin", {})
             # run_job sets ContextVars — verify each job sees its own
             from gateway.session_context import set_session_vars, clear_session_vars
@@ -2422,6 +2462,30 @@ class TestMultiTargetDeliveryContinuesOnFailure:
         assert "a@example.com" in result
         assert "b@example.com" in result
         assert mock_pool.submit.call_count == 2
+
+class TestBuildJobPromptExtraPrompt:
+    """Regression: _build_job_prompt merges extra_prompt into the assembled prompt."""
+
+    def test_extra_prompt_appended_with_header(self):
+        """extra_prompt appears under a '## Run Context' header."""
+        job = {"prompt": "stored prompt"}
+        result = _build_job_prompt(job, extra_prompt="CONTEXT: client=Foo")
+        assert "stored prompt" in result
+        assert "## Run Context" in result
+        assert "CONTEXT: client=Foo" in result
+
+    def test_extra_prompt_does_not_mutate_job(self):
+        """The job dict's 'prompt' field must remain unchanged."""
+        job = {"prompt": "original"}
+        _build_job_prompt(job, extra_prompt="transient context")
+        assert job["prompt"] == "original"
+
+    def test_no_extra_prompt_omits_header(self):
+        """Without extra_prompt, no '## Run Context' header is injected."""
+        job = {"prompt": "just the stored prompt"}
+        result = _build_job_prompt(job)
+        assert "## Run Context" not in result
+        assert "just the stored prompt" in result
 
 
 class TestSetCronSessionTitle:

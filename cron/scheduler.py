@@ -399,6 +399,35 @@ def get_running_job_ids() -> "frozenset[str]":
         return frozenset(_running_job_ids)
 
 
+def try_register_running_job(job_id: str) -> bool:
+    """Atomically add ``job_id`` to the in-flight running set.
+
+    Returns False (without registering) when the job is already mid-run —
+    the caller must skip the fire. This is the single dedupe owner shared by
+    the ticker's ``_submit_with_guard`` and manual runs
+    (``tools/cronjob_tools``): the fire claim alone cannot prevent a
+    double-fire because its TTL (300s) is routinely outlived by real jobs,
+    after which a manual ``cronjob(action='run')`` would claim successfully
+    and run the same job concurrently (idea from #53395 by @izumi0uu).
+
+    Registration also makes the run visible to ``get_running_job_ids`` (the
+    gateway shutdown drain, #60432) and ``mark_running_jobs_interrupted``.
+    Callers MUST pair a successful registration with
+    ``release_running_job`` in a ``finally`` block.
+    """
+    with _running_lock:
+        if job_id in _running_job_ids:
+            return False
+        _running_job_ids.add(job_id)
+        return True
+
+
+def release_running_job(job_id: str) -> None:
+    """Remove ``job_id`` from the in-flight running set (idempotent)."""
+    with _running_lock:
+        _running_job_ids.discard(job_id)
+
+
 def mark_running_jobs_interrupted(reason: str) -> list:
     """Best-effort: mark every currently in-flight cron job interrupted.
 
@@ -496,11 +525,28 @@ class _ReadWriteLock:
         self._writer_active = False
         self._writers_waiting = 0
 
-    def acquire_read(self) -> None:
+    def acquire_read(self, timeout: float | None = None) -> bool:
+        """Acquire a read lock.
+
+        Returns ``True`` if the lock was acquired, ``False`` on timeout.
+        A timed-out caller proceeds without the lock (degraded mode) —
+        see the call-site in ``run_job`` for the logging / trade-off.
+        """
+        deadline = (
+            time.monotonic() + timeout if timeout is not None else None
+        )
         with self._cond:
             while self._writer_active or self._writers_waiting > 0:
-                self._cond.wait()
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        self._cond.notify_all()
+                        return False
+                    self._cond.wait(timeout=remaining)
+                else:
+                    self._cond.wait()
             self._readers += 1
+        return True
 
     def release_read(self) -> None:
         with self._cond:
@@ -508,15 +554,31 @@ class _ReadWriteLock:
             if self._readers == 0:
                 self._cond.notify_all()
 
-    def acquire_write(self) -> None:
+    def acquire_write(self, timeout: float | None = None) -> bool:
+        """Acquire a write lock.
+
+        Returns ``True`` if the lock was acquired, ``False`` on timeout.
+        A timed-out caller proceeds without the lock (degraded mode).
+        """
+        deadline = (
+            time.monotonic() + timeout if timeout is not None else None
+        )
         with self._cond:
             self._writers_waiting += 1
             try:
                 while self._writer_active or self._readers > 0:
-                    self._cond.wait()
+                    if deadline is not None:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            self._cond.notify_all()
+                            return False
+                        self._cond.wait(timeout=remaining)
+                    else:
+                        self._cond.wait()
             finally:
                 self._writers_waiting -= 1
             self._writer_active = True
+        return True
 
     def release_write(self) -> None:
         with self._cond:
@@ -533,6 +595,53 @@ _terminal_cwd_lock = _ReadWriteLock()
 # retaining parallelism among jobs that stay in the scheduler's default
 # profile. This lock begins before run_job enters the cwd critical section.
 _profile_env_lock = _ReadWriteLock()
+
+# Ceiling on how long a cron job waits for the TERMINAL_CWD lock before
+# FAILING (fail-closed, #79768). Derived from the cron inactivity limit
+# (HERMES_CRON_TIMEOUT, default 600s): a wedged lock holder stops touching
+# its activity clock, so the inactivity monitor usually reaps it and the
+# lock is released within roughly that limit. The bound is measured from
+# the WAITER's arrival, so a holder that wedges late (or hangs in pre-agent
+# setup before the monitor arms) can still outlive it — waiters then fail
+# loudly rather than run: proceeding without the lock lets the holder's
+# process-global TERMINAL_CWD override leak into this job's shell/file/
+# code-exec commands (wrong-directory execution — the exact corruption
+# _ReadWriteLock exists to prevent, see
+# test_reader_never_observes_writer_override). A healthy long-running
+# workdir job past the bound also fails its waiters loudly rather than
+# corrupting them silently; the failure names the holder pattern so the fix
+# (stagger schedules / drop the workdir) is actionable.
+_CWD_LOCK_TIMEOUT_FLOOR_SECONDS = 120.0
+_CWD_LOCK_TIMEOUT_MARGIN_SECONDS = 60.0
+
+
+def _cron_inactivity_seconds() -> float:
+    """Parse HERMES_CRON_TIMEOUT (seconds). 0 = unlimited; bad input = 600.
+
+    Shared by run_job's inactivity monitor (which maps 0 to "no limit") and
+    the cwd-lock bound below (which keeps the wait bounded regardless) so
+    the two sites cannot drift apart — the lock bound must stay at or above
+    the inactivity limit or waiters would fail while a healthy holder runs.
+    """
+    raw = os.getenv("HERMES_CRON_TIMEOUT", "").strip()
+    if not raw:
+        return 600.0
+    try:
+        return float(raw)
+    except (ValueError, TypeError):
+        logger.warning("Invalid HERMES_CRON_TIMEOUT=%r; using default 600s", raw)
+        return 600.0
+
+
+def _cwd_lock_timeout_seconds() -> float:
+    """Bound for the TERMINAL_CWD lock wait: inactivity limit + margin."""
+    inactivity = _cron_inactivity_seconds()
+    if inactivity <= 0:  # 0 = unlimited job runtime; keep the wait bounded.
+        inactivity = 600.0
+    return (
+        max(inactivity, _CWD_LOCK_TIMEOUT_FLOOR_SECONDS)
+        + _CWD_LOCK_TIMEOUT_MARGIN_SECONDS
+    )
 
 
 def _get_parallel_pool(max_workers: Optional[int]) -> concurrent.futures.ThreadPoolExecutor:
@@ -668,6 +777,14 @@ def _job_profile_context(job_id: str, profile: Optional[str]):
     try:
         override_token = set_hermes_home_override(profile_home)
         _hermes_home = profile_home
+        # Profile env must exist before no-agent and pre-run scripts; the
+        # full agent path refreshes it again later for hot secret changes.
+        from hermes_cli.env_loader import (
+            load_hermes_dotenv,
+            reset_secret_source_cache,
+        )
+        reset_secret_source_cache()
+        load_hermes_dotenv(hermes_home=profile_home)
         logger.info("Job '%s': using Hermes profile '%s' (%s)", job_id, normalized_profile, profile_home)
         yield normalized_profile
     finally:
@@ -680,6 +797,75 @@ def _job_profile_context(job_id: str, profile: Optional[str]):
         for key, value in env_snapshot.items():
             if os.environ.get(key) != value:
                 os.environ[key] = value
+
+
+def run_one_job_profiled(
+    job: dict,
+    adapters: Optional[dict] = None,
+    loop=None,
+    verbose: bool = False,
+    execution_id: Optional[str] = None,
+    extra_prompt: Optional[str] = None,
+) -> bool:
+    """Run one job behind the profile/env isolation used by scheduler ticks.
+
+    Manual tool runs and external scheduler providers must use the same lane as
+    due-job dispatch. Otherwise a profile-pinned job inherits the caller's
+    config, secrets, and live delivery adapter. The lock wait is bounded by the
+    cron inactivity budget so a wedged profile job cannot block the fleet
+    indefinitely before ``run_job`` reaches its TERMINAL_CWD timeout.
+    """
+    has_profile_override = bool(str(job.get("profile") or "").strip())
+    timeout = _cwd_lock_timeout_seconds()
+    if has_profile_override:
+        acquired = _profile_env_lock.acquire_write(timeout=timeout)
+    else:
+        acquired = _profile_env_lock.acquire_read(timeout=timeout)
+    if not acquired:
+        mode = "write" if has_profile_override else "read"
+        error = (
+            f"Timed out waiting for the cron profile/env {mode} lock after "
+            f"{timeout:.0f}s — another profile-pinned cron job appears wedged"
+        )
+        logger.error("Job '%s': %s", job["id"], error)
+        ledger_execution_id = execution_id or job.get("execution_id")
+        if not ledger_execution_id:
+            ledger_execution_id = create_execution(job["id"], source="direct")["id"]
+        try:
+            mark_execution_running(ledger_execution_id)
+        except Exception as record_err:
+            logger.error("Failed to mark execution %s running: %s", ledger_execution_id, record_err)
+        try:
+            # Besides surfacing the failure, this clears external-provider fire
+            # claims so a lock timeout cannot wedge future occurrences.
+            mark_job_run(job["id"], False, error)
+        except Exception as record_err:
+            logger.error("Failed to record profile-lock timeout for job %s: %s", job["id"], record_err)
+        try:
+            finish_execution(ledger_execution_id, success=False, error=error)
+        except Exception as record_err:
+            logger.error("Failed to finish execution %s: %s", ledger_execution_id, record_err)
+        # ``run_one_job`` returns True when an occurrence was processed even
+        # when that occurrence failed. External providers use this signal to
+        # re-arm the next occurrence.
+        return True
+    try:
+        with _job_profile_context(job["id"], job.get("profile")):
+            delivery_adapters = None if has_profile_override else adapters
+            delivery_loop = None if has_profile_override else loop
+            return run_one_job(
+                job,
+                adapters=delivery_adapters,
+                loop=delivery_loop,
+                verbose=verbose,
+                execution_id=execution_id,
+                extra_prompt=extra_prompt,
+            )
+    finally:
+        if has_profile_override:
+            _profile_env_lock.release_write()
+        else:
+            _profile_env_lock.release_read()
 
 
 def _resolve_origin(job: dict) -> Optional[dict]:
@@ -2613,7 +2799,11 @@ def _parse_wake_gate(script_output: str) -> bool:
     return gate.get("wakeAgent", True) is not False
 
 
-def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
+def _build_job_prompt(
+    job: dict,
+    prerun_script: Optional[tuple] = None,
+    extra_prompt: Optional[str] = None,
+) -> str:
     """Build the effective prompt for a cron job, optionally loading one or more skills first.
 
     Args:
@@ -2623,8 +2813,14 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
             When provided, the script is not re-executed and the cached
             result is used for prompt injection. When omitted, the script
             (if any) runs inline as before.
+        extra_prompt: Optional per-run context (from ``cronjob(action='run')``,
+            #57331 — salvaged from #57342 by @liuhao1024). Appended to the
+            stored prompt under a ``## Run Context`` header for this single
+            fire only — never persisted to the job definition.
     """
     user_prompt = str(job.get("prompt") or "")
+    if extra_prompt:
+        user_prompt = f"{user_prompt}\n\n## Run Context\n{extra_prompt}"
     prompt = user_prompt
     skills = job.get("skills")
     # True when runtime-collected DATA (script stdout, upstream-job output)
@@ -2937,7 +3133,8 @@ def _guard_job_credential_exfil(job: dict) -> None:
 
 
 def run_job(
-    job: dict, *, defer_agent_teardown: Optional[list] = None
+    job: dict, *, defer_agent_teardown: Optional[list] = None,
+    extra_prompt: Optional[str] = None,
 ) -> tuple[bool, str, str, Optional[str]]:
     """
     Execute a single cron job.
@@ -2951,6 +3148,10 @@ def run_job(
     torn-down async client (defense-in-depth alongside the interpreter-shutdown
     guard). When ``None`` (the default) teardown happens inline as before, so
     every existing caller is unchanged.
+
+    ``extra_prompt``: optional per-run context from ``cronjob(action='run',
+    prompt=...)`` (#57331). Appended to the stored prompt for this fire only —
+    never persisted to the job definition.
 
     Returns:
         Tuple of (success, full_output_doc, final_response, error_message)
@@ -3160,7 +3361,9 @@ def run_job(
             return True, silent_doc, SILENT_MARKER, None
 
     try:
-        prompt = _build_job_prompt(job, prerun_script=prerun_script)
+        prompt = _build_job_prompt(
+            job, prerun_script=prerun_script, extra_prompt=extra_prompt
+        )
     except CronPromptInjectionBlocked as block_exc:
         # Assembled prompt (user prompt + loaded skill content) tripped the
         # injection scanner. Refuse to run the agent this tick and surface
@@ -3286,10 +3489,14 @@ def run_job(
     _prior_terminal_cwd = os.environ.get("TERMINAL_CWD", "_UNSET_")
 
     _holds_cwd_write = _job_workdir is not None
+    _cwd_lock_timeout = _cwd_lock_timeout_seconds()
+    _cwd_lock_acquired = True
     if _holds_cwd_write:
-        _terminal_cwd_lock.acquire_write()
+        if not _terminal_cwd_lock.acquire_write(timeout=_cwd_lock_timeout):
+            _cwd_lock_acquired = False
     else:
-        _terminal_cwd_lock.acquire_read()
+        if not _terminal_cwd_lock.acquire_read(timeout=_cwd_lock_timeout):
+            _cwd_lock_acquired = False
 
     # Everything after the acquire MUST live inside this try, so the finally
     # below always releases the lock even if the env override or any later
@@ -3300,6 +3507,22 @@ def run_job(
     _cron_session_token = None
     _non_dispatcher_token = None
     try:
+        if not _cwd_lock_acquired:
+            # Fail closed (#79768): running without the lock would let a
+            # concurrent workdir job's process-global TERMINAL_CWD override
+            # leak into this job's shell/file/code-exec commands — silent
+            # wrong-directory execution, the exact corruption the lock
+            # exists to prevent. A loud failure is recoverable (next tick /
+            # manual rerun); a job that ran in the wrong directory is not.
+            raise TimeoutError(
+                f"Timed out waiting for the TERMINAL_CWD "
+                f"{'write' if _holds_cwd_write else 'read'} lock after "
+                f"{_cwd_lock_timeout:.0f}s — another cron job (a workdir "
+                f"writer, or long-running readers) has held it for longer "
+                f"than the cron inactivity limit. If a workdir job is the "
+                f"holder, stagger its schedule or remove its workdir to "
+                f"unblock this job (#79768)."
+            )
         # Scope cron approval policy to this job. Keep the token so the finally
         # restores the pre-job state instead of pinning an explicit empty value,
         # which would suppress the legacy os.environ fallback used by standalone
@@ -3729,18 +3952,7 @@ def run_job(
         #
         # Uses the agent's built-in activity tracker (updated by
         # _touch_activity() on every tool call, API call, and stream delta).
-        _raw_cron_timeout = os.getenv("HERMES_CRON_TIMEOUT", "").strip()
-        if _raw_cron_timeout:
-            try:
-                _cron_timeout = float(_raw_cron_timeout)
-            except (ValueError, TypeError):
-                logger.warning(
-                    "Invalid HERMES_CRON_TIMEOUT=%r; using default 600s",
-                    _raw_cron_timeout,
-                )
-                _cron_timeout = 600.0
-        else:
-            _cron_timeout = 600.0
+        _cron_timeout = _cron_inactivity_seconds()
         _cron_inactivity_limit = _cron_timeout if _cron_timeout > 0 else None
         _POLL_INTERVAL = 5.0
         # Keep the one-shot run_claim fresh while the run is alive (#62002):
@@ -3959,19 +4171,22 @@ def run_job(
 
     finally:
         # Restore TERMINAL_CWD to whatever it was before this job ran.  We
-        # only ever mutate it when the job has a workdir; see the setup block
-        # at the top of run_job for the serialization guarantee.
-        if _job_workdir:
+        # only ever mutate it when the job has a workdir AND actually held
+        # the write lock — a fail-closed timeout raised before the env-set,
+        # so restoring there would replay a pre-wait snapshot over the
+        # ACTIVE holder's live override.
+        if _job_workdir and _cwd_lock_acquired:
             if _prior_terminal_cwd == "_UNSET_":
                 os.environ.pop("TERMINAL_CWD", None)
             else:
                 os.environ["TERMINAL_CWD"] = _prior_terminal_cwd
         # Release the cwd lock now that the env is restored, so a waiting
         # workdir job (or queued reader) can proceed without seeing the override.
-        if _holds_cwd_write:
-            _terminal_cwd_lock.release_write()
-        else:
-            _terminal_cwd_lock.release_read()
+        if _cwd_lock_acquired:
+            if _holds_cwd_write:
+                _terminal_cwd_lock.release_write()
+            else:
+                _terminal_cwd_lock.release_read()
         # Clean up ContextVar session/delivery state for this job.
         # clear_session_vars also clears _SESSION_CWD internally, so no
         # separate clear_session_cwd() call is needed.
@@ -4099,6 +4314,7 @@ def run_one_job(
     loop=None,
     verbose: bool = False,
     execution_id: Optional[str] = None,
+    extra_prompt: Optional[str] = None,
 ) -> bool:
     """Run ONE due job end-to-end: execute → save output → deliver → mark.
 
@@ -4170,7 +4386,8 @@ def run_one_job(
         _deferred_agents: list = []
         try:
             success, output, final_response, error = run_job(
-                job, defer_agent_teardown=_deferred_agents
+                job, defer_agent_teardown=_deferred_agents,
+                extra_prompt=extra_prompt,
             )
         except BaseException:
             # run_job's finally still hands back the agent when it raises; tear
@@ -4323,6 +4540,51 @@ def _notify_provider_jobs_changed() -> None:
         logger.debug("on_jobs_changed notify failed: %s", e)
 
 
+class CronSchedulerRegistrationError(RuntimeError):
+    """A job was persisted but its first external trigger was not registered."""
+
+    def __init__(self, job: dict, cause: Exception) -> None:
+        self.job = job
+        self.cause = cause
+        super().__init__(
+            f"Cron job '{job['id']}' was saved, but its first scheduler "
+            f"registration failed ({type(cause).__name__}). Do not create a "
+            "duplicate. Pause/resume or update the job to retry registration."
+        )
+
+    def user_message(self) -> str:
+        """Human-facing variant for chat/CLI surfaces (no exception class name)."""
+        label = self.job.get("name") or self.job["id"]
+        return (
+            f"Saved cron job '{label}', but couldn't register it with the "
+            "external scheduler yet. The job is kept — don't re-create it; "
+            "pause/resume or edit it (e.g. via /cron) to retry registration."
+        )
+
+    def to_dict(self) -> dict:
+        """Return the public partial-failure contract without provider details."""
+        return {
+            "error": str(self),
+            "job_id": self.job["id"],
+            "job_saved": True,
+            "scheduler_registered": False,
+            "retry_create": False,
+        }
+
+
+def create_job_with_scheduler_registration(**kwargs) -> dict:
+    """Persist one job and register its first trigger with the active provider."""
+    from cron.jobs import create_job
+    from cron.scheduler_provider import resolve_cron_scheduler
+
+    job = create_job(**kwargs)
+    try:
+        resolve_cron_scheduler().register_job(job)
+    except Exception as exc:
+        raise CronSchedulerRegistrationError(job, exc) from exc
+    return job
+
+
 def tick(
     verbose: bool = True,
     adapters=None,
@@ -4427,27 +4689,13 @@ def tick(
 
         def _process_job(job: dict, execution_id: Optional[str] = None) -> bool:
             """Run one due job end-to-end with profile-aware delivery isolation."""
-            has_profile_override = bool(str(job.get("profile") or "").strip())
-            if has_profile_override:
-                _profile_env_lock.acquire_write()
-            else:
-                _profile_env_lock.acquire_read()
-            try:
-                with _job_profile_context(job["id"], job.get("profile")):
-                    delivery_adapters = None if has_profile_override else adapters
-                    delivery_loop = None if has_profile_override else loop
-                    return run_one_job(
-                        job,
-                        adapters=delivery_adapters,
-                        loop=delivery_loop,
-                        verbose=verbose,
-                        execution_id=execution_id,
-                    )
-            finally:
-                if has_profile_override:
-                    _profile_env_lock.release_write()
-                else:
-                    _profile_env_lock.release_read()
+            return run_one_job_profiled(
+                job,
+                adapters=adapters,
+                loop=loop,
+                verbose=verbose,
+                execution_id=execution_id,
+            )
 
         # Partition due jobs: jobs with a per-job workdir and/or profile touch
         # process-global runtime state inside run_job. Workdir jobs temporarily
@@ -4487,11 +4735,9 @@ def tick(
                     job.get("name", job_id),
                 )
                 return None
-            with _running_lock:
-                if job_id in _running_job_ids:
-                    logger.info("Job '%s' already running — skipping", job.get("name", job_id))
-                    return None
-                _running_job_ids.add(job_id)
+            if not try_register_running_job(job_id):
+                logger.info("Job '%s' already running — skipping", job.get("name", job_id))
+                return None
             # Record the attempt before executor dispatch. Recovery classifies
             # abandoned records as unknown; it never automatically retries them.
             execution = create_execution(job_id, source="builtin")
@@ -4501,14 +4747,12 @@ def tick(
                 try:
                     return ctx.run(_process_job, j, eid)
                 finally:
-                    with _running_lock:
-                        _running_job_ids.discard(j["id"])
+                    release_running_job(j["id"])
 
             try:
                 return pool.submit(_run_and_release)
             except Exception as submit_err:
-                with _running_lock:
-                    _running_job_ids.discard(job_id)
+                release_running_job(job_id)
                 finish_execution(
                     execution["id"],
                     success=False,
