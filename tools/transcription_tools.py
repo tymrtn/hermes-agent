@@ -1741,6 +1741,38 @@ def _convert_caf_to_wav(file_path: str) -> Optional[str]:
     return None
 
 
+_WHISPER_STDOUT_SEGMENT_RE = re.compile(
+    r"^\s*\[(?:\d{2}:)?\d{2}:\d{2}\.\d{3}\s*-->\s*"
+    r"(?:\d{2}:)?\d{2}:\d{2}\.\d{3}\]\s*(?P<text>.*)\s*$"
+)
+
+
+def _extract_whisper_stdout_transcript(stdout: str) -> str:
+    """Recover transcript text from OpenAI Whisper's timestamped stdout.
+
+    The local command contract normally reads a ``.txt`` artifact. Some
+    successful Whisper CLI invocations emit the full timestamped transcript on
+    stdout without leaving that artifact behind. Accept only timestamped
+    segment lines so warnings, progress messages, and arbitrary diagnostics
+    can never become user speech.
+    """
+    segments: list[str] = []
+    saw_nonempty = False
+    for line in (stdout or "").splitlines():
+        if not line.strip():
+            continue
+        saw_nonempty = True
+        match = _WHISPER_STDOUT_SEGMENT_RE.match(line)
+        if not match:
+            return ""
+        text = match.group("text").strip()
+        if text:
+            segments.append(text)
+    if not saw_nonempty:
+        return ""
+    return "\n".join(segments).strip()
+
+
 def _transcribe_local_command(file_path: str, model_name: str) -> Dict[str, Any]:
     """Run the configured local STT command template and read back a .txt transcript."""
     command_template = _get_local_command_template()
@@ -1775,7 +1807,18 @@ def _transcribe_local_command(file_path: str, model_name: str) -> Dict[str, Any]
             from tools.environments.local import hermes_subprocess_env
 
             child_env = hermes_subprocess_env(inherit_credentials=False)
-            subprocess.run(
+            # launchd/systemd gateways commonly inherit a minimal PATH. The
+            # Whisper executable itself may be found by absolute path while it
+            # later invokes bare ``ffmpeg``, then exits 0 after skipping the
+            # input. Make the same common local binary roots visible to the
+            # child and its descendants without restoring any scrubbed secrets.
+            existing_path = child_env.get("PATH", "")
+            existing_entries = [p for p in existing_path.split(os.pathsep) if p]
+            common_entries = [
+                p for p in COMMON_LOCAL_BIN_DIRS if p not in existing_entries
+            ]
+            child_env["PATH"] = os.pathsep.join(common_entries + existing_entries)
+            completed = subprocess.run(
                 shlex.split(command),
                 check=True,
                 capture_output=True,
@@ -1790,6 +1833,19 @@ def _transcribe_local_command(file_path: str, model_name: str) -> Dict[str, Any]
 
             txt_files = sorted(Path(output_dir).glob("*.txt"))
             if not txt_files:
+                stdout_transcript = _extract_whisper_stdout_transcript(completed.stdout)
+                if stdout_transcript:
+                    logger.info(
+                        "Recovered %s transcript from local Whisper stdout (%s, %d chars)",
+                        Path(file_path).name,
+                        normalized_model,
+                        len(stdout_transcript),
+                    )
+                    return {
+                        "success": True,
+                        "transcript": stdout_transcript,
+                        "provider": "local_command",
+                    }
                 return {
                     "success": False,
                     "transcript": "",

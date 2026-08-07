@@ -13,6 +13,7 @@ import os
 import random
 import re
 import socket as _socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -991,6 +992,29 @@ def cache_audio_from_bytes(data: bytes, ext: str = ".ogg") -> str:
     filepath = cache_dir / filename
     filepath.write_bytes(data)
     return str(filepath)
+
+
+def remove_managed_cached_audio(path: str) -> bool:
+    """Best-effort removal of one direct child of Hermes' audio cache.
+
+    Parent resolution rejects traversal; ``lstat`` rejects symlinks before the
+    direct-child unlink. If the entry is swapped after ``lstat``, unlink still
+    removes the directory entry itself rather than following a symlink target.
+    Arbitrary audio files supplied by users or tools are never deleted.
+    """
+    try:
+        cache_dir = get_audio_cache_dir().resolve()
+        candidate = Path(path)
+        candidate_parent = candidate.parent.resolve(strict=True)
+        if candidate_parent != cache_dir or not candidate.name:
+            return False
+        candidate = cache_dir / candidate.name
+        if not stat.S_ISREG(candidate.lstat().st_mode):
+            return False
+        candidate.unlink()
+        return True
+    except (OSError, RuntimeError, ValueError):
+        return False
 
 
 async def cache_audio_from_url(url: str, ext: str = ".ogg", retries: int = 2) -> str:

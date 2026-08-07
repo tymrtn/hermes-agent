@@ -252,6 +252,11 @@ class TestTranscribeLocalCommand:
         monkeypatch.setenv("AUXILIARY_VISION_API_KEY", "sk-vision")
         monkeypatch.setenv("OPENAI_API_KEY", "sk-openai")
         monkeypatch.setenv("MY_SAFE_LOCAL_STT", "keep")
+        monkeypatch.setenv("PATH", "/usr/bin:/bin")
+        monkeypatch.setattr(
+            "tools.transcription_tools.COMMON_LOCAL_BIN_DIRS",
+            ("/opt/homebrew/bin", "/usr/local/bin"),
+        )
         monkeypatch.setenv(
             "HERMES_LOCAL_STT_COMMAND",
             "whisper {input_path} --model {model} --output_dir {output_dir} --language {language}",
@@ -294,6 +299,12 @@ class TestTranscribeLocalCommand:
         assert "AUXILIARY_VISION_API_KEY" not in env
         assert "OPENAI_API_KEY" not in env
         assert env["MY_SAFE_LOCAL_STT"] == "keep"
+        assert env["PATH"].split(os.pathsep) == [
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            "/usr/bin",
+            "/bin",
+        ]
 
     def test_command_fallback_with_template(self, monkeypatch, sample_ogg, tmp_path):
         out_dir = tmp_path / "local-out"
@@ -331,6 +342,68 @@ class TestTranscribeLocalCommand:
         assert result["success"] is True
         assert result["transcript"] == "hello from local command"
         assert result["provider"] == "local_command"
+
+    def test_command_recovers_timestamped_whisper_stdout_without_txt(
+        self, monkeypatch, sample_wav, tmp_path
+    ):
+        out_dir = tmp_path / "local-out"
+        out_dir.mkdir()
+        monkeypatch.setenv(
+            "HERMES_LOCAL_STT_COMMAND",
+            "whisper {input_path} --model {model} --output_dir {output_dir} --language {language}",
+        )
+
+        def fake_tempdir(prefix=None):
+            class _TempDir:
+                def __enter__(self_inner):
+                    return str(out_dir)
+
+                def __exit__(self_inner, exc_type, exc, tb):
+                    return False
+
+            return _TempDir()
+
+        stdout = (
+            "[00:00.000 --> 00:02.000]  first sentence\n"
+            "[00:02.000 --> 00:04.000]  second sentence\n"
+        )
+        monkeypatch.setattr(
+            "tools.transcription_tools.subprocess.run",
+            lambda cmd, *args, **kwargs: subprocess.CompletedProcess(
+                cmd, 0, stdout=stdout, stderr=""
+            ),
+        )
+        monkeypatch.setattr(
+            "tools.transcription_tools.tempfile.TemporaryDirectory", fake_tempdir
+        )
+        monkeypatch.setattr(
+            "tools.transcription_tools._prepare_local_audio",
+            lambda *args, **kwargs: (str(sample_wav), None),
+        )
+
+        from tools.transcription_tools import _transcribe_local_command
+
+        result = _transcribe_local_command(str(sample_wav), "base")
+
+        assert result == {
+            "success": True,
+            "transcript": "first sentence\nsecond sentence",
+            "provider": "local_command",
+        }
+
+    @pytest.mark.parametrize(
+        "stdout",
+        [
+            "Downloading model...\n",
+            "warning: something happened\n[00:00.000 --> 00:01.000] speech\n",
+            "[ERROR --> FATAL] conversion failed\n",
+            "plain diagnostic output\n",
+        ],
+    )
+    def test_whisper_stdout_recovery_rejects_diagnostics(self, stdout):
+        from tools.transcription_tools import _extract_whisper_stdout_transcript
+
+        assert _extract_whisper_stdout_transcript(stdout) == ""
 
 
 # ============================================================================

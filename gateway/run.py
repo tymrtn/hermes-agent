@@ -17502,6 +17502,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     audio_file_paths.append(path)
                 elif not _pending_stt_prepared and _event_media_is_stt_input(event, i):
                     audio_paths.append(path)
+                elif _pending_stt_prepared and _event_media_is_stt_input(event, i):
+                    # Busy-session preflight keeps managed voice files alive so
+                    # a later merged note can invalidate and rebuild the cached
+                    # transcript. This is the final inbound preparation path;
+                    # cached text is now authoritative and the staging file can
+                    # be removed without breaking a future merge/retranscription.
+                    try:
+                        from gateway.platforms.base import remove_managed_cached_audio
+
+                        if remove_managed_cached_audio(path):
+                            logger.debug("Removed prepared voice cache file: %s", path)
+                    except Exception:
+                        logger.debug(
+                            "Could not remove prepared voice cache file: %s",
+                            path,
+                            exc_info=True,
+                        )
                 if mtype.startswith("video/") or (not mtype and event.message_type == MessageType.VIDEO):
                     video_paths.append(path)
 
@@ -23500,6 +23517,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self,
         user_text: str,
         audio_paths: List[str],
+        *,
+        cleanup_managed_audio: bool = True,
     ) -> tuple[str, List[str]]:
         """
         Auto-transcribe user voice/audio messages using the configured STT provider
@@ -23575,6 +23594,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         result = fallback
                 if result["success"]:
                     transcript = result["transcript"]
+                    # Voice files are staging artifacts, not conversation
+                    # storage. Remove only files owned by Hermes' managed audio
+                    # cache; arbitrary AUDIO attachments and user paths remain.
+                    if cleanup_managed_audio:
+                        try:
+                            from gateway.platforms.base import remove_managed_cached_audio
+
+                            if remove_managed_cached_audio(path):
+                                logger.debug("Removed transcribed voice cache file: %s", path)
+                        except Exception:
+                            logger.debug(
+                                "Could not remove transcribed voice cache file: %s",
+                                path,
+                                exc_info=True,
+                            )
                     # Speech-to-text can return success=True with an empty or
                     # whitespace-only transcript on silence, cut-off, or
                     # inaudible audio. Emitting empty quotes ('""') makes the
@@ -23607,21 +23641,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # logged for operator diagnosis but kept out of the
                     # LLM-visible prompt.
                     logger.info("Voice transcription failed for %s: %s", path, error)
-                    from tools.credential_files import to_agent_visible_cache_path
-
-                    agent_path = to_agent_visible_cache_path(os.path.abspath(path))
                     enriched_parts.append(
-                        "[voice message could not be transcribed automatically; "
-                        f"the audio is available at: {agent_path}]"
+                        "[The user's voice message could not be transcribed. "
+                        "Do not guess at its content; ask the user to resend it "
+                        "or type it out.]"
                     )
             except Exception as e:
                 logger.error("Transcription error: %s", e)
-                from tools.credential_files import to_agent_visible_cache_path
-
-                agent_path = to_agent_visible_cache_path(os.path.abspath(path))
                 enriched_parts.append(
-                    "[voice message could not be transcribed automatically; "
-                    f"the audio is available at: {agent_path}]"
+                    "[The user's voice message could not be transcribed. "
+                    "Do not guess at its content; ask the user to resend it "
+                    "or type it out.]"
                 )
 
         if enriched_parts:
@@ -23667,9 +23697,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return user_text if user_text is not None else (getattr(event, "text", None) or None), []
 
         text = user_text if user_text is not None else (getattr(event, "text", "") or "")
+        # Skip cleanup here: several call sites (interrupt monitor, pending-
+        # drain, button-tap) can race to peek the same event before the
+        # ``_gateway_pending_stt_text`` cache above is set, so more than one
+        # coroutine may still be mid-transcription on this path when the
+        # first one finishes. Deleting the file here could yank it out from
+        # under a concurrent in-flight read. The 24h age-based cache sweep
+        # (cleanup_audio_cache) still reclaims it later.
         enriched_text, successful_transcripts = await self._enrich_message_with_transcription(
             text,
             audio_paths,
+            cleanup_managed_audio=False,
         )
         setattr(event, "_gateway_pending_stt_text", enriched_text)
         setattr(event, "_gateway_pending_stt_transcripts", list(successful_transcripts))
