@@ -9343,17 +9343,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             effective_mode = "interrupt"
             busy_text_mode = "interrupt"
+        adapter_text_queue_staged = False
         if (
             event.message_type == MessageType.TEXT
             and busy_text_mode == "queue"
             and effective_mode != "steer"
             and not force_busy_ack
         ):
-            if not force_busy_ack:
-                return False
-            # Clarify-supersede path: honor the text-queue preference here
-            # (FIFO queue + queue ack below) instead of deferring to the base
-            # adapter, which is not in the call chain for this message.
+            # Stage the event in the adapter debounce buffer *before* any
+            # acknowledgment/control awaits. Returning to the adapter only
+            # after those awaits left a race where the active turn could drain
+            # first, or Stop could complete before the correction was staged.
+            try:
+                await adapter._queue_text_debounce(session_key, event)
+                adapter_text_queue_staged = True
+            except Exception as exc:
+                logger.warning(
+                    "Busy text debounce staging failed for %s; falling back to "
+                    "runner queue: %s",
+                    session_key,
+                    exc,
+                )
             effective_mode = "queue"
 
         if already_queued and effective_mode == "steer":
@@ -9467,7 +9477,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # already_queued: the clarify-supersede caller pre-enqueued this event
         # (durably claiming it before releasing the clarify waiter), so we must
         # not enqueue it a second time.
-        if not steered and not redirected and not already_queued:
+        if (
+            not steered
+            and not redirected
+            and not already_queued
+            and not adapter_text_queue_staged
+        ):
             self._queue_or_replace_pending_event(session_key, event)
 
         is_queue_mode = effective_mode == "queue"
@@ -9510,7 +9525,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             _pf = getattr(self, "_pending_followups", None)
             if _pf is not None:
-                _pf.setdefault(session_key, []).append(event)
+                # BasePlatformAdapter mutates the first debounce event in place
+                # as later chunks arrive. Keep an immutable scalar snapshot for
+                # button text/reaction dispatch so "one\ntwo" is not joined with
+                # "two" again and earlier message ids are not overwritten.
+                tracked_event = (
+                    dataclasses.replace(event)
+                    if adapter_text_queue_staged
+                    else event
+                )
+                _pf.setdefault(session_key, []).append(tracked_event)
         except Exception as _bs_err:
             logger.debug("Busy-session follow-up tracking failed for %s: %s", session_key, _bs_err)
 
@@ -9524,10 +9548,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception as _react_err:
                 logger.debug("Busy-session interrupt reaction failed for %s: %s", session_key, _react_err)
 
-        try:
-            await self._ensure_busy_session_controls(session_key, event)
-        except Exception as _bs_err:
-            logger.debug("Busy-session control attach failed for %s: %s", session_key, _bs_err)
+        # Adapter-debounced queue text continues into the ack-anchor path
+        # below, which attaches the same keyboard. Avoid attaching it twice.
+        if not adapter_text_queue_staged:
+            try:
+                await self._ensure_busy_session_controls(session_key, event)
+            except Exception as _bs_err:
+                logger.debug("Busy-session control attach failed for %s: %s", session_key, _bs_err)
 
         # Check if busy ack is disabled — skip sending but still process the input.
         # Placed before debounce so we don't stamp a "last ack" timestamp that was
@@ -9535,7 +9562,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         busy_ack_enabled = os.environ.get("HERMES_GATEWAY_BUSY_ACK_ENABLED", "true").lower() == "true"
         if not busy_ack_enabled:
             logger.debug("Busy ack suppressed for session %s", session_key)
-            return True  # input still processed, just no ack sent
+            if adapter_text_queue_staged:
+                try:
+                    await self._ensure_busy_session_controls(session_key, event)
+                except Exception as exc:
+                    logger.debug(
+                        "Busy-session control attach failed for %s: %s",
+                        session_key,
+                        exc,
+                    )
+            return True
 
         # Debounce before consulting config-heavy display settings. Rapid
         # follow-ups should be processed but should not trigger another config
@@ -9544,7 +9580,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         now = time.time()
         last_ack = _busy_state.turn.busy_ack_ts if _busy_state else 0
         if now - last_ack < _BUSY_ACK_COOLDOWN:
-            return True  # interrupt sent (if not queue), ack already delivered recently
+            if adapter_text_queue_staged:
+                try:
+                    await self._ensure_busy_session_controls(session_key, event)
+                except Exception as exc:
+                    logger.debug(
+                        "Busy-session control attach failed for %s: %s",
+                        session_key,
+                        exc,
+                    )
+            return True
 
         from gateway.display_config import resolve_display_setting
         platform_key = _platform_config_key(event.source.platform)
@@ -9739,7 +9784,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         session_key,
                         _bs_err,
                     )
+        elif adapter_text_queue_staged:
+            # A failed/suppressed ack must not hide controls when a tool bubble
+            # already exists.
+            try:
+                await self._ensure_busy_session_controls(session_key, event)
+            except Exception as exc:
+                logger.debug(
+                    "Busy-session control attach failed for %s: %s",
+                    session_key,
+                    exc,
+                )
 
+        # Queue-mode text was staged in the adapter debounce buffer before any
+        # UI awaits; all other modes were consumed by the runner directly.
         return True
 
     # ------------------------------------------------------------------
@@ -9937,6 +9995,44 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return "⛔ This isn't your session."
 
         adapter = self.adapters.get(source.platform) if source else None
+        # Queue-mode text may still be staged in the adapter's debounce buffer
+        # when a button is tapped. Flush it before dispatch so Steer/Stop can
+        # consume the canonical merged event and cancel the timer rather than
+        # letting it replay after the primitive completes.
+        debounce_flushed = False
+        had_staged_debounce = bool(
+            adapter is not None
+            and session_key in getattr(adapter, "_text_debounce", {})
+        )
+        if adapter is not None and hasattr(adapter, "_flush_text_debounce_now"):
+            try:
+                debounce_flushed = bool(
+                    await adapter._flush_text_debounce_now(session_key)
+                )
+            except Exception as exc:
+                logger.debug("Busy-session debounce flush failed for %s: %s", session_key, exc)
+        if had_staged_debounce and not debounce_flushed:
+            if primitive == PRIMITIVE_STOP:
+                # Stop is authoritative: discard text that could otherwise
+                # replay after the run is halted.
+                discard = getattr(adapter, "_discard_text_debounce", None)
+                if callable(discard):
+                    discard(session_key)
+            else:
+                # An incompatible pending sender owns the slot. The adapter
+                # rescheduled this debounce; do not also inject the tracked
+                # snapshot now or it would be delivered twice.
+                logger.info(
+                    "Deferring busy primitive %s for %s until staged text can "
+                    "claim the pending slot",
+                    primitive,
+                    session_key,
+                )
+                # Keep the keyboard and tracked follow-ups intact so the user
+                # can retry once the other sender's pending turn drains. A
+                # silent None would make platform callbacks report "Done"
+                # even though no primitive was applied.
+                return "Another sender's queued message is ahead; try again shortly."
         _pf = getattr(self, "_pending_followups", None)
         # Take a copy of the follow-ups but DO NOT pop yet — platform
         # ``_chat_id_for_session`` resolves the chat_id from this list
@@ -9947,6 +10043,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         joined_text = "\n\n".join(
             (e.text or "").strip() for e in followups if (e.text or "").strip()
         )
+        if (
+            debounce_flushed
+            and adapter is not None
+            and hasattr(adapter, "_pending_messages")
+        ):
+            consolidated = adapter._pending_messages.get(session_key)
+            consolidated_text = (getattr(consolidated, "text", None) or "").strip()
+            if consolidated_text:
+                joined_text = consolidated_text
 
         # Capture the ack anchors BEFORE applying the primitive — the stop
         # path runs ``_interrupt_and_clear_session`` which itself calls

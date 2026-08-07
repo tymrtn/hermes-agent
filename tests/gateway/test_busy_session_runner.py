@@ -104,6 +104,23 @@ def _make_runner():
 def _make_adapter():
     adapter = MagicMock()
     adapter._pending_messages = {}
+    adapter._text_debounce = {}
+
+    async def _queue_text_debounce(sk, event):
+        adapter._text_debounce[sk] = types.SimpleNamespace(event=event, task=None)
+
+    async def _flush_text_debounce_now(sk):
+        state = adapter._text_debounce.pop(sk, None)
+        if state is None:
+            return False
+        adapter._pending_messages[sk] = state.event
+        return True
+
+    adapter._queue_text_debounce = AsyncMock(side_effect=_queue_text_debounce)
+    adapter._flush_text_debounce_now = AsyncMock(side_effect=_flush_text_debounce_now)
+    adapter._discard_text_debounce = MagicMock(
+        side_effect=lambda sk: adapter._text_debounce.pop(sk, None)
+    )
     adapter._send_with_retry = AsyncMock()
     adapter.set_busy_reaction = AsyncMock(return_value=True)
     adapter.attach_busy_session_buttons = AsyncMock(return_value=True)
@@ -239,12 +256,60 @@ class TestEarlyCorrectionAutoInterrupt:
         agent = MagicMock()
         runner._running_agents[sk] = agent
         runner._running_agents_ts[sk] = time.time() - 10.5
+        runner._tool_bubble_msg_ids[sk] = "tool-msg"
 
         result = await GatewayRunner._handle_active_session_busy_message(runner, event, sk)
 
-        assert result is False
+        assert result is True
         agent.interrupt.assert_not_called()
         adapter.set_busy_reaction.assert_not_awaited()
+        # The runner stages queue/debounce before awaiting control UI, so a
+        # completing active turn or immediate button tap cannot outrun it.
+        adapter._queue_text_debounce.assert_awaited_once_with(sk, event)
+        assert adapter._text_debounce[sk].event is event
+        assert runner._pending_followups[sk] == [event]
+        adapter.attach_busy_session_buttons.assert_awaited_once_with(sk, "tool-msg")
+
+    @pytest.mark.asyncio
+    async def test_queue_tracking_snapshots_events_before_adapter_mutation(self):
+        from gateway.run import GatewayRunner
+
+        runner, _ = _make_runner()
+        runner._busy_input_mode = "queue"
+        runner._busy_text_mode = "queue"
+        adapter = _make_adapter()
+        event = _make_event(text="one", message_id="m1")
+        sk = build_session_key(event.source)
+        runner.adapters[event.source.platform] = adapter
+        runner._running_agents[sk] = MagicMock()
+        runner._running_agents_ts[sk] = time.time() - 20
+
+        assert await GatewayRunner._handle_active_session_busy_message(runner, event, sk) is True
+        event.text = "one\ntwo"
+        event.message_id = "m2"
+
+        tracked = runner._pending_followups[sk][0]
+        assert tracked.text == "one"
+        assert tracked.message_id == "m1"
+
+    @pytest.mark.asyncio
+    async def test_queue_mode_attaches_existing_controls_when_ack_disabled(self, monkeypatch):
+        from gateway.run import GatewayRunner
+
+        monkeypatch.setenv("HERMES_GATEWAY_BUSY_ACK_ENABLED", "false")
+        runner, _ = _make_runner()
+        runner._busy_input_mode = "queue"
+        runner._busy_text_mode = "queue"
+        adapter = _make_adapter()
+        event = _make_event(text="later", message_id="m1")
+        sk = build_session_key(event.source)
+        runner.adapters[event.source.platform] = adapter
+        runner._running_agents[sk] = MagicMock()
+        runner._running_agents_ts[sk] = time.time() - 20
+        runner._tool_bubble_msg_ids[sk] = "tool-msg"
+
+        assert await GatewayRunner._handle_active_session_busy_message(runner, event, sk) is True
+        adapter.attach_busy_session_buttons.assert_awaited_once_with(sk, "tool-msg")
 
 
 # ---------------------------------------------------------------------------
@@ -277,6 +342,59 @@ class TestButtonTap:
         assert sk not in adapter._pending_messages
         adapter.set_busy_reaction.assert_awaited_with(event, REACTION_STEER)
         assert "Steered" in toast or REACTION_STEER in toast
+
+    @pytest.mark.asyncio
+    async def test_steer_flushes_staged_debounce_and_uses_consolidated_text(self):
+        runner, _ = _make_runner()
+        adapter = _make_adapter()
+        first = _make_event(text="one", message_id="m1")
+        second = _make_event(text="two", message_id="m2")
+        consolidated = _make_event(text="one\ntwo", message_id="m2")
+        sk = build_session_key(first.source)
+        runner.adapters[first.source.platform] = adapter
+
+        async def flush(_session_key):
+            adapter._pending_messages[sk] = consolidated
+            return True
+
+        adapter._flush_text_debounce_now = AsyncMock(side_effect=flush)
+        agent = MagicMock()
+        agent.steer = MagicMock(return_value=True)
+        runner._running_agents[sk] = agent
+        runner._pending_followups[sk] = [first, second]
+
+        await runner._handle_busy_session_button_tap(sk, PRIMITIVE_STEER, first.source)
+
+        adapter._flush_text_debounce_now.assert_awaited_once_with(sk)
+        agent.steer.assert_called_once_with("one\ntwo")
+        assert sk not in adapter._pending_messages
+
+    @pytest.mark.asyncio
+    async def test_steer_in_shared_session_reports_retry_without_losing_controls(self):
+        runner, _ = _make_runner()
+        adapter = _make_adapter()
+        event = _make_event(text="my correction", message_id="m1")
+        sk = build_session_key(event.source)
+        runner.adapters[event.source.platform] = adapter
+        adapter._text_debounce[sk] = types.SimpleNamespace(event=event, task=MagicMock())
+        adapter._pending_messages[sk] = _make_event(
+            text="other sender", message_id="m0"
+        )
+        adapter._flush_text_debounce_now = AsyncMock(return_value=False)
+        agent = MagicMock()
+        agent.steer = MagicMock(return_value=True)
+        runner._running_agents[sk] = agent
+        runner._pending_followups[sk] = [event]
+
+        toast = await runner._handle_busy_session_button_tap(
+            sk, PRIMITIVE_STEER, event.source
+        )
+
+        assert "try again" in toast.lower()
+        agent.steer.assert_not_called()
+        assert runner._pending_followups[sk] == [event]
+        assert sk in adapter._text_debounce
+        adapter.clear_busy_session_buttons.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_interrupt_tap_calls_running_agent_interrupt_with_text(self):
@@ -350,6 +468,27 @@ class TestButtonTap:
         # _interrupt_and_clear_session pops the pending slot.
         assert sk not in adapter._pending_messages
         adapter.set_busy_reaction.assert_awaited_with(event, REACTION_STOP)
+
+    @pytest.mark.asyncio
+    async def test_stop_flushes_and_clears_staged_debounce(self):
+        runner, _ = _make_runner()
+        adapter = _make_adapter()
+        event = _make_event(text="do not replay", message_id="m1")
+        sk = build_session_key(event.source)
+        runner.adapters[event.source.platform] = adapter
+
+        async def flush(_session_key):
+            adapter._pending_messages[sk] = event
+            return True
+
+        adapter._flush_text_debounce_now = AsyncMock(side_effect=flush)
+        runner._running_agents[sk] = MagicMock()
+        runner._pending_followups[sk] = [event]
+
+        await runner._handle_busy_session_button_tap(sk, PRIMITIVE_STOP, event.source)
+
+        adapter._flush_text_debounce_now.assert_awaited_once_with(sk)
+        assert sk not in adapter._pending_messages
 
     @pytest.mark.asyncio
     async def test_unknown_primitive_returns_unknown_action(self):

@@ -274,6 +274,68 @@ async def test_debounce_resets_timer_on_new_arrival():
 
 
 @pytest.mark.asyncio
+async def test_incompatible_pending_sender_reschedules_debounce_instead_of_stranding():
+    adapter = _make_adapter()
+    adapter._busy_text_debounce_seconds = 0.05
+    adapter._busy_text_hard_cap_seconds = 0.0
+    session_key = "shared-session"
+
+    existing = _make_event("first sender")
+    existing.source.user_id = "user-one"
+    staged = _make_event("second sender")
+    staged.source.user_id = "user-two"
+    adapter._pending_messages[session_key] = existing
+    await adapter._queue_text_debounce(session_key, staged)
+
+    assert await adapter._flush_text_debounce_now(session_key) is False
+    state = adapter._text_debounce[session_key]
+    assert state.event is staged
+    assert state.task is not None and not state.task.done()
+    await asyncio.sleep(0.01)
+    assert not state.task.done(), "contention retry must not hot-loop at expired cap"
+
+    # Once the incompatible owner drains, the rescheduled timer promotes the
+    # staged sender instead of leaving it inert forever.
+    adapter._pending_messages.pop(session_key)
+    await asyncio.sleep(0.15)
+
+    assert session_key not in adapter._text_debounce
+    assert adapter._pending_messages[session_key] is staged
+
+
+@pytest.mark.asyncio
+async def test_third_sender_waits_in_overflow_and_promotes_in_order():
+    adapter = _make_adapter()
+    adapter._busy_text_debounce_seconds = 0.03
+    session_key = "shared-session"
+
+    first = _make_event("first")
+    first.source.user_id = "user-one"
+    second = _make_event("second")
+    second.source.user_id = "user-two"
+    third = _make_event("third")
+    third.source.user_id = "user-three"
+    adapter._pending_messages[session_key] = first
+
+    await adapter._queue_text_debounce(session_key, second)
+    await adapter._queue_text_debounce(session_key, third)
+
+    assert adapter._text_debounce[session_key].event is second
+    assert adapter._text_debounce_overflow[session_key] == [third]
+
+    adapter._pending_messages.pop(session_key)
+    await asyncio.sleep(0.1)
+    assert adapter._pending_messages[session_key] is second
+    assert adapter._text_debounce[session_key].event is third
+
+    adapter._pending_messages.pop(session_key)
+    await asyncio.sleep(0.1)
+    assert adapter._pending_messages[session_key] is third
+    assert session_key not in adapter._text_debounce
+    assert session_key not in adapter._text_debounce_overflow
+
+
+@pytest.mark.asyncio
 async def test_control_and_clarify_messages_bypass_text_debounce():
     adapter = _make_adapter()
     started: list[str] = []

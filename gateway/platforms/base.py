@@ -5695,6 +5695,14 @@ class BasePlatformAdapter(ABC):
             self._text_debounce = store
         return store
 
+    def _text_debounce_overflow_store(self) -> dict[str, list[MessageEvent]]:
+        """Return deferred cross-sender text that cannot occupy the one slot yet."""
+        store = getattr(self, "_text_debounce_overflow", None)
+        if store is None:
+            store = {}
+            self._text_debounce_overflow = store
+        return store
+
     def _is_queue_text_debounce_candidate(self, event: MessageEvent) -> bool:
         """Return True for normal text eligible for queue-mode debounce."""
         result = (
@@ -5762,6 +5770,13 @@ class BasePlatformAdapter(ABC):
                         event,
                         merge_text=True,
                     )
+                else:
+                    # One sender is pending and another already owns the
+                    # debounce slot. Preserve this third sender for promotion
+                    # after the current staged burst claims the slot.
+                    self._text_debounce_overflow_store().setdefault(
+                        session_key, []
+                    ).append(event)
                 return
 
         now = time.monotonic()
@@ -5831,6 +5846,20 @@ class BasePlatformAdapter(ABC):
             existing_pending is not None
             and not self._can_merge_text_debounce_events(existing_pending, state.event)
         ):
+            # A shared session can already have a pending event from another
+            # sender. The old path cancelled this debounce timer and then
+            # returned False, stranding the buffered event forever. Retry once
+            # the pending slot has had a chance to drain instead.
+            # The normal debounce deadline may already be exhausted. A zero
+            # retry delay would reschedule this task in a hot loop while the
+            # incompatible pending sender still owns the slot.
+            delay = max(
+                0.05,
+                min(float(self._busy_text_debounce_seconds), 0.5),
+            )
+            state.task = asyncio.create_task(
+                self._flush_text_debounce(session_key, delay)
+            )
             return False
 
         state = store.pop(session_key, None)
@@ -5842,6 +5871,12 @@ class BasePlatformAdapter(ABC):
             state.event,
             merge_text=True,
         )
+        overflow = self._text_debounce_overflow_store().get(session_key)
+        if overflow:
+            next_event = overflow.pop(0)
+            if not overflow:
+                self._text_debounce_overflow_store().pop(session_key, None)
+            await self._queue_text_debounce(session_key, next_event)
         return True
 
     def _discard_text_debounce(self, session_key: str) -> None:
@@ -5849,6 +5884,7 @@ class BasePlatformAdapter(ABC):
         state = self._text_debounce_store().pop(session_key, None)
         if state is not None and state.task is not None and not state.task.done():
             state.task.cancel()
+        self._text_debounce_overflow_store().pop(session_key, None)
 
     # ------------------------------------------------------------------
     # Session task + guard ownership helpers
