@@ -66,6 +66,16 @@ def _make_file_obj(data: bytes = b"hello"):
     return f
 
 
+class TimedOut(Exception):
+    """Stand-in for ``telegram.error.TimedOut``.
+
+    ``TelegramAdapter._looks_like_network_error`` classifies transient
+    transport failures by class name, so this stub must be named ``TimedOut``
+    for the media-download retry path to treat it as transient without the real
+    python-telegram-bot package installed in the test environment.
+    """
+
+
 def _make_document(
     file_name="report.pdf",
     mime_type="application/pdf",
@@ -285,7 +295,9 @@ class TestDocumentDownloadBlock:
 
     @pytest.mark.asyncio
     async def test_voice_cache_failure_replies_and_signals_agent(self, adapter):
-        """Same fail-closed contract applies to the voice site (#23045 Bug 2 class)."""
+        """A non-transient error fails immediately (no retry) and still keeps the
+        fail-closed contract (#23045 Bug 2 class): reply to the user and pass an
+        agent-visible failure note onward."""
         msg = _make_message()
         msg.voice = MagicMock()
         msg.voice.file_size = 100
@@ -294,11 +306,488 @@ class TestDocumentDownloadBlock:
 
         await adapter._handle_media_message(update, MagicMock())
 
+        # RuntimeError is not a transient transport failure — no retry.
+        assert msg.voice.get_file.await_count == 1
         msg.reply_text.assert_awaited_once()
         assert "voice message" in msg.reply_text.await_args.args[0]
         adapter.handle_message.assert_called_once()
         event = adapter.handle_message.call_args[0][0]
         assert "could not be downloaded" in (event.text or "")
+
+    @pytest.mark.asyncio
+    async def test_voice_download_retries_transient_get_file_timeout(self, adapter):
+        """A single transient get_file() timeout retries and succeeds silently."""
+        adapter.config.extra.update(
+            {"media_download_attempts": 2, "media_download_retry_delay_seconds": 0}
+        )
+        file_obj = _make_file_obj(b"voice-bytes")
+        msg = _make_message()
+        msg.voice = MagicMock()
+        msg.voice.file_size = 100
+        msg.voice.get_file = AsyncMock(side_effect=[TimedOut("CDN timeout"), file_obj])
+        update = _make_update(msg)
+
+        with patch(
+            "plugins.platforms.telegram.adapter.cache_audio_from_bytes",
+            return_value="/tmp/cached-voice.ogg",
+        ) as cache_mock:
+            await adapter._handle_media_message(update, MagicMock())
+
+        assert msg.voice.get_file.await_count == 2
+        cache_mock.assert_called_once_with(b"voice-bytes", ext=".ogg")
+        msg.reply_text.assert_not_awaited()
+        adapter.handle_message.assert_called_once()
+        event = adapter.handle_message.call_args.args[0]
+        assert event.media_urls == ["/tmp/cached-voice.ogg"]
+        assert event.media_types == ["audio/ogg"]
+
+    @pytest.mark.asyncio
+    async def test_voice_download_retries_transient_download_byte_timeout(self, adapter):
+        """A transient download_as_bytearray() timeout also retries the whole
+        get_file + download step, then succeeds silently."""
+        adapter.config.extra.update(
+            {"media_download_attempts": 2, "media_download_retry_delay_seconds": 0}
+        )
+        file_obj = MagicMock()
+        file_obj.download_as_bytearray = AsyncMock(
+            side_effect=[TimedOut("CDN timeout"), bytearray(b"voice-bytes")]
+        )
+        msg = _make_message()
+        msg.voice = MagicMock()
+        msg.voice.file_size = 100
+        msg.voice.get_file = AsyncMock(return_value=file_obj)
+        update = _make_update(msg)
+
+        with patch(
+            "plugins.platforms.telegram.adapter.cache_audio_from_bytes",
+            return_value="/tmp/cached-voice.ogg",
+        ) as cache_mock:
+            await adapter._handle_media_message(update, MagicMock())
+
+        assert msg.voice.get_file.await_count == 2
+        assert file_obj.download_as_bytearray.await_count == 2
+        cache_mock.assert_called_once_with(b"voice-bytes", ext=".ogg")
+        msg.reply_text.assert_not_awaited()
+        adapter.handle_message.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_voice_download_retry_exhaustion_preserves_failure_contract(self, adapter):
+        """Persistent transient failures exhaust the bound, then keep the
+        user + agent failure contract from #53912."""
+        adapter.config.extra.update(
+            {"media_download_attempts": 2, "media_download_retry_delay_seconds": 0}
+        )
+        msg = _make_message()
+        msg.voice = MagicMock()
+        msg.voice.file_size = 100
+        msg.voice.get_file = AsyncMock(side_effect=TimedOut("CDN timeout"))
+        update = _make_update(msg)
+
+        await adapter._handle_media_message(update, MagicMock())
+
+        assert msg.voice.get_file.await_count == 2
+        msg.reply_text.assert_awaited_once()
+        assert "voice message" in msg.reply_text.await_args.args[0]
+        adapter.handle_message.assert_called_once()
+        event = adapter.handle_message.call_args[0][0]
+        assert "could not be downloaded" in (event.text or "")
+
+    @pytest.mark.asyncio
+    async def test_audio_download_retries_transient_timeout(self, adapter):
+        """The audio site shares the same bounded transient-retry download path."""
+        adapter.config.extra.update(
+            {"media_download_attempts": 2, "media_download_retry_delay_seconds": 0}
+        )
+        file_obj = _make_file_obj(b"audio-bytes")
+        msg = _make_message()
+        msg.audio = MagicMock()
+        msg.audio.file_size = 100
+        msg.audio.get_file = AsyncMock(side_effect=[TimedOut("CDN timeout"), file_obj])
+
+        with patch(
+            "plugins.platforms.telegram.adapter.cache_audio_from_bytes",
+            return_value="/tmp/cached-audio.mp3",
+        ) as cache_mock:
+            await adapter._handle_media_message(_make_update(msg), MagicMock())
+
+        assert msg.audio.get_file.await_count == 2
+        cache_mock.assert_called_once_with(b"audio-bytes", ext=".mp3")
+        msg.reply_text.assert_not_awaited()
+        event = adapter.handle_message.call_args.args[0]
+        assert event.media_urls == ["/tmp/cached-audio.mp3"]
+        assert event.media_types == ["audio/mp3"]
+
+    @pytest.mark.asyncio
+    async def test_media_download_retry_attempts_are_clamped(self, adapter):
+        """Attempts clamp to the 1-5 bound; a negative delay clamps to no wait."""
+        adapter.config.extra.update(
+            {"media_download_attempts": 99, "media_download_retry_delay_seconds": -10}
+        )
+        media = MagicMock()
+        media.get_file = AsyncMock(side_effect=TimedOut("CDN down"))
+
+        with pytest.raises(TimedOut):
+            await adapter._download_telegram_media_bytes(media, "voice message")
+
+        assert media.get_file.await_count == 5
+
+
+# ---------------------------------------------------------------------------
+# TestDirectMediaDownloadRetry
+# ---------------------------------------------------------------------------
+
+class TestDirectMediaDownloadRetry:
+    """Every *direct* inbound attachment shares the bounded transient-retry
+    download, not just voice/audio.
+
+    The CDN flake is per-download, so a photo or document left on the raw
+    one-shot ``get_file() + download_as_bytearray()`` pair would keep failing
+    the whole turn on a single timeout. One representative case per contract —
+    photo (batched), document (cached + injected), sticker (vision fallback) —
+    plus an exhaustion case per user-visible failure contract; the remaining
+    MIME branches route through the same helper.
+    """
+
+    @pytest.mark.asyncio
+    async def test_photo_download_retries_transient_timeout(self, adapter):
+        """A transient photo timeout retries, then batches exactly as it would
+        have without the flake — including the file_path-derived extension."""
+        adapter.config.extra.update(
+            {"media_download_attempts": 2, "media_download_retry_delay_seconds": 0}
+        )
+        adapter._media_batch_delay_seconds = 0
+        file_obj = _make_file_obj(b"photo-bytes")
+        file_obj.file_path = "photos/screenshot.png"
+        photo = MagicMock()
+        photo.get_file = AsyncMock(side_effect=[TimedOut("CDN timeout"), file_obj])
+        msg = _make_message(photo=[photo])
+
+        with patch(
+            "plugins.platforms.telegram.adapter.cache_image_from_bytes",
+            return_value="/tmp/cached-photo.png",
+        ) as cache_mock:
+            await adapter._handle_media_message(_make_update(msg), MagicMock())
+            await asyncio.sleep(0.05)  # let the photo batch flush
+
+        assert photo.get_file.await_count == 2
+        cache_mock.assert_called_once_with(b"photo-bytes", ext=".png")
+        msg.reply_text.assert_not_awaited()
+        event = adapter.handle_message.call_args.args[0]
+        assert event.media_urls == ["/tmp/cached-photo.png"]
+        assert event.media_types == ["image/png"]
+
+    @pytest.mark.asyncio
+    async def test_photo_retry_exhaustion_preserves_failure_contract(self, adapter):
+        """Persistent transient failures exhaust the bound, then keep the
+        #23045 fail-closed contract: user reply + agent-visible note."""
+        adapter.config.extra.update(
+            {"media_download_attempts": 2, "media_download_retry_delay_seconds": 0}
+        )
+        photo = MagicMock()
+        photo.get_file = AsyncMock(side_effect=TimedOut("CDN timeout"))
+        msg = _make_message(photo=[photo])
+
+        await adapter._handle_media_message(_make_update(msg), MagicMock())
+
+        assert photo.get_file.await_count == 2
+        msg.reply_text.assert_awaited_once()
+        reply = msg.reply_text.await_args.args[0]
+        assert "Couldn't download photo" in reply
+        assert "TimedOut" in reply
+        adapter.handle_message.assert_called_once()
+        event = adapter.handle_message.call_args.args[0]
+        assert event.media_urls == []
+        assert "could not be downloaded" in (event.text or "")
+
+    @pytest.mark.asyncio
+    async def test_document_download_retries_transient_timeout(self, adapter):
+        """A transient document timeout retries, then caches and injects the
+        text content exactly as it would have without the flake."""
+        adapter.config.extra.update(
+            {"media_download_attempts": 2, "media_download_retry_delay_seconds": 0}
+        )
+        content = b"Hello from a text file"
+        doc = _make_document(
+            file_name="notes.txt", mime_type="text/plain", file_size=len(content),
+        )
+        doc.get_file = AsyncMock(
+            side_effect=[TimedOut("CDN timeout"), _make_file_obj(content)]
+        )
+        msg = _make_message(document=doc)
+
+        await adapter._handle_media_message(_make_update(msg), MagicMock())
+
+        assert doc.get_file.await_count == 2
+        msg.reply_text.assert_not_awaited()
+        event = adapter.handle_message.call_args.args[0]
+        assert len(event.media_urls) == 1
+        assert "[Content of notes.txt]" in event.text
+        assert "Hello from a text file" in event.text
+
+    @pytest.mark.asyncio
+    async def test_document_retry_exhaustion_preserves_failure_contract(self, adapter):
+        """The document site's exhaustion still names the file in both the user
+        reply and the agent note."""
+        adapter.config.extra.update(
+            {"media_download_attempts": 2, "media_download_retry_delay_seconds": 0}
+        )
+        doc = _make_document(file_name="notes.md", mime_type="text/markdown", file_size=100)
+        doc.get_file = AsyncMock(side_effect=TimedOut("CDN timeout"))
+        msg = _make_message(document=doc)
+
+        await adapter._handle_media_message(_make_update(msg), MagicMock())
+
+        assert doc.get_file.await_count == 2
+        reply = msg.reply_text.await_args.args[0]
+        assert "Couldn't download attachment 'notes.md': TimedOut" in reply
+        event = adapter.handle_message.call_args.args[0]
+        assert event.media_urls == []
+        assert "could not be downloaded" in (event.text or "")
+        assert "notes.md" in (event.text or "")
+
+    @pytest.mark.asyncio
+    async def test_sticker_download_retries_transient_timeout(self, adapter):
+        """The sticker site retries too, and a recovered download still reaches
+        vision analysis rather than the emoji fallback."""
+        adapter.config.extra.update(
+            {"media_download_attempts": 2, "media_download_retry_delay_seconds": 0}
+        )
+        msg = _make_message()
+        msg.sticker = MagicMock()
+        msg.sticker.emoji = "🎉"
+        msg.sticker.set_name = "party"
+        msg.sticker.file_unique_id = "sticker-retry-1"
+        msg.sticker.is_animated = False
+        msg.sticker.is_video = False
+        msg.sticker.get_file = AsyncMock(
+            side_effect=[TimedOut("CDN timeout"), _make_file_obj(b"webp-bytes")]
+        )
+        event = MessageEvent(text="")
+
+        with (
+            patch(
+                "plugins.platforms.telegram.adapter.cache_image_from_bytes",
+                return_value="/tmp/cached-sticker.webp",
+            ) as cache_mock,
+            patch(
+                "tools.vision_tools.vision_analyze_tool",
+                new=AsyncMock(return_value='{"success": true, "analysis": "confetti"}'),
+            ) as vision_mock,
+        ):
+            await adapter._handle_sticker(msg, event)
+
+        assert msg.sticker.get_file.await_count == 2
+        cache_mock.assert_called_once_with(b"webp-bytes", ext=".webp")
+        vision_mock.assert_awaited_once()
+        assert "confetti" in event.text
+
+    @pytest.mark.asyncio
+    async def test_sticker_retry_exhaustion_falls_back_to_emoji(self, adapter):
+        """Sticker analysis stays best-effort: exhaustion is swallowed into the
+        emoji injection, never raised at the caller."""
+        adapter.config.extra.update(
+            {"media_download_attempts": 2, "media_download_retry_delay_seconds": 0}
+        )
+        msg = _make_message()
+        msg.sticker = MagicMock()
+        msg.sticker.emoji = "🎉"
+        msg.sticker.set_name = "party"
+        msg.sticker.file_unique_id = "sticker-retry-2"
+        msg.sticker.is_animated = False
+        msg.sticker.is_video = False
+        msg.sticker.get_file = AsyncMock(side_effect=TimedOut("CDN timeout"))
+        event = MessageEvent(text="")
+
+        await adapter._handle_sticker(msg, event)
+
+        assert msg.sticker.get_file.await_count == 2
+        assert "🎉" in event.text
+        msg.reply_text.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# TestRepliedMediaDownloadBlock
+# ---------------------------------------------------------------------------
+
+def _reply_to_voice_message(get_file, *, text="what did they say?", file_size=100):
+    """Build a text message replying to a voice note."""
+    voice = MagicMock()
+    voice.file_size = file_size
+    voice.get_file = get_file
+    replied = _make_message()
+    replied.voice = voice
+    msg = _make_message()
+    msg.text = text
+    msg.reply_to_message = replied
+    return msg, voice
+
+
+class TestRepliedMediaDownloadBlock:
+    """A text/command turn replying to media shares the voice site's bounded
+    transient-retry download, so one CDN flake no longer drops the attachment."""
+
+    @pytest.mark.asyncio
+    async def test_replied_voice_retries_transient_timeout(self, adapter):
+        """A transient get_file() timeout retries, then the voice note is cached
+        and annotated exactly as it would have been without the flake."""
+        adapter.config.extra.update(
+            {"media_download_attempts": 2, "media_download_retry_delay_seconds": 0}
+        )
+        file_obj = _make_file_obj(b"replied-voice-bytes")
+        file_obj.file_path = "voice/file_1.oga"
+        msg, voice = _reply_to_voice_message(
+            AsyncMock(side_effect=[TimedOut("CDN timeout"), file_obj])
+        )
+        event = MessageEvent(text=msg.text)
+
+        await adapter._cache_replied_media(msg, event)
+
+        assert voice.get_file.await_count == 2
+        assert len(event.media_urls) == 1
+        assert event.media_types == ["audio/ogg"]
+        assert event.message_type == MessageType.AUDIO
+        assert "Replied-to audio" in event.text
+        assert msg.text in event.text
+
+    @pytest.mark.asyncio
+    async def test_replied_voice_non_transient_failure_is_silently_omitted(self, adapter):
+        """A non-transient error fails on the first attempt. The replied-to path
+        has no user/agent notice — the turn proceeds without the attachment."""
+        msg, voice = _reply_to_voice_message(AsyncMock(side_effect=RuntimeError("CDN down")))
+        event = MessageEvent(text=msg.text)
+
+        await adapter._cache_replied_media(msg, event)
+
+        assert voice.get_file.await_count == 1
+        assert event.media_urls == []
+        assert event.media_types == []
+        assert event.text == msg.text
+        msg.reply_text.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_replied_voice_retry_exhaustion_is_silently_omitted(self, adapter):
+        """Persistent transient failures exhaust the bound and keep the same
+        silent-omission semantics."""
+        adapter.config.extra.update(
+            {"media_download_attempts": 2, "media_download_retry_delay_seconds": 0}
+        )
+        msg, voice = _reply_to_voice_message(AsyncMock(side_effect=TimedOut("CDN timeout")))
+        event = MessageEvent(text=msg.text)
+
+        await adapter._cache_replied_media(msg, event)
+
+        assert voice.get_file.await_count == 2
+        assert event.media_urls == []
+        assert event.text == msg.text
+        msg.reply_text.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_replied_media_filename_falls_back_to_downloaded_file_path(self, adapter):
+        """Media with no Telegram-supplied name still names the cache entry from
+        the downloaded File — the retry helper must hand back that File, not
+        only its bytes."""
+        file_obj = _make_file_obj(b"\x89PNG\r\n\x1a\n replied")
+        file_obj.file_path = "photos/observed.png"
+        photo = MagicMock()
+        photo.file_size = 100
+        photo.get_file = AsyncMock(return_value=file_obj)
+        replied = _make_message()
+        replied.photo = [photo]
+        msg = _make_message()
+        msg.text = "what is this?"
+        msg.reply_to_message = replied
+        event = MessageEvent(text=msg.text)
+
+        with patch("gateway.platforms.base.cache_media_bytes") as cache_mock:
+            cache_mock.return_value = None
+            await adapter._cache_replied_media(msg, event)
+
+        cache_mock.assert_called_once_with(
+            b"\x89PNG\r\n\x1a\n replied",
+            filename="observed.png",
+            mime_type="",
+            default_kind="image",
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestObservedMediaDownloadBlock
+# ---------------------------------------------------------------------------
+
+def _observed_group_voice_message(get_file, *, file_size=100):
+    """Build an unmentioned group message carrying a voice note."""
+    voice = MagicMock()
+    voice.file_size = file_size
+    voice.get_file = get_file
+    msg = _make_message()
+    msg.chat.type = "supergroup"
+    msg.voice = voice
+    return msg, voice
+
+
+class TestObservedMediaDownloadBlock:
+    """An unmentioned group attachment shares the same bounded transient-retry
+    download, so one CDN flake no longer drops it from the observed transcript."""
+
+    @pytest.mark.asyncio
+    async def test_observed_voice_retries_transient_timeout(self, adapter):
+        """A transient get_file() timeout retries, then the voice note is cached
+        and annotated exactly as it would have been without the flake."""
+        adapter.config.extra.update(
+            {"media_download_attempts": 2, "media_download_retry_delay_seconds": 0}
+        )
+        file_obj = _make_file_obj(b"observed-voice-bytes")
+        msg, voice = _observed_group_voice_message(
+            AsyncMock(side_effect=[TimedOut("CDN timeout"), file_obj])
+        )
+        event = MessageEvent(text="did anyone catch that?")
+
+        await adapter._cache_observed_media(msg, event)
+
+        assert voice.get_file.await_count == 2
+        assert len(event.media_urls) == 1
+        assert event.media_types == ["audio/ogg"]
+        assert event.message_type == MessageType.AUDIO
+        assert "audio 'voice.ogg' saved at:" in event.text
+        assert "did anyone catch that?" in event.text
+        with open(event.media_urls[0], "rb") as fh:
+            assert fh.read() == b"observed-voice-bytes"
+
+    @pytest.mark.asyncio
+    async def test_observed_voice_non_transient_failure_is_silently_omitted(self, adapter):
+        """A non-transient error fails on the first attempt. The observed path
+        has no user/agent notice — the transcript proceeds without the note."""
+        msg, voice = _observed_group_voice_message(
+            AsyncMock(side_effect=RuntimeError("CDN down"))
+        )
+        event = MessageEvent(text="did anyone catch that?")
+
+        await adapter._cache_observed_media(msg, event)
+
+        assert voice.get_file.await_count == 1
+        assert event.media_urls == []
+        assert event.media_types == []
+        assert event.text == "did anyone catch that?"
+        msg.reply_text.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_observed_voice_retry_exhaustion_is_silently_omitted(self, adapter):
+        """Persistent transient failures exhaust the bound and keep the same
+        silent-omission semantics."""
+        adapter.config.extra.update(
+            {"media_download_attempts": 2, "media_download_retry_delay_seconds": 0}
+        )
+        msg, voice = _observed_group_voice_message(
+            AsyncMock(side_effect=TimedOut("CDN timeout"))
+        )
+        event = MessageEvent(text="did anyone catch that?")
+
+        await adapter._cache_observed_media(msg, event)
+
+        assert voice.get_file.await_count == 2
+        assert event.media_urls == []
+        assert event.text == "did anyone catch that?"
+        msg.reply_text.assert_not_awaited()
 
 
 class TestVideoDownloadBlock:

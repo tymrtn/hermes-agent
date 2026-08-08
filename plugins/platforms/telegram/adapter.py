@@ -2134,6 +2134,25 @@ class TelegramAdapter(BasePlatformAdapter):
             return default
         return bool(value)
 
+    def _coerce_int_extra(
+        self,
+        key: str,
+        default: int,
+        *,
+        min_value: Optional[int] = None,
+        max_value: Optional[int] = None,
+    ) -> int:
+        value = self.config.extra.get(key) if getattr(self.config, "extra", None) else None
+        try:
+            parsed = int(value) if value is not None else int(default)
+        except (TypeError, ValueError):
+            parsed = int(default)
+        if min_value is not None:
+            parsed = max(parsed, min_value)
+        if max_value is not None:
+            parsed = min(parsed, max_value)
+        return parsed
+
     def _coerce_float_extra(
         self,
         key: str,
@@ -8628,8 +8647,9 @@ class TelegramAdapter(BasePlatformAdapter):
             return
 
         try:
-            file_obj = await source.get_file()
-            data = bytes(await file_obj.download_as_bytearray())
+            file_obj, data = await self._download_telegram_media_bytes(
+                source, f"observed group {kind or 'document'}"
+            )
             if not filename:
                 filename = os.path.basename(getattr(file_obj, "file_path", "") or "")
             cached = cache_media_bytes(
@@ -8682,8 +8702,9 @@ class TelegramAdapter(BasePlatformAdapter):
             return
 
         try:
-            file_obj = await source.get_file()
-            data = bytes(await file_obj.download_as_bytearray())
+            file_obj, data = await self._download_telegram_media_bytes(
+                source, f"replied-to {kind or 'document'}"
+            )
             if not filename:
                 filename = os.path.basename(getattr(file_obj, "file_path", "") or "")
             cached = cache_media_bytes(
@@ -9071,6 +9092,69 @@ class TelegramAdapter(BasePlatformAdapter):
             return f"{text.rstrip()}\n\n{note}"
         return note
 
+    async def _download_telegram_media_bytes(
+        self,
+        media_source: Any,
+        media_label: str,
+    ) -> tuple[Any, bytes]:
+        """Download Telegram media with bounded retry on transient failures.
+
+        Both ``get_file()`` and ``download_as_bytearray()`` can raise a transient
+        ``telegram.error.TimedOut``/``NetworkError`` when the Telegram CDN
+        hiccups; a single such flake used to fail the whole voice/audio turn
+        (contributor PR #41087). Only *transient* transport failures are retried
+        (via :meth:`_looks_like_network_error`) so a genuine BadRequest/Forbidden
+        still fails fast and is surfaced by :meth:`_surface_media_cache_failure`.
+
+        Every *inbound* media download goes through here — voice, audio, photo,
+        video, all three document branches, stickers, plus the replied-to and
+        observed-group cache paths. The CDN flake is per-download, not per-type,
+        so a sibling attachment type left on the raw one-shot call would keep
+        the exact bug this helper exists to fix. Outbound sends keep their own
+        retry/backoff machinery and are deliberately untouched.
+
+        Returns ``(file_obj, data)``: the photo, video and replied-to paths read
+        ``file_obj.file_path`` for the extension or fallback filename, so the
+        File must survive the call.
+
+        The two bounds are undeclared ``extra`` overrides, like
+        ``typing_cooldown_seconds``: resilience tuning nobody needs to discover.
+        Declaring them in DEFAULT_CONFIG would make ``hermes update`` prompt
+        every existing user about two "new config options" they never asked for.
+        """
+        attempts = self._coerce_int_extra(
+            "media_download_attempts",
+            2,
+            min_value=1,
+            max_value=5,
+        )
+        delay = self._coerce_float_extra(
+            "media_download_retry_delay_seconds",
+            0.5,
+            min_value=0.0,
+            max_value=10.0,
+        )
+        for attempt in range(1, attempts + 1):
+            try:
+                file_obj = await media_source.get_file()
+                return file_obj, bytes(await file_obj.download_as_bytearray())
+            except Exception as exc:
+                if attempt >= attempts or not self._looks_like_network_error(exc):
+                    raise
+                logger.warning(
+                    "[Telegram] %s download failed (attempt %d/%d), "
+                    "retrying in %.2fs: %s",
+                    media_label,
+                    attempt,
+                    attempts,
+                    delay,
+                    _redact_telegram_error_text(exc),
+                )
+                if delay > 0:
+                    await asyncio.sleep(delay)
+
+        raise RuntimeError("Telegram media download attempts exhausted")
+
     async def _surface_media_cache_failure(
         self,
         msg: Message,
@@ -9326,9 +9410,10 @@ class TelegramAdapter(BasePlatformAdapter):
             try:
                 # msg.photo is a list of PhotoSize sorted by size; take the largest
                 photo = msg.photo[-1]
-                file_obj = await photo.get_file()
                 # Download the image bytes directly into memory
-                image_bytes = await file_obj.download_as_bytearray()
+                file_obj, image_bytes = await self._download_telegram_media_bytes(
+                    photo, "photo"
+                )
                 # Determine extension from the file path if available
                 ext = ".jpg"
                 if file_obj.file_path:
@@ -9337,7 +9422,7 @@ class TelegramAdapter(BasePlatformAdapter):
                             ext = candidate
                             break
                 # Save to local cache (for vision tool access)
-                cached_path = cache_image_from_bytes(bytes(image_bytes), ext=ext)
+                cached_path = cache_image_from_bytes(image_bytes, ext=ext)
                 event.media_urls = [cached_path]
                 event.media_types = [f"image/{ext.lstrip('.')}" ]
                 logger.info("[Telegram] Cached user photo at %s", cached_path)
@@ -9363,9 +9448,10 @@ class TelegramAdapter(BasePlatformAdapter):
                     logger.info("[Telegram] Skipped oversized user voice (size=%s)", getattr(msg.voice, "file_size", None))
                     await self.handle_message(event)
                     return
-                file_obj = await msg.voice.get_file()
-                audio_bytes = await file_obj.download_as_bytearray()
-                cached_path = cache_audio_from_bytes(bytes(audio_bytes), ext=".ogg")
+                _file_obj, audio_bytes = await self._download_telegram_media_bytes(
+                    msg.voice, "voice message"
+                )
+                cached_path = cache_audio_from_bytes(audio_bytes, ext=".ogg")
                 event.media_urls = [cached_path]
                 event.media_types = ["audio/ogg"]
                 logger.info("[Telegram] Cached user voice at %s", cached_path)
@@ -9381,9 +9467,10 @@ class TelegramAdapter(BasePlatformAdapter):
                     logger.info("[Telegram] Skipped oversized user audio (size=%s)", getattr(msg.audio, "file_size", None))
                     await self.handle_message(event)
                     return
-                file_obj = await msg.audio.get_file()
-                audio_bytes = await file_obj.download_as_bytearray()
-                cached_path = cache_audio_from_bytes(bytes(audio_bytes), ext=".mp3")
+                _file_obj, audio_bytes = await self._download_telegram_media_bytes(
+                    msg.audio, "audio file"
+                )
+                cached_path = cache_audio_from_bytes(audio_bytes, ext=".mp3")
                 event.media_urls = [cached_path]
                 event.media_types = ["audio/mp3"]
                 logger.info("[Telegram] Cached user audio at %s", cached_path)
@@ -9400,15 +9487,16 @@ class TelegramAdapter(BasePlatformAdapter):
                     logger.info("[Telegram] Skipped oversized user video (size=%s)", getattr(msg.video, "file_size", None))
                     await self.handle_message(event)
                     return
-                file_obj = await msg.video.get_file()
-                video_bytes = await file_obj.download_as_bytearray()
+                file_obj, video_bytes = await self._download_telegram_media_bytes(
+                    msg.video, "video file"
+                )
                 ext = ".mp4"
                 if getattr(file_obj, "file_path", None):
                     for candidate in SUPPORTED_VIDEO_TYPES:
                         if file_obj.file_path.lower().endswith(candidate):
                             ext = candidate
                             break
-                cached_path = cache_video_from_bytes(bytes(video_bytes), ext=ext)
+                cached_path = cache_video_from_bytes(video_bytes, ext=ext)
                 event.media_urls = [cached_path]
                 event.media_types = [SUPPORTED_VIDEO_TYPES.get(ext, "video/mp4")]
                 logger.info("[Telegram] Cached user video at %s", cached_path)
@@ -9455,11 +9543,12 @@ class TelegramAdapter(BasePlatformAdapter):
                 # payload is actually an image, route it through the image cache
                 # and batching path instead of rejecting it as a document.
                 if ext in _TELEGRAM_IMAGE_EXTENSIONS or doc_mime.startswith("image/"):
-                    file_obj = await doc.get_file()
-                    image_bytes = await file_obj.download_as_bytearray()
+                    _file_obj, image_bytes = await self._download_telegram_media_bytes(
+                        doc, "image document"
+                    )
                     image_ext = ext if ext in _TELEGRAM_IMAGE_EXTENSIONS else _TELEGRAM_IMAGE_MIME_TO_EXT.get(doc_mime, ".jpg")
                     try:
-                        cached_path = cache_image_from_bytes(bytes(image_bytes), ext=image_ext)
+                        cached_path = cache_image_from_bytes(image_bytes, ext=image_ext)
                     except ValueError as e:
                         logger.warning("[Telegram] Failed to cache image document: %s", _redact_telegram_error_text(e), exc_info=True)
                         event.text = (
@@ -9495,9 +9584,10 @@ class TelegramAdapter(BasePlatformAdapter):
                     ext = image_mime_to_ext.get(doc.mime_type, "")
 
                 if ext in SUPPORTED_VIDEO_TYPES:
-                    file_obj = await doc.get_file()
-                    video_bytes = await file_obj.download_as_bytearray()
-                    cached_path = cache_video_from_bytes(bytes(video_bytes), ext=ext)
+                    _file_obj, video_bytes = await self._download_telegram_media_bytes(
+                        doc, "video document"
+                    )
+                    cached_path = cache_video_from_bytes(video_bytes, ext=ext)
                     event.media_urls = [cached_path]
                     event.media_types = [SUPPORTED_VIDEO_TYPES[ext]]
                     event.message_type = MessageType.VIDEO
@@ -9515,9 +9605,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 # to message the agent is the gate, not the file extension.
                 # Known types keep their precise MIME; unknown types are tagged
                 # application/octet-stream so the agent reaches for terminal tools.
-                file_obj = await doc.get_file()
-                doc_bytes = await file_obj.download_as_bytearray()
-                raw_bytes = bytes(doc_bytes)
+                _file_obj, raw_bytes = await self._download_telegram_media_bytes(
+                    doc, "document"
+                )
                 from gateway.platforms.base import cache_media_bytes
 
                 cached = cache_media_bytes(
@@ -9663,9 +9753,10 @@ class TelegramAdapter(BasePlatformAdapter):
 
         # Cache miss -- download and analyze
         try:
-            file_obj = await sticker.get_file()
-            image_bytes = await file_obj.download_as_bytearray()
-            cached_path = cache_image_from_bytes(bytes(image_bytes), ext=".webp")
+            _file_obj, image_bytes = await self._download_telegram_media_bytes(
+                sticker, "sticker"
+            )
+            cached_path = cache_image_from_bytes(image_bytes, ext=".webp")
             logger.info("[Telegram] Analyzing sticker at %s", cached_path)
 
             from tools.vision_tools import vision_analyze_tool
