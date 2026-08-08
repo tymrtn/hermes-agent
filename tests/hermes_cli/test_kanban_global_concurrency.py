@@ -44,10 +44,21 @@ def _create_tasks(board: str, assignee: str, count: int, *, priority: int = 0) -
 
 
 def _mark_running(board: str, task_ids: list[str]) -> None:
+    """Mark tasks running with the claim bookkeeping of a live worker.
+
+    A bare ``status='running'`` row (NULL claim) is orphan-shaped:
+    ``reconcile_orphaned_running`` would requeue it on the next dispatch
+    tick and dissolve the "workers already up" precondition these tests
+    stage. An unexpired foreign-host claim keeps the rows counted as
+    running without tripping the crash/stale/pidless reapers.
+    """
+    expires = int(time.time()) + 3600
     with kb.connect_closing(board=board) as conn:
         for task_id in task_ids:
             conn.execute(
-                "UPDATE tasks SET status = 'running' WHERE id = ?", (task_id,)
+                "UPDATE tasks SET status = 'running', claim_lock = ?, "
+                "claim_expires = ? WHERE id = ?",
+                (f"otherhost:{task_id}", expires, task_id),
             )
         conn.commit()
 
@@ -227,7 +238,10 @@ def test_corrupt_secondary_board_fails_admission_closed(
         rows = conn.execute(
             "SELECT id FROM tasks WHERE status = 'ready' ORDER BY created_at, id"
         ).fetchall()
-    assert [row["id"] for row in rows] == ready
+    # The contract is that every ready card survives admission failure.  Task
+    # creation timestamps have one-second resolution, so ordering tied rows by
+    # random task id is intentionally not an insertion-order guarantee.
+    assert {row["id"] for row in rows} == set(ready)
     assert any(
         "board-b" in record.getMessage()
         for record in caplog.records

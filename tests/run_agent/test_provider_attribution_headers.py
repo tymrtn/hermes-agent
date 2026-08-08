@@ -87,6 +87,27 @@ def test_nvidia_cloud_base_url_applies_billing_origin_header(mock_openai):
     assert headers["X-BILLING-INVOKE-ORIGIN"] == "HermesAgent"
 
 
+@patch("run_agent.OpenAI")
+def test_fireworks_profile_fallback_avoids_partner_attribution(mock_openai):
+    """Fireworks keeps a client User-Agent but does not add third-party
+    attribution headers without the repository's required opt-in gate."""
+    mock_openai.return_value = MagicMock()
+    agent = AIAgent(
+        api_key="test-key",
+        base_url="https://api.fireworks.ai/inference/v1",
+        model="accounts/fireworks/models/kimi-k2p6",
+        provider="fireworks",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+
+    agent._apply_client_headers_for_base_url("https://api.fireworks.ai/inference/v1")
+
+    headers = agent._client_kwargs["default_headers"]
+    assert "HTTP-Referer" not in headers
+    assert "X-Title" not in headers
+    assert headers["User-Agent"].startswith("HermesAgent/")
 
 
 @patch("run_agent.OpenAI")
