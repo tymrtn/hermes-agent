@@ -462,6 +462,19 @@ class TestCheckForSkillUpdates:
 
 class TestCreateSourceRouter:
 
+    def test_local_source_resolves_profile_skills_without_legacy_global(
+        self, tmp_path, monkeypatch
+    ):
+        import tools.skills_hub as skills_hub
+
+        profile_home = tmp_path / "profile"
+        monkeypatch.setenv("HERMES_HOME", str(profile_home))
+        assert "SKILLS_DIR" not in vars(skills_hub)
+
+        source = skills_hub.LocalSkillSource()
+
+        assert source._skills_dir == profile_home / "skills"
+
     def test_url_source_runs_before_github_source(self):
         # UrlSource must win over GitHubSource when both could claim a URL.
         sources = create_source_router(auth=MagicMock(spec=GitHubAuth))

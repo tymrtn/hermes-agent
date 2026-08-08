@@ -3097,7 +3097,7 @@ class LocalSkillSource(SkillSource):
     """
 
     def __init__(self):
-        self._skills_dir = SKILLS_DIR
+        self._skills_dir = _skills_dir()
 
     def source_id(self) -> str:
         return "local"
