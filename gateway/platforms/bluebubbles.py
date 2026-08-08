@@ -192,6 +192,12 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         if _require_mention is None:
             _require_mention = os.getenv("BLUEBUBBLES_REQUIRE_MENTION")
         self.require_mention = str(_require_mention).strip().lower() in {"true", "1", "yes", "on"}
+        _require_mention_in_dms = extra.get("require_mention_in_dms")
+        if _require_mention_in_dms is None:
+            _require_mention_in_dms = os.getenv("BLUEBUBBLES_REQUIRE_MENTION_IN_DMS")
+        self.require_mention_in_dms = str(_require_mention_in_dms).strip().lower() in {
+            "true", "1", "yes", "on"
+        }
         self._mention_patterns = self._compile_mention_patterns(
             extra["mention_patterns"]
             if "mention_patterns" in extra
@@ -1039,10 +1045,16 @@ class BlueBubblesAdapter(BasePlatformAdapter):
 
         session_chat_id = chat_guid or chat_identifier
         is_group = bool(record.get("isGroup")) or (";+;" in (chat_guid or ""))
-        if is_group and self.require_mention:
+        mention_required = (
+            (is_group and self.require_mention)
+            or (not is_group and self.require_mention_in_dms)
+        )
+        if mention_required:
             if not self._message_matches_mention_patterns(text):
+                chat_type = "group" if is_group else "DM"
                 logger.debug(
-                    "[bluebubbles] ignoring group message (require_mention=true, no mention pattern matched)"
+                    "[bluebubbles] ignoring %s message (mention required, no mention pattern matched)",
+                    chat_type,
                 )
                 return web.Response(text="ok")
             text = self._clean_mention_text(text)

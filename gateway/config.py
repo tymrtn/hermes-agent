@@ -1561,6 +1561,8 @@ def load_gateway_config() -> GatewayConfig:
                     bridged["cron_continuable_surface"] = platform_cfg["cron_continuable_surface"]
                 if "require_mention" in platform_cfg:
                     bridged["require_mention"] = platform_cfg["require_mention"]
+                if "require_mention_in_dms" in platform_cfg:
+                    bridged["require_mention_in_dms"] = platform_cfg["require_mention_in_dms"]
                 if "send_read_receipts" in platform_cfg:
                     bridged["send_read_receipts"] = platform_cfg["send_read_receipts"]
                 if plat == Platform.TELEGRAM and "allowed_chats" in platform_cfg:
@@ -2401,6 +2403,11 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         if bluebubbles_require_mention is not None:
             config.platforms[Platform.BLUEBUBBLES].extra["require_mention"] = (
                 bluebubbles_require_mention.lower() in {"true", "1", "yes", "on"}
+            )
+        bluebubbles_require_mention_in_dms = getenv("BLUEBUBBLES_REQUIRE_MENTION_IN_DMS")
+        if bluebubbles_require_mention_in_dms is not None:
+            config.platforms[Platform.BLUEBUBBLES].extra["require_mention_in_dms"] = (
+                bluebubbles_require_mention_in_dms.lower() in {"true", "1", "yes", "on"}
             )
         bluebubbles_mention_patterns = getenv("BLUEBUBBLES_MENTION_PATTERNS")
         if bluebubbles_mention_patterns:

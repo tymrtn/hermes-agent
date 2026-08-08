@@ -465,6 +465,9 @@ These are set automatically by the Docker terminal backend when `proxy.enabled: 
 | `BLUEBUBBLES_HOME_CHANNEL` | Phone/email for cron/notification delivery |
 | `BLUEBUBBLES_ALLOWED_USERS` | Comma-separated authorized users |
 | `BLUEBUBBLES_ALLOW_ALL_USERS` | Allow all users (`true`/`false`) |
+| `BLUEBUBBLES_REQUIRE_MENTION` | Require mention-pattern matching in group chats (`true`/`false`, default: `false`) |
+| `BLUEBUBBLES_REQUIRE_MENTION_IN_DMS` | Require wake-word mention-pattern matching in one-to-one DMs (`true`/`false`, default: `false`) |
+| `BLUEBUBBLES_MENTION_PATTERNS` | JSON array, newline-separated, or comma-separated regex patterns used by BlueBubbles mention gates |
 | `QQ_APP_ID` | QQ Bot App ID from [q.qq.com](https://q.qq.com) |
 | `QQ_CLIENT_SECRET` | QQ Bot App Secret from [q.qq.com](https://q.qq.com) |
 | `QQ_STT_API_KEY` | API key for external STT fallback provider (optional, used when QQ built-in ASR returns no text) |

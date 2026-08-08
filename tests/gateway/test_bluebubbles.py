@@ -29,6 +29,7 @@ class TestBlueBubblesConfigLoading:
         monkeypatch.setenv("BLUEBUBBLES_PASSWORD", "secret")
         monkeypatch.setenv("BLUEBUBBLES_WEBHOOK_PORT", "9999")
         monkeypatch.setenv("BLUEBUBBLES_REQUIRE_MENTION", "true")
+        monkeypatch.setenv("BLUEBUBBLES_REQUIRE_MENTION_IN_DMS", "true")
         monkeypatch.setenv("BLUEBUBBLES_MENTION_PATTERNS", r'["(?i)^amos\\b"]')
         from gateway.config import GatewayConfig, _apply_env_overrides
 
@@ -41,7 +42,8 @@ class TestBlueBubblesConfigLoading:
         assert bc.extra["password"] == "secret"
         assert bc.extra["webhook_port"] == 9999
         assert bc.extra["require_mention"] is True
-        assert bc.extra["mention_patterns"] == ["(?i)^amos\\b"]
+        assert bc.extra["require_mention_in_dms"] is True
+        assert bc.extra["mention_patterns"] == [r"(?i)^amos\b"]
 
 
 class TestBlueBubblesHelpers:
@@ -84,6 +86,21 @@ class _FakeBlueBubblesRequest:
 
 
 class TestBlueBubblesMentionGating:
+    @staticmethod
+    def _message_payload(text, *, is_group=False, sender="caroline@example.com"):
+        separator = "+" if is_group else "-"
+        return {
+            "type": "new-message",
+            "data": {
+                "guid": "msg-1",
+                "text": text,
+                "handle": {"address": sender},
+                "isFromMe": False,
+                "isGroup": is_group,
+                "chats": [{"guid": f"iMessage;{separator};chat-1"}],
+            },
+        }
+
     @pytest.mark.asyncio
     async def test_group_message_without_mention_is_acknowledged_and_skipped(self, monkeypatch):
         adapter = _make_adapter(
@@ -112,6 +129,93 @@ class TestBlueBubblesMentionGating:
 
         assert response.status == 200
         assert handled == []
+
+    @pytest.mark.asyncio
+    async def test_dm_messages_remain_ungated_by_default(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch, send_read_receipts=False)
+        handled = []
+
+        async def fake_handle_message(event):
+            handled.append(event)
+
+        monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+        response = await adapter._handle_webhook(
+            _FakeBlueBubblesRequest(self._message_payload("ordinary conversation"))
+        )
+        await asyncio.sleep(0)
+
+        assert response.status == 200
+        assert [event.text for event in handled] == ["ordinary conversation"]
+
+    @pytest.mark.asyncio
+    async def test_dm_without_wake_word_is_acknowledged_and_skipped(self, monkeypatch):
+        adapter = _make_adapter(
+            monkeypatch,
+            require_mention_in_dms=True,
+            mention_patterns=[r"(?i)^@rocinante\b"],
+            send_read_receipts=False,
+        )
+        handled = []
+
+        async def fake_handle_message(event):
+            handled.append(event)
+
+        monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+        response = await adapter._handle_webhook(
+            _FakeBlueBubblesRequest(self._message_payload("ordinary conversation"))
+        )
+        await asyncio.sleep(0)
+
+        assert response.status == 200
+        assert handled == []
+
+    @pytest.mark.asyncio
+    async def test_unknown_dm_with_wake_word_reaches_pairing_pipeline_stripped(self, monkeypatch):
+        adapter = _make_adapter(
+            monkeypatch,
+            require_mention_in_dms=True,
+            mention_patterns=[r"(?i)^@rocinante\b"],
+            send_read_receipts=False,
+        )
+        handled = []
+
+        async def fake_handle_message(event):
+            # Authorization/pairing happens downstream of adapter dispatch. An
+            # unknown sender must reach that pipeline when the wake word matches.
+            handled.append(event)
+
+        monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+        response = await adapter._handle_webhook(_FakeBlueBubblesRequest(
+            self._message_payload("  @rocinante, please pair me", sender="unknown@example.com")
+        ))
+        await asyncio.sleep(0)
+
+        assert response.status == 200
+        assert len(handled) == 1
+        assert handled[0].text == "please pair me"
+        assert handled[0].source.user_id == "unknown@example.com"
+
+    @pytest.mark.asyncio
+    async def test_dm_gate_does_not_change_group_behavior(self, monkeypatch):
+        adapter = _make_adapter(
+            monkeypatch,
+            require_mention_in_dms=True,
+            mention_patterns=[r"(?i)^@rocinante\b"],
+            send_read_receipts=False,
+        )
+        handled = []
+
+        async def fake_handle_message(event):
+            handled.append(event)
+
+        monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+        response = await adapter._handle_webhook(_FakeBlueBubblesRequest(
+            self._message_payload("ordinary group conversation", is_group=True)
+        ))
+        await asyncio.sleep(0)
+
+        assert response.status == 200
+        assert [event.text for event in handled] == ["ordinary group conversation"]
 
 
 class TestBlueBubblesWebhookParsing:
