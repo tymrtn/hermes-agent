@@ -99,6 +99,11 @@ def _env_keys_defined_in_dotenv(path: Path) -> set[str]:
             text = path.read_text(encoding="latin-1", errors="replace")
         except Exception:
             return keys
+    # Strip a leading UTF-8 BOM before scanning the first key. Invalid UTF-8
+    # bytes elsewhere are replaced only for inventory purposes; key names on
+    # unaffected lines remain visible so profile isolation can remove root-only
+    # platform identity values.
+    text = text.lstrip("\ufeff")
     for line in text.splitlines():
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
@@ -317,12 +322,22 @@ def _shared_profile_env_key(key: str) -> bool:
 
 
 def _dotenv_keys(path: Path) -> set[str]:
+    """Inventory dotenv assignments with the same grammar/encoding as loading."""
     if not path.exists():
         return set()
     try:
-        return {str(k) for k, v in dotenv_values(path).items() if k and v is not None}
+        values = dotenv_values(dotenv_path=path, encoding="utf-8-sig")
+    except UnicodeDecodeError:
+        try:
+            raw = path.read_bytes()
+            if raw.startswith(codecs.BOM_UTF8):
+                raw = raw[len(codecs.BOM_UTF8) :]
+            values = dotenv_values(stream=io.StringIO(raw.decode("latin-1")))
+        except Exception:
+            return set()
     except Exception:
         return set()
+    return {str(key) for key, value in values.items() if key and value is not None}
 
 
 def _discard_unshared_root_env(
@@ -412,9 +427,17 @@ def _sanitize_loaded_credentials() -> None:
 
 def _load_dotenv_with_fallback(path: Path, *, override: bool) -> None:
     try:
-        load_dotenv(dotenv_path=path, override=override, encoding="utf-8")
+        # utf-8-sig strips a leading UTF-8 BOM if present (PowerShell 5.1
+        # Set-Content -Encoding UTF8 / Notepad) and is a no-op for BOM-less
+        # UTF-8. Plain "utf-8" would keep U+FEFF on the first key name and
+        # silently drop it from os.environ under its canonical name.
+        load_dotenv(dotenv_path=path, override=override, encoding="utf-8-sig")
     except UnicodeDecodeError:
-        load_dotenv(dotenv_path=path, override=override, encoding="latin-1")
+        # utf-8-sig can't strip a BOM once we fall back to latin-1 decode.
+        raw = path.read_bytes()
+        if raw.startswith(codecs.BOM_UTF8):
+            raw = raw[len(codecs.BOM_UTF8) :]
+        load_dotenv(stream=io.StringIO(raw.decode("latin-1")), override=override)
     # Strip non-ASCII characters from credential env vars that were just
     # loaded.  API keys must be pure ASCII since they're sent as HTTP
     # header values (httpx encodes headers as ASCII).  Non-ASCII chars

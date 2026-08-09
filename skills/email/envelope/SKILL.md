@@ -2,6 +2,8 @@
 name: envelope
 description: "Use Envelope CLI for agent mailbox workflows."
 version: 1.3.0
+author: Tyler Martin
+license: MIT
 platforms: [linux, macos]
 metadata:
   hermes:
