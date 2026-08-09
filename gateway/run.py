@@ -9551,13 +9551,38 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # already_queued: the clarify-supersede caller pre-enqueued this event
         # (durably claiming it before releasing the clarify waiter), so we must
         # not enqueue it a second time.
+        queued_ok = True
         if (
             not steered
             and not redirected
             and not already_queued
             and not adapter_text_queue_staged
         ):
-            self._queue_or_replace_pending_event(session_key, event)
+            queued_ok = self._queue_or_replace_pending_event(session_key, event)
+
+        # Transcribe a queued voice note now, at arrival, instead of leaving it
+        # for the pending-drain path after the current turn ends.  Steer and
+        # interrupt already pre-transcribe because they need the words inside
+        # the running turn; queue mode stored the raw event, so the user got
+        # "Queued for the next turn" with no 🎙️ echo and no evidence the note
+        # was even heard until the turn finished.  Runs after the authorization,
+        # halt-phrase and approval gates above, and only for STT-eligible voice
+        # media (a MessageType.AUDIO attachment stays a file).
+        #
+        # The transcript is cached on the *queued* event, which may be the
+        # existing pending head that just absorbed this event's attachments, so
+        # the drain path reuses it without a second STT call and the echo ledger
+        # suppresses a repeat 🎙️ line.
+        if effective_mode == "queue" and queued_ok:
+            voice_event = self._busy_queued_voice_event(session_key, event, adapter)
+            if voice_event is not None:
+                await self._transcribe_and_echo_pending_voice(
+                    voice_event,
+                    adapter,
+                    event.source,
+                    voice_event.text or "",
+                    log_context="Busy-queue",
+                )
 
         is_queue_mode = effective_mode == "queue"
         is_steer_mode = effective_mode == "steer"
@@ -24307,6 +24332,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 audio_paths.append(path)
         return audio_paths
 
+    def _busy_queued_voice_event(self, session_key: str, event, adapter):
+        """Return the queued event that owns *event*'s voice media, if any.
+
+        ``_queue_or_replace_pending_event`` folds a media follow-up into the
+        existing pending head (photo-burst / album semantics) rather than
+        storing the incoming event, and that head is what the drain path
+        consumes.  The transcript cache and the echo ledger therefore have to
+        live on the head, not on the orphaned incoming event.  Returns ``None``
+        when there is nothing STT-eligible to prepare.
+        """
+        audio_paths = self._pending_event_audio_paths(event)
+        if not audio_paths:
+            return None
+        pending_slot = getattr(adapter, "_pending_messages", None)
+        head = pending_slot.get(session_key) if isinstance(pending_slot, dict) else None
+        if head is not None and head is not event:
+            head_urls = set(getattr(head, "media_urls", None) or [])
+            if all(path in head_urls for path in audio_paths):
+                return head
+        return event
+
     async def _transcribe_pending_audio_event_once(
         self,
         event,
@@ -24319,31 +24365,117 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         but only one STT call and one transcript echo should happen for the
         platform message.
         """
-        if hasattr(event, "_gateway_pending_stt_text"):
-            cached_text = getattr(event, "_gateway_pending_stt_text")
-            cached_transcripts = getattr(event, "_gateway_pending_stt_transcripts", []) or []
-            return cached_text, list(cached_transcripts)
+        lock = getattr(event, "_gateway_pending_stt_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            setattr(event, "_gateway_pending_stt_lock", lock)
 
-        audio_paths = self._pending_event_audio_paths(event)
-        if not audio_paths:
-            return user_text if user_text is not None else (getattr(event, "text", None) or None), []
+        async with lock:
+            while True:
+                if hasattr(event, "_gateway_pending_stt_text"):
+                    cached_text = getattr(event, "_gateway_pending_stt_text")
+                    cached_transcripts = (
+                        getattr(event, "_gateway_pending_stt_transcripts", []) or []
+                    )
+                    return cached_text, list(cached_transcripts)
 
-        text = user_text if user_text is not None else (getattr(event, "text", "") or "")
-        # Skip cleanup here: several call sites (interrupt monitor, pending-
-        # drain, button-tap) can race to peek the same event before the
-        # ``_gateway_pending_stt_text`` cache above is set, so more than one
-        # coroutine may still be mid-transcription on this path when the
-        # first one finishes. Deleting the file here could yank it out from
-        # under a concurrent in-flight read. The 24h age-based cache sweep
-        # (cleanup_audio_cache) still reclaims it later.
-        enriched_text, successful_transcripts = await self._enrich_message_with_transcription(
-            text,
-            audio_paths,
-            cleanup_managed_audio=False,
-        )
-        setattr(event, "_gateway_pending_stt_text", enriched_text)
-        setattr(event, "_gateway_pending_stt_transcripts", list(successful_transcripts))
-        return enriched_text, successful_transcripts
+                audio_paths = self._pending_event_audio_paths(event)
+                if not audio_paths:
+                    fallback = (
+                        user_text
+                        if user_text is not None
+                        else (getattr(event, "text", None) or None)
+                    )
+                    return fallback, []
+
+                event_text = getattr(event, "text", None)
+                text = (
+                    event_text
+                    if event_text is not None
+                    else (user_text or "")
+                )
+                generation = int(
+                    getattr(event, "_gateway_pending_stt_generation", 0) or 0
+                )
+                path_cache = dict(
+                    getattr(event, "_gateway_pending_stt_path_transcripts", {})
+                    or {}
+                )
+                missing_paths = [path for path in audio_paths if path not in path_cache]
+
+                # Skip cleanup here: pending-drain and busy-session paths may
+                # still consume the same managed audio. The 24h age-based cache
+                # sweep (cleanup_audio_cache) reclaims it later.
+                missing_transcripts: List[str] = []
+                if missing_paths:
+                    _, missing_transcripts = (
+                        await self._enrich_message_with_transcription(
+                            "",
+                            missing_paths,
+                            cleanup_managed_audio=False,
+                        )
+                    )
+                    if len(missing_transcripts) == len(missing_paths):
+                        # A concurrent merge may have copied the incoming
+                        # event's already-completed path cache while this STT
+                        # call was in flight. Merge into the latest cache rather
+                        # than replacing it with our older snapshot.
+                        latest_cache = dict(
+                            getattr(
+                                event,
+                                "_gateway_pending_stt_path_transcripts",
+                                {},
+                            )
+                            or {}
+                        )
+                        latest_cache.update(path_cache)
+                        latest_cache.update(zip(missing_paths, missing_transcripts))
+                        path_cache = latest_cache
+                        setattr(
+                            event,
+                            "_gateway_pending_stt_path_transcripts",
+                            path_cache,
+                        )
+
+                current_generation = int(
+                    getattr(event, "_gateway_pending_stt_generation", 0) or 0
+                )
+                current_paths = self._pending_event_audio_paths(event)
+                if generation != current_generation or audio_paths != current_paths:
+                    # Media merged while STT was in flight. Keep any completed
+                    # per-path results, but never publish the stale aggregate;
+                    # retry under the same lock for only the new paths.
+                    continue
+
+                if all(path in path_cache for path in audio_paths):
+                    successful_transcripts = [path_cache[path] for path in audio_paths]
+                    prefix = "\n\n".join(
+                        f'"{transcript}"' for transcript in successful_transcripts
+                    )
+                    placeholder = "(The user sent a message with no text content)"
+                    if text and text.strip() != placeholder:
+                        enriched_text = f"{prefix}\n\n{text}"
+                    else:
+                        enriched_text = prefix
+                else:
+                    # At least one path failed. Re-run the complete batch with
+                    # the real caption so failure markers and transcript order
+                    # exactly match the normal inbound STT path.
+                    enriched_text, successful_transcripts = (
+                        await self._enrich_message_with_transcription(
+                            text,
+                            audio_paths,
+                            cleanup_managed_audio=False,
+                        )
+                    )
+
+                setattr(event, "_gateway_pending_stt_text", enriched_text)
+                setattr(
+                    event,
+                    "_gateway_pending_stt_transcripts",
+                    list(successful_transcripts),
+                )
+                return enriched_text, successful_transcripts
 
     async def _echo_pending_stt_transcripts_once(
         self,
@@ -24373,18 +24505,76 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             or adapter is None
         ):
             return
-        already_echoed = int(getattr(event, "_gateway_pending_stt_echoed", 0) or 0)
-        unsent = transcripts[already_echoed:]
-        setattr(event, "_gateway_pending_stt_echoed", already_echoed + len(unsent))
-        for tx in unsent:
-            try:
-                await adapter.send(
-                    source.chat_id,
-                    f'🎙️ "{tx}"',
-                    metadata=metadata,
+        lock = getattr(event, "_gateway_pending_stt_echo_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            setattr(event, "_gateway_pending_stt_echo_lock", lock)
+        async with lock:
+            audio_paths = self._pending_event_audio_paths(event)
+            path_cache = dict(
+                getattr(event, "_gateway_pending_stt_path_transcripts", {})
+                or {}
+            )
+            transcript_paths: List[str] = []
+            used_paths: set[str] = set()
+            for transcript in transcripts:
+                match = next(
+                    (
+                        path
+                        for path in audio_paths
+                        if path not in used_paths and path_cache.get(path) == transcript
+                    ),
+                    None,
                 )
-            except Exception as echo_exc:
-                logger.debug("%s echo failed (non-fatal): %s", log_context, echo_exc)
+                if match is None:
+                    transcript_paths = []
+                    break
+                transcript_paths.append(match)
+                used_paths.add(match)
+            if not transcript_paths and len(audio_paths) == len(transcripts):
+                transcript_paths = list(audio_paths)
+
+            if len(transcript_paths) == len(transcripts):
+                echoed_paths = set(
+                    getattr(event, "_gateway_pending_stt_echoed_paths", set())
+                    or set()
+                )
+                unsent_pairs = [
+                    (path, transcript)
+                    for path, transcript in zip(transcript_paths, transcripts)
+                    if path not in echoed_paths
+                ]
+                echoed_paths.update(path for path, _ in unsent_pairs)
+                setattr(event, "_gateway_pending_stt_echoed_paths", echoed_paths)
+                # Keep the legacy count coherent for older diagnostics/tests;
+                # path identity is the authoritative ledger for merged media.
+                setattr(event, "_gateway_pending_stt_echoed", len(echoed_paths))
+                unsent = [transcript for _, transcript in unsent_pairs]
+            else:
+                # Partial-success legacy events cannot be mapped safely back to
+                # media paths. Retain the previous prefix-count fallback.
+                already_echoed = int(
+                    getattr(event, "_gateway_pending_stt_echoed", 0) or 0
+                )
+                unsent = transcripts[already_echoed:]
+                setattr(
+                    event,
+                    "_gateway_pending_stt_echoed",
+                    already_echoed + len(unsent),
+                )
+            for tx in unsent:
+                try:
+                    await adapter.send(
+                        source.chat_id,
+                        f'🎙️ "{tx}"',
+                        metadata=metadata,
+                    )
+                except Exception as echo_exc:
+                    logger.debug(
+                        "%s echo failed (non-fatal): %s",
+                        log_context,
+                        echo_exc,
+                    )
 
     async def _transcribe_and_echo_pending_voice(
         self,

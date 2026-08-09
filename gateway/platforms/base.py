@@ -2862,7 +2862,10 @@ class SecureReply(str):
         return str.__str__(self)
 
 
-def _invalidate_pending_stt_cache(event: MessageEvent) -> None:
+def _invalidate_pending_stt_cache(
+    event: MessageEvent,
+    incoming: Optional[MessageEvent] = None,
+) -> None:
     """Clear gateway-side STT cache attrs when media is merged into an event.
 
     ``merge_pending_message_event`` extends ``media_urls`` in place when two
@@ -2878,12 +2881,42 @@ def _invalidate_pending_stt_cache(event: MessageEvent) -> None:
     returns the earlier notes again, so clearing the ledger would echo them a
     second time.
     """
+    # Preserve per-path successful transcripts across media merges. This lets
+    # the runner transcribe only newly appended voice notes instead of paying
+    # for every earlier note again. A steer/interrupt fallback may have already
+    # cached the incoming event before it was folded into this head.
+    path_cache = dict(
+        getattr(event, "_gateway_pending_stt_path_transcripts", {}) or {}
+    )
+    if incoming is not None:
+        path_cache.update(
+            getattr(incoming, "_gateway_pending_stt_path_transcripts", {}) or {}
+        )
+    if path_cache:
+        setattr(event, "_gateway_pending_stt_path_transcripts", path_cache)
+
+    echoed_paths = set(
+        getattr(event, "_gateway_pending_stt_echoed_paths", set()) or set()
+    )
+    if incoming is not None:
+        echoed_paths.update(
+            getattr(incoming, "_gateway_pending_stt_echoed_paths", set()) or set()
+        )
+    if echoed_paths:
+        setattr(event, "_gateway_pending_stt_echoed_paths", echoed_paths)
+
     for attr in (
         "_gateway_pending_stt_text",
         "_gateway_pending_stt_transcripts",
     ):
         if hasattr(event, attr):
             delattr(event, attr)
+    # Always advance a generation, even when a transcription is still in
+    # flight and no cache exists yet. The writer snapshots this value before
+    # awaiting STT and retries if media merged underneath it, preventing a
+    # stale one-note result from overwriting the merged event's cache.
+    generation = int(getattr(event, "_gateway_pending_stt_generation", 0) or 0)
+    setattr(event, "_gateway_pending_stt_generation", generation + 1)
 
 
 # Metadata key under which a platform adapter stages a deferred thread-
@@ -3003,7 +3036,7 @@ def merge_pending_message_event(
             if event.text:
                 existing.text = BasePlatformAdapter._merge_caption(existing.text, event.text)
             _adopt_newer_staged_watermark(existing, event)
-            _invalidate_pending_stt_cache(existing)
+            _invalidate_pending_stt_cache(existing, event)
             return
 
         if existing_has_media or incoming_has_media:
@@ -3025,7 +3058,7 @@ def merge_pending_message_event(
             ):
                 existing.message_type = event.message_type
             _adopt_newer_staged_watermark(existing, event)
-            _invalidate_pending_stt_cache(existing)
+            _invalidate_pending_stt_cache(existing, event)
             return
 
         if (

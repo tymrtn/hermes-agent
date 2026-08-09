@@ -8,6 +8,8 @@ Covers:
 - Multi follow-up text concatenation in the order received.
 - Reaction lifecycle (👍 / ⚡ / 🙊 emitted on each follow-up).
 - Control-bubble fallback when no tool bubble exists.
+- Queue-mode voice notes transcribed at arrival (before the queue ack)
+  rather than when the pending queue drains.
 
 Adapter is mocked; we exercise GatewayRunner methods directly to keep
 the surface tight.  These complement the platform-neutral wire-format
@@ -67,6 +69,67 @@ def _make_event(text="hello", chat_id="123", platform_val="telegram", message_id
     )
 
 
+def _make_voice_event(
+    path="/tmp/voice_one.ogg",
+    text="",
+    message_id="v1",
+    message_type=MessageType.VOICE,
+    media_type="audio/ogg",
+    source=None,
+):
+    source = source or SessionSource(
+        platform=MagicMock(value="telegram"),
+        chat_id="123",
+        chat_type="private",
+        user_id="user1",
+    )
+    return MessageEvent(
+        text=text,
+        message_type=message_type,
+        source=source,
+        message_id=message_id,
+        media_urls=[path],
+        media_types=[media_type],
+    )
+
+
+def _install_fake_stt(runner, transcripts_by_path):
+    """Stub the STT boundary, keeping the real cache/echo-ledger machinery.
+
+    Returns the list of audio-path batches passed to each transcription call,
+    so tests can assert how many STT requests were actually issued.
+    """
+    calls: list[list[str]] = []
+
+    async def _enrich(user_text, audio_paths, cleanup_managed_audio=True):
+        calls.append(list(audio_paths))
+        transcripts = [transcripts_by_path[p] for p in audio_paths]
+        prefix = "\n\n".join(
+            f'[Voice message transcript]: "{t}"' for t in transcripts
+        )
+        if user_text:
+            return f"{prefix}\n\n{user_text}", transcripts
+        return prefix, transcripts
+
+    runner._enrich_message_with_transcription = _enrich
+    return calls
+
+
+def _record_chat_sends(adapter):
+    """Capture transcript echoes and busy acks in a single ordered log."""
+    sent: list[tuple[str, str]] = []
+
+    async def _echo(_chat_id, content, **_kwargs):
+        sent.append(("echo", content))
+
+    async def _ack(**kwargs):
+        sent.append(("ack", kwargs.get("content") or ""))
+
+    adapter.send = AsyncMock(side_effect=_echo)
+    adapter._send_with_retry = AsyncMock(side_effect=_ack)
+    return sent
+
+
 def _make_runner():
     from gateway.run import GatewayRunner, _AGENT_PENDING_SENTINEL
 
@@ -122,6 +185,7 @@ def _make_adapter():
         side_effect=lambda sk: adapter._text_debounce.pop(sk, None)
     )
     adapter._send_with_retry = AsyncMock()
+    adapter.send = AsyncMock()
     adapter.set_busy_reaction = AsyncMock(return_value=True)
     adapter.attach_busy_session_buttons = AsyncMock(return_value=True)
     adapter.clear_busy_session_buttons = AsyncMock(return_value=True)
@@ -806,6 +870,385 @@ class TestAckTextUpdateAfterTap:
             c.kwargs for c in adapter.edit_message.await_args_list
         ]
         assert any("Stopped" in (kw.get("content") or "") for kw in edit_calls)
+
+
+class TestBusyQueueVoiceTranscription:
+    """Queue-mode voice notes must be transcribed when they arrive.
+
+    Steer and interrupt already pre-transcribe because they need the text
+    inside the running turn.  Queue mode used to store the raw event, so a
+    voice note sent while the agent was mid-tool produced only "Queued for
+    the next turn" — no 🎙️ echo, and no transcript at all until the turn
+    finished and the pending queue drained.
+    """
+
+    @pytest.mark.asyncio
+    async def test_voice_note_transcript_is_echoed_before_the_queue_ack(self):
+        from gateway.run import GatewayRunner
+
+        runner, _ = _make_runner()
+        runner._busy_input_mode = "queue"
+        adapter = _make_adapter()
+        sent = _record_chat_sends(adapter)
+        stt_calls = _install_fake_stt(runner, {"/tmp/voice_one.ogg": "ship it tomorrow"})
+        event = _make_voice_event()
+        sk = build_session_key(event.source)
+        runner.adapters[event.source.platform] = adapter
+        runner._running_agents[sk] = MagicMock()
+
+        assert await GatewayRunner._handle_active_session_busy_message(
+            runner, event, sk
+        ) is True
+
+        assert stt_calls == [["/tmp/voice_one.ogg"]]
+        assert sent[0] == ("echo", '🎙️ "ship it tomorrow"')
+        assert sent[1][0] == "ack"
+        assert "Queued for the next turn" in sent[1][1]
+        assert adapter._pending_messages[sk] is event
+
+    @pytest.mark.asyncio
+    async def test_pending_drain_reuses_the_arrival_transcript(self):
+        """Drain must not pay for a second STT call or echo the note twice."""
+        from gateway.run import GatewayRunner
+
+        runner, _ = _make_runner()
+        runner._busy_input_mode = "queue"
+        adapter = _make_adapter()
+        sent = _record_chat_sends(adapter)
+        stt_calls = _install_fake_stt(runner, {"/tmp/voice_one.ogg": "ship it tomorrow"})
+        event = _make_voice_event()
+        sk = build_session_key(event.source)
+        runner.adapters[event.source.platform] = adapter
+        runner._running_agents[sk] = MagicMock()
+
+        await GatewayRunner._handle_active_session_busy_message(runner, event, sk)
+
+        assert stt_calls == [["/tmp/voice_one.ogg"]]
+        queued = adapter._pending_messages[sk]
+        # Mirrors the post-run drain site, which prepares the dequeued event
+        # before handing its text back as the next user turn.
+        drained, _ = await runner._transcribe_and_echo_pending_voice(
+            queued,
+            adapter,
+            event.source,
+            queued.text or "",
+            log_context="Voice-drain",
+        )
+
+        assert "ship it tomorrow" in drained
+        assert stt_calls == [["/tmp/voice_one.ogg"]]
+        assert [kind for kind, _ in sent].count("echo") == 1
+
+    @pytest.mark.asyncio
+    async def test_audio_file_attachment_is_not_auto_transcribed(self):
+        """MessageType.AUDIO is a file attachment, never an STT input."""
+        from gateway.run import GatewayRunner
+
+        runner, _ = _make_runner()
+        runner._busy_input_mode = "queue"
+        adapter = _make_adapter()
+        sent = _record_chat_sends(adapter)
+        stt_calls = _install_fake_stt(runner, {"/tmp/song.m4a": "should never run"})
+        event = _make_voice_event(
+            path="/tmp/song.m4a",
+            message_type=MessageType.AUDIO,
+            media_type="audio/mp4",
+        )
+        sk = build_session_key(event.source)
+        runner.adapters[event.source.platform] = adapter
+        runner._running_agents[sk] = MagicMock()
+
+        assert await GatewayRunner._handle_active_session_busy_message(
+            runner, event, sk
+        ) is True
+
+        assert stt_calls == []
+        assert [kind for kind, _ in sent] == ["ack"]
+        assert adapter._pending_messages[sk] is event
+
+    @pytest.mark.asyncio
+    async def test_failed_transcription_still_queues_the_event_and_caption(self):
+        from gateway.run import GatewayRunner
+
+        runner, _ = _make_runner()
+        runner._busy_input_mode = "queue"
+        adapter = _make_adapter()
+        sent = _record_chat_sends(adapter)
+
+        attempts = []
+
+        async def _boom(*_args, **_kwargs):
+            attempts.append(1)
+            raise RuntimeError("stt backend down")
+
+        runner._enrich_message_with_transcription = _boom
+        event = _make_voice_event(text="see attached note")
+        sk = build_session_key(event.source)
+        runner.adapters[event.source.platform] = adapter
+        runner._running_agents[sk] = MagicMock()
+
+        assert await GatewayRunner._handle_active_session_busy_message(
+            runner, event, sk
+        ) is True
+
+        assert attempts == [1]
+        queued = adapter._pending_messages[sk]
+        assert queued is event
+        assert queued.text == "see attached note"
+        assert queued.media_urls == ["/tmp/voice_one.ogg"]
+        assert [kind for kind, _ in sent] == ["ack"]
+
+    @pytest.mark.asyncio
+    async def test_subagent_demotion_to_queue_transcribes_voice_note(self):
+        """interrupt → queue demotion (#30170) still needs the transcript."""
+        from gateway.run import GatewayRunner
+
+        runner, _ = _make_runner()
+        runner._busy_input_mode = "interrupt"
+        runner._agent_has_active_subagents = lambda _agent: True
+        adapter = _make_adapter()
+        sent = _record_chat_sends(adapter)
+        stt_calls = _install_fake_stt(runner, {"/tmp/voice_one.ogg": "check the logs"})
+        event = _make_voice_event()
+        sk = build_session_key(event.source)
+        runner.adapters[event.source.platform] = adapter
+        agent = MagicMock()
+        runner._running_agents[sk] = agent
+
+        assert await GatewayRunner._handle_active_session_busy_message(
+            runner, event, sk
+        ) is True
+
+        agent.interrupt.assert_not_called()
+        assert stt_calls == [["/tmp/voice_one.ogg"]]
+        assert sent[0] == ("echo", '🎙️ "check the logs"')
+        assert "Subagent working" in sent[1][1]
+
+    @pytest.mark.asyncio
+    async def test_steer_fallback_to_queue_transcribes_only_once(self):
+        """A steer that can't land falls back to queue — without redoing STT."""
+        from gateway.run import GatewayRunner
+
+        runner, _ = _make_runner()
+        runner._busy_input_mode = "steer"
+        adapter = _make_adapter()
+        sent = _record_chat_sends(adapter)
+        stt_calls = _install_fake_stt(runner, {"/tmp/voice_one.ogg": "use the other branch"})
+        event = _make_voice_event()
+        sk = build_session_key(event.source)
+        runner.adapters[event.source.platform] = adapter
+        agent = MagicMock()
+        agent.steer = MagicMock(return_value=False)
+        runner._running_agents[sk] = agent
+
+        assert await GatewayRunner._handle_active_session_busy_message(
+            runner, event, sk
+        ) is True
+
+        assert stt_calls == [["/tmp/voice_one.ogg"]]
+        assert [kind for kind, _ in sent].count("echo") == 1
+        assert "Queued for the next turn" in sent[-1][1]
+        assert adapter._pending_messages[sk] is event
+
+    @pytest.mark.asyncio
+    async def test_second_voice_note_merged_into_pending_head_echoes_only_the_new_one(self):
+        """Media merge invalidates the cached transcript; don't re-echo note 1."""
+        from gateway.run import GatewayRunner
+
+        runner, _ = _make_runner()
+        runner._busy_input_mode = "queue"
+        adapter = _make_adapter()
+        sent = _record_chat_sends(adapter)
+        stt_calls = _install_fake_stt(
+            runner,
+            {"/tmp/voice_one.ogg": "first note", "/tmp/voice_two.ogg": "second note"},
+        )
+        first = _make_voice_event()
+        second = _make_voice_event(
+            path="/tmp/voice_two.ogg", message_id="v2", source=first.source
+        )
+        sk = build_session_key(first.source)
+        runner.adapters[first.source.platform] = adapter
+        runner._running_agents[sk] = MagicMock()
+
+        await GatewayRunner._handle_active_session_busy_message(runner, first, sk)
+        await GatewayRunner._handle_active_session_busy_message(runner, second, sk)
+
+        assert stt_calls == [["/tmp/voice_one.ogg"], ["/tmp/voice_two.ogg"]]
+        echoes = [content for kind, content in sent if kind == "echo"]
+        assert echoes == ['🎙️ "first note"', '🎙️ "second note"']
+
+        queued = adapter._pending_messages[sk]
+        assert queued.media_urls == ["/tmp/voice_one.ogg", "/tmp/voice_two.ogg"]
+        drained, _ = await runner._transcribe_and_echo_pending_voice(
+            queued,
+            adapter,
+            first.source,
+            queued.text or "",
+            log_context="Voice-drain",
+        )
+        assert "first note" in drained and "second note" in drained
+        assert [content for kind, content in sent if kind == "echo"] == echoes
+
+    @pytest.mark.asyncio
+    async def test_concurrent_voice_merge_cannot_publish_stale_head_cache(self):
+        """An in-flight first note retries only the newly merged second note."""
+        from gateway.run import GatewayRunner
+
+        runner, _ = _make_runner()
+        runner._busy_input_mode = "queue"
+        adapter = _make_adapter()
+        sent = _record_chat_sends(adapter)
+        calls: list[list[str]] = []
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+
+        async def _enrich(user_text, audio_paths, cleanup_managed_audio=True):
+            paths = list(audio_paths)
+            calls.append(paths)
+            if paths == ["/tmp/voice_one.ogg"]:
+                first_started.set()
+                await release_first.wait()
+            transcripts = [
+                "first note" if path.endswith("voice_one.ogg") else "second note"
+                for path in paths
+            ]
+            prefix = "\n\n".join(f'"{tx}"' for tx in transcripts)
+            return (f"{prefix}\n\n{user_text}" if user_text else prefix), transcripts
+
+        runner._enrich_message_with_transcription = _enrich
+        first = _make_voice_event(text="caption one")
+        second = _make_voice_event(
+            path="/tmp/voice_two.ogg",
+            text="caption two",
+            message_id="v2",
+            source=first.source,
+        )
+        sk = build_session_key(first.source)
+        runner.adapters[first.source.platform] = adapter
+        runner._running_agents[sk] = MagicMock()
+
+        first_task = asyncio.create_task(
+            GatewayRunner._handle_active_session_busy_message(runner, first, sk)
+        )
+        await first_started.wait()
+        second_task = asyncio.create_task(
+            GatewayRunner._handle_active_session_busy_message(runner, second, sk)
+        )
+        await asyncio.sleep(0)
+        assert adapter._pending_messages[sk].media_urls == [
+            "/tmp/voice_one.ogg",
+            "/tmp/voice_two.ogg",
+        ]
+        release_first.set()
+        await asyncio.gather(first_task, second_task)
+
+        queued = adapter._pending_messages[sk]
+        assert calls == [["/tmp/voice_one.ogg"], ["/tmp/voice_two.ogg"]]
+        assert getattr(queued, "_gateway_pending_stt_transcripts") == [
+            "first note",
+            "second note",
+        ]
+        drained, _ = await runner._transcribe_and_echo_pending_voice(
+            queued,
+            adapter,
+            first.source,
+            queued.text or "",
+            log_context="Voice-drain",
+        )
+        assert "first note" in drained and "second note" in drained
+        assert "caption one" in drained and "caption two" in drained
+        assert [content for kind, content in sent if kind == "echo"] == [
+            '🎙️ "first note"',
+            '🎙️ "second note"',
+        ]
+
+    @pytest.mark.asyncio
+    async def test_second_failed_steer_transfers_echo_ledger_to_pending_head(self):
+        """Queue fallback must not re-transcribe or re-echo the incoming note."""
+        from gateway.run import GatewayRunner
+
+        runner, _ = _make_runner()
+        runner._busy_input_mode = "steer"
+        adapter = _make_adapter()
+        sent = _record_chat_sends(adapter)
+        calls = _install_fake_stt(
+            runner,
+            {"/tmp/voice_one.ogg": "first note", "/tmp/voice_two.ogg": "second note"},
+        )
+        first = _make_voice_event()
+        second = _make_voice_event(
+            path="/tmp/voice_two.ogg", message_id="v2", source=first.source
+        )
+        sk = build_session_key(first.source)
+        runner.adapters[first.source.platform] = adapter
+        agent = MagicMock()
+        agent.steer = MagicMock(return_value=False)
+        runner._running_agents[sk] = agent
+
+        await GatewayRunner._handle_active_session_busy_message(runner, first, sk)
+        await GatewayRunner._handle_active_session_busy_message(runner, second, sk)
+
+        assert calls == [["/tmp/voice_one.ogg"], ["/tmp/voice_two.ogg"]]
+        assert [content for kind, content in sent if kind == "echo"] == [
+            '🎙️ "first note"',
+            '🎙️ "second note"',
+        ]
+        queued = adapter._pending_messages[sk]
+        assert getattr(queued, "_gateway_pending_stt_echoed") == 2
+        assert getattr(queued, "_gateway_pending_stt_transcripts") == [
+            "first note",
+            "second note",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_failed_prefix_does_not_re_echo_transferred_successful_suffix(self):
+        """A path-keyed ledger must beat legacy prefix counting after failure."""
+        from gateway.run import GatewayRunner
+
+        runner, _ = _make_runner()
+        adapter = _make_adapter()
+        sent = _record_chat_sends(adapter)
+        source = _make_voice_event().source
+        event = _make_voice_event(source=source)
+        event.media_urls.append("/tmp/voice_two.ogg")
+        event.media_types.append("audio/ogg")
+        event._gateway_pending_stt_path_transcripts = {
+            "/tmp/voice_two.ogg": "second note"
+        }
+        event._gateway_pending_stt_echoed_paths = {"/tmp/voice_two.ogg"}
+        event._gateway_pending_stt_echoed = 1
+
+        await runner._echo_pending_stt_transcripts_once(
+            event,
+            adapter,
+            source,
+            ["second note"],
+            log_context="Voice-test",
+        )
+
+        assert [content for kind, content in sent if kind == "echo"] == []
+        assert event._gateway_pending_stt_echoed_paths == {"/tmp/voice_two.ogg"}
+
+    @pytest.mark.asyncio
+    async def test_plain_text_followup_never_touches_stt(self):
+        from gateway.run import GatewayRunner
+
+        runner, _ = _make_runner()
+        runner._busy_input_mode = "queue"
+        adapter = _make_adapter()
+        _record_chat_sends(adapter)
+        stt_calls = _install_fake_stt(runner, {})
+        event = _make_event(text="just some more context")
+        sk = build_session_key(event.source)
+        runner.adapters[event.source.platform] = adapter
+        runner._running_agents[sk] = MagicMock()
+        runner._running_agents_ts[sk] = time.time() - 60
+
+        assert await GatewayRunner._handle_active_session_busy_message(
+            runner, event, sk
+        ) is True
+        assert stt_calls == []
 
 
 class TestCleanup:
