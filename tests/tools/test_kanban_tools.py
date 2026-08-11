@@ -56,7 +56,8 @@ def test_kanban_tools_visible_with_env_var(monkeypatch, tmp_path):
     names = {s["function"].get("name") for s in schema if "function" in s}
     kanban = {n for n in names if n and n.startswith("kanban_")}
     expected = {
-        "kanban_show", "kanban_complete", "kanban_block", "kanban_heartbeat",
+        "kanban_show", "kanban_complete", "kanban_block",
+        "kanban_request_review", "kanban_request_changes", "kanban_heartbeat",
         "kanban_comment", "kanban_create", "kanban_link",
         "kanban_attach", "kanban_attach_url", "kanban_attachments",
     }
@@ -138,7 +139,8 @@ def test_kanban_tools_visible_with_toolset_config(monkeypatch, tmp_path):
     kanban = {n for n in names if n and n.startswith("kanban_")}
     expected = {
         "kanban_list", "kanban_search",
-        "kanban_show", "kanban_complete", "kanban_block", "kanban_heartbeat",
+        "kanban_show", "kanban_complete", "kanban_block",
+        "kanban_request_review", "kanban_request_changes", "kanban_heartbeat",
         "kanban_comment", "kanban_create", "kanban_link",
         "kanban_unblock",
         "kanban_attach", "kanban_attach_url", "kanban_attachments",
@@ -847,6 +849,34 @@ def test_kanban_guidance_prompt_size_bounded(monkeypatch, tmp_path):
     assert 1_500 < len(KANBAN_GUIDANCE) < 6_500, (
         f"KANBAN_GUIDANCE is {len(KANBAN_GUIDANCE)} chars — too short (missing?) or too long"
     )
+
+
+def test_kanban_guidance_prompt_size_bounded():
+    """KANBAN_GUIDANCE is injected into every kanban-capable process's system
+    prompt and resolved once at agent init, so its size is a per-worker token
+    tax paid on every spawn. Bound it as an invariant, not a change-detector:
+    the ceiling (8000 chars, roughly 2000 tokens) leaves headroom above the
+    current ~6.2k chars for tight additions, while catching accidental bloat
+    (pasted docs, duplicated sections) before it ships to every worker.
+    """
+    from agent.prompt_builder import KANBAN_GUIDANCE
+
+    assert len(KANBAN_GUIDANCE) < 8000, (
+        f"KANBAN_GUIDANCE is {len(KANBAN_GUIDANCE)} chars; it is injected into "
+        "every kanban worker's system prompt — trim it or consciously re-bound "
+        "this invariant with justification."
+    )
+
+
+def test_kanban_guidance_orchestrator_decision_ownership():
+    """The orchestrator section must carry the split-brain prevention
+    contract: decisions are made by the orchestrator before fan-out and
+    stamped into every dependent card body."""
+    from agent.prompt_builder import KANBAN_GUIDANCE
+
+    assert KANBAN_GUIDANCE.count("Decision ownership.") == 1
+    assert "Never let two subtree cards decide the same question" in KANBAN_GUIDANCE
+    assert "workers cannot see sibling context" in KANBAN_GUIDANCE
 
 
 # ---------------------------------------------------------------------------
