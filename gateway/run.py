@@ -2607,6 +2607,8 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     STAGED_WATERMARK_COMMIT_KEY,
+    _event_media_is_stt_input,
+    _event_media_type_at,
     _prefix_within_utf16_limit,
     _reply_anchor_for_event,
     build_auto_tts_output_path,
@@ -2905,16 +2907,6 @@ def _try_resolve_fallback_provider() -> dict | None:
     return None
 
 
-def _event_media_type_at(event, index: int) -> str:
-    """Return the per-attachment MIME for the attachment at *index*.
-
-    Empty string when the platform didn't populate a per-file MIME for
-    that slot (some adapters only set a message-level type).
-    """
-    media_types = getattr(event, "media_types", None) or []
-    return media_types[index] if index < len(media_types) else ""
-
-
 def _event_media_is_image(event, index: int) -> bool:
     """True if the attachment at *index* is an image.
 
@@ -2938,23 +2930,31 @@ def _event_media_is_audio(event, index: int) -> bool:
     return getattr(event, "message_type", None) in {MessageType.VOICE, MessageType.AUDIO}
 
 
-def _event_media_is_stt_input(event, index: int) -> bool:
-    """True when an audio attachment should enter the automatic STT pipeline."""
-    message_type = getattr(event, "message_type", None)
-    if message_type in {MessageType.AUDIO, MessageType.DOCUMENT}:
-        return False
-    return (
-        message_type == MessageType.VOICE
-        or _event_media_type_at(event, index).startswith("audio/")
-    )
-
-
 def _event_media_is_video(event, index: int) -> bool:
     """True if the attachment at *index* is video (per-attachment MIME first)."""
     mtype = _event_media_type_at(event, index)
     if mtype:
         return mtype.startswith("video/")
     return getattr(event, "message_type", None) == MessageType.VIDEO
+
+
+# Discord sends this when a message carries attachments and no body text.
+# Once the audio is transcribed the placeholder is redundant.
+_EMPTY_CONTENT_PLACEHOLDER = "(The user sent a message with no text content)"
+
+
+def _compose_transcribed_text(prefix: str, user_text: str) -> str:
+    """Join a transcription prefix with the user's caption text.
+
+    Composition is kept separate from transcription so a cached prefix can be
+    re-joined against an updated caption — a pending voice note that later
+    absorbs a text follow-up — without paying for a second STT call.
+    """
+    if not prefix:
+        return user_text
+    if user_text and user_text.strip() != _EMPTY_CONTENT_PLACEHOLDER:
+        return f"{prefix}\n\n{user_text}"
+    return prefix
 
 
 def _build_media_placeholder(event) -> str:
@@ -9362,6 +9362,70 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._enqueue_fifo(session_key, event, adapter)
         return True
 
+    async def _admit_busy_queue_event(
+        self,
+        session_key: str,
+        event: MessageEvent,
+        *,
+        log_context: str,
+        enqueue: bool = True,
+        merge_text: Optional[bool] = None,
+        adapter=None,
+    ) -> bool:
+        """Park a busy-session follow-up for the next turn and prepare its voice.
+
+        Every busy path that queues a message instead of steering or
+        interrupting goes through here: queue mode, steer-fallback-to-queue,
+        the subagent (#30170) and compression (#56391) interrupt demotions, the
+        agent-setup sentinel, and the PRIORITY fast-path in ``_handle_message``.
+        Steer and interrupt already pre-transcribe because they need the words
+        inside the running turn; the queue paths stored the raw event, so a
+        voice note sent mid-run got "Queued for the next turn" with no 🎙️ echo
+        and no evidence it was heard until the turn finished and the queue
+        drained.
+
+        Callers must have cleared their authorization / halt-phrase / approval
+        gates before reaching here — this issues an STT call and writes to the
+        chat.  Only STT-eligible voice media is transcribed; a
+        ``MessageType.AUDIO`` or ``DOCUMENT`` attachment stays a file.
+
+        ``enqueue=False`` serves a caller that durably queued the event itself
+        (the clarify-supersede path) and needs only the preparation half.
+        ``merge_text`` selects a raw ``merge_pending_message_event`` fold into
+        the head slot instead of the FIFO turn boundary; ``None`` means FIFO.
+
+        Returns whether the event is queued.  A rejected event (queue at cap)
+        is never transcribed.
+        """
+        adapter = adapter if adapter is not None else self._adapter_for_source(event.source)
+        if enqueue:
+            if merge_text is None:
+                if not self._queue_or_replace_pending_event(session_key, event):
+                    return False
+            elif adapter is None:
+                return False
+            else:
+                merge_pending_message_event(
+                    adapter._pending_messages,
+                    session_key,
+                    event,
+                    merge_text=merge_text,
+                )
+        # Cache the transcript on whichever event the drain will consume: a
+        # media follow-up is folded into the existing pending head rather than
+        # stored, so caching on the incoming event would strand it and the
+        # drain would pay for STT again.
+        voice_event = self._busy_queued_voice_event(session_key, event, adapter)
+        if voice_event is not None:
+            await self._transcribe_and_echo_pending_voice(
+                voice_event,
+                adapter,
+                event.source,
+                voice_event.text or "",
+                log_context=log_context,
+            )
+        return True
+
     async def _handle_busy_slash_command_followup(self, event: MessageEvent, session_key: str) -> None:
         """Treat a blocked mid-run slash command as an intentional follow-up."""
         state = getattr(self, "__dict__", {})
@@ -9745,38 +9809,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # already_queued: the clarify-supersede caller pre-enqueued this event
         # (durably claiming it before releasing the clarify waiter), so we must
         # not enqueue it a second time.
-        queued_ok = True
-        if (
+        needs_enqueue = (
             not steered
             and not redirected
             and not already_queued
             and not adapter_text_queue_staged
-        ):
-            queued_ok = self._queue_or_replace_pending_event(session_key, event)
-
-        # Transcribe a queued voice note now, at arrival, instead of leaving it
-        # for the pending-drain path after the current turn ends.  Steer and
-        # interrupt already pre-transcribe because they need the words inside
-        # the running turn; queue mode stored the raw event, so the user got
-        # "Queued for the next turn" with no 🎙️ echo and no evidence the note
-        # was even heard until the turn finished.  Runs after the authorization,
-        # halt-phrase and approval gates above, and only for STT-eligible voice
-        # media (a MessageType.AUDIO attachment stays a file).
-        #
-        # The transcript is cached on the *queued* event, which may be the
-        # existing pending head that just absorbed this event's attachments, so
-        # the drain path reuses it without a second STT call and the echo ledger
-        # suppresses a repeat 🎙️ line.
-        if effective_mode == "queue" and queued_ok:
-            voice_event = self._busy_queued_voice_event(session_key, event, adapter)
-            if voice_event is not None:
-                await self._transcribe_and_echo_pending_voice(
-                    voice_event,
-                    adapter,
-                    event.source,
-                    voice_event.text or "",
-                    log_context="Busy-queue",
-                )
+        )
+        if effective_mode == "queue" and not steered and not redirected:
+            # Queue mode parks the follow-up for the next turn, so transcribe a
+            # voice note now rather than leaving the user with a bare "Queued
+            # for the next turn".  ``_admit_busy_queue_event`` is the shared
+            # admission chokepoint — the PRIORITY fast-path in
+            # ``_handle_message`` reaches the same preparation through it.
+            await self._admit_busy_queue_event(
+                session_key,
+                event,
+                log_context="Busy-queue",
+                enqueue=needs_enqueue,
+                adapter=adapter,
+            )
+        elif needs_enqueue:
+            # Interrupt/redirect flows transcribe below, inside the running
+            # turn, so they only need the durable enqueue here.
+            self._queue_or_replace_pending_event(session_key, event)
 
         is_queue_mode = effective_mode == "queue"
         is_steer_mode = effective_mode == "steer"
@@ -17207,9 +17262,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             if event.message_type == MessageType.PHOTO:
                 logger.debug("PRIORITY photo follow-up for session %s — queueing without interrupt", _quick_key)
-                adapter = self._adapter_for_source(source)
-                if adapter:
-                    merge_pending_message_event(adapter._pending_messages, _quick_key, event)
+                await self._admit_busy_queue_event(
+                    _quick_key,
+                    event,
+                    log_context="Busy-priority-photo",
+                    merge_text=False,
+                )
                 return None
 
             effective_busy_input_mode = self._effective_busy_input_mode(source)
@@ -17234,17 +17292,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Preserve per-source busy-mode precedence: queue mode keeps FIFO
                 # turn boundaries, while non-queue modes retain the legacy
                 # debounce merge without interrupting the just-started turn.
+                # Both go through the shared admission helper so a grace-window
+                # follow-up is prepared the same way as any other queued one.
                 adapter = self._adapter_for_source(source)
                 if adapter:
-                    if effective_busy_input_mode == "queue":
-                        self._queue_or_replace_pending_event(_quick_key, event)
-                    else:
-                        merge_pending_message_event(
-                            adapter._pending_messages,
-                            _quick_key,
-                            event,
-                            merge_text=True,
-                        )
+                    await self._admit_busy_queue_event(
+                        _quick_key,
+                        event,
+                        log_context="Busy-priority-grace",
+                        merge_text=(
+                            None if effective_busy_input_mode == "queue" else True
+                        ),
+                        adapter=adapter,
+                    )
                 return None
 
             _ra_state = self._peek_session_state(_quick_key)
@@ -17258,21 +17318,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     return EphemeralReply("⚡ Force-stopped. The agent was still starting — session unlocked.")
                 # Queue the message so it will be picked up after the
                 # agent starts.
-                adapter = self._adapter_for_source(source)
-                if adapter:
-                    merge_pending_message_event(
-                        adapter._pending_messages,
-                        _quick_key,
-                        event,
-                        merge_text=True,
-                    )
+                await self._admit_busy_queue_event(
+                    _quick_key,
+                    event,
+                    log_context="Busy-priority-pending",
+                    merge_text=True,
+                )
                 return None
             if self._draining:
                 queue_during_drain = self._queue_during_drain_enabled(
                     effective_busy_input_mode
                 )
                 if queue_during_drain:
-                    self._queue_or_replace_pending_event(_quick_key, event)
+                    await self._admit_busy_queue_event(
+                        _quick_key,
+                        event,
+                        log_context="Busy-priority-drain",
+                    )
                 return (
                     f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
                     if queue_during_drain
@@ -17280,7 +17342,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
             if effective_busy_input_mode == "queue":
                 logger.debug("PRIORITY queue follow-up for session %s", _quick_key)
-                self._queue_or_replace_pending_event(_quick_key, event)
+                await self._admit_busy_queue_event(
+                    _quick_key,
+                    event,
+                    log_context="Busy-priority-queue",
+                )
                 return None
             if effective_busy_input_mode == "steer":
                 # Steer mode: inject text into the running agent mid-run via
@@ -17304,7 +17370,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     logger.debug("PRIORITY steer for session %s", _quick_key)
                     return None
                 logger.debug("PRIORITY steer-fallback-to-queue for session %s", _quick_key)
-                self._queue_or_replace_pending_event(_quick_key, event)
+                await self._admit_busy_queue_event(
+                    _quick_key,
+                    event,
+                    log_context="Busy-priority-steer-fallback",
+                )
                 return None
             # #30170 — Subagent protection (PRIORITY path). Same rationale
             # as ``_handle_active_session_busy_message``: an interrupt
@@ -17320,7 +17390,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "because the running agent has active subagents (#30170)",
                     _quick_key,
                 )
-                self._queue_or_replace_pending_event(_quick_key, event)
+                await self._admit_busy_queue_event(
+                    _quick_key,
+                    event,
+                    log_context="Busy-priority-subagent-demotion",
+                )
                 return None
             # #56391 — Compression protection (PRIORITY path). Same
             # rationale as ``_handle_active_session_busy_message``: context
@@ -17336,7 +17410,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "because context compression is in flight (#56391)",
                     _quick_key,
                 )
-                self._queue_or_replace_pending_event(_quick_key, event)
+                await self._admit_busy_queue_event(
+                    _quick_key,
+                    event,
+                    log_context="Busy-priority-compression-demotion",
+                )
                 return None
             # Text-only corrections redirect the live turn (preserving
             # displayed context) when the runtime supports it; media/voice and
@@ -24518,15 +24596,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                 else:
                     notes.append(f"[The user sent a voice message: {abs_path}]")
-            if not notes:
-                return user_text, []
-            prefix = "\n\n".join(notes)
-            _placeholder = "(The user sent a message with no text content)"
-            if user_text and user_text.strip() == _placeholder:
-                return prefix, []
-            if user_text:
-                return f"{prefix}\n\n{user_text}", []
-            return prefix, []
+            return _compose_transcribed_text("\n\n".join(notes), user_text), []
 
         try:
             from tools.transcription_tools import (
@@ -24536,12 +24606,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except ModuleNotFoundError as e:
             logger.error("Transcription module unavailable: %s", e)
             unavailable_note = "[voice message could not be transcribed]"
-            _placeholder = "(The user sent a message with no text content)"
-            if user_text and user_text.strip() == _placeholder:
-                return unavailable_note, []
-            if user_text:
-                return f"{unavailable_note}\n\n{user_text}", []
-            return unavailable_note, []
+            return _compose_transcribed_text(unavailable_note, user_text), []
 
         enriched_parts = []
         successful_transcripts: List[str] = []
@@ -24622,17 +24687,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "or type it out.]"
                 )
 
-        if enriched_parts:
-            prefix = "\n\n".join(enriched_parts)
-            # Strip the empty-content placeholder from the Discord adapter
-            # when we successfully transcribed the audio — it's redundant.
-            _placeholder = "(The user sent a message with no text content)"
-            if user_text and user_text.strip() == _placeholder:
-                return prefix, successful_transcripts
-            if user_text:
-                return f"{prefix}\n\n{user_text}", successful_transcripts
-            return prefix, successful_transcripts
-        return user_text, successful_transcripts
+        return (
+            _compose_transcribed_text("\n\n".join(enriched_parts), user_text),
+            successful_transcripts,
+        )
 
     def _pending_event_audio_paths(self, event) -> List[str]:
         """Return STT-eligible paths from a pending voice message."""
@@ -24675,6 +24733,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         later consumed by the pending-drain path.  Both need the same transcript,
         but only one STT call and one transcript echo should happen for the
         platform message.
+
+        Arrival-time preparation and the pending drain can also reach the same
+        event *concurrently*, before either has populated the cache.  A
+        per-event lock serialises them: the second caller waits for the first
+        call to publish its result instead of issuing a duplicate STT request.
         """
         lock = getattr(event, "_gateway_pending_stt_lock", None)
         if lock is None:
@@ -24763,11 +24826,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     prefix = "\n\n".join(
                         f'"{transcript}"' for transcript in successful_transcripts
                     )
-                    placeholder = "(The user sent a message with no text content)"
-                    if text and text.strip() != placeholder:
-                        enriched_text = f"{prefix}\n\n{text}"
-                    else:
-                        enriched_text = prefix
+                    enriched_text = _compose_transcribed_text(prefix, text)
                 else:
                     # At least one path failed. Re-run the complete batch with
                     # the real caption so failure markers and transcript order

@@ -2879,6 +2879,27 @@ class SecureReply(str):
         return str.__str__(self)
 
 
+def _event_media_type_at(event, index: int) -> str:
+    """Return the per-attachment MIME for the attachment at *index*.
+
+    Empty string when the platform didn't populate a per-file MIME for
+    that slot (some adapters only set a message-level type).
+    """
+    media_types = getattr(event, "media_types", None) or []
+    return media_types[index] if index < len(media_types) else ""
+
+
+def _event_media_is_stt_input(event, index: int) -> bool:
+    """True when an audio attachment should enter the automatic STT pipeline."""
+    message_type = getattr(event, "message_type", None)
+    if message_type in {MessageType.AUDIO, MessageType.DOCUMENT}:
+        return False
+    return (
+        message_type == MessageType.VOICE
+        or _event_media_type_at(event, index).startswith("audio/")
+    )
+
+
 def _invalidate_pending_stt_cache(
     event: MessageEvent,
     incoming: Optional[MessageEvent] = None,
@@ -2891,6 +2912,13 @@ def _invalidate_pending_stt_cache(
     ``_transcribe_pending_audio_event_once``); if the cached event gains new
     media after the cache was populated, the stale transcript must be
     discarded so the next transcription call picks up the merged attachments.
+
+    Dropping the aggregate does not re-bill for audio nobody re-sent.  The
+    per-path transcripts preserved below let the next read rebuild the prefix
+    and rejoin it with the merged caption, calling STT only for paths that are
+    genuinely new — so a merge that leaves the STT-eligible audio untouched (a
+    caption, a plain text follow-up, a photo, an ``AUDIO``/``DOCUMENT`` file
+    attachment) costs a recomposition and nothing more.
 
     Only the *derived* transcription cache is dropped.  The echo ledger
     (``_gateway_pending_stt_echoed``) records which transcripts were already
