@@ -873,6 +873,55 @@ class TestEscapeNativeToolArg:
         assert any("'C:/Users/alice/project'" in c for c in rg_cmds), rg_cmds
         assert all("/c/Users" not in c for c in rg_cmds), rg_cmds
 
+    def test_rg_file_search_sorted_and_fallback_use_native_form(
+        self, mock_env, monkeypatch
+    ):
+        """Both rg --files attempts must receive a native Windows path."""
+        import tools.environments.local as local_mod
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        commands = []
+
+        def side_effect(command, **kwargs):
+            commands.append(command)
+            if "test -e" in command:
+                return {"output": "exists", "returncode": 0}
+            if "command -v" in command:
+                return {"output": "yes", "returncode": 0}
+            # Empty sorted output forces the older-rg fallback command.
+            return {"output": "", "returncode": 0}
+
+        mock_env.execute.side_effect = side_effect
+        ops = self._ops(mock_env)
+        ops.search("*.py", path=r"C:\Users\alice\project", target="files")
+        rg_file_cmds = [c for c in commands if "rg --files" in c]
+        assert len(rg_file_cmds) == 2, rg_file_cmds
+        assert "--sortr=modified" in rg_file_cmds[0]
+        assert "--sortr=modified" not in rg_file_cmds[1]
+        assert all("'C:/Users/alice/project'" in c for c in rg_file_cmds)
+        assert all("/c/Users" not in c for c in rg_file_cmds)
+
+    def test_zero_match_fixed_probe_uses_native_form(self, mock_env, monkeypatch):
+        """The literal near-miss probe must not regress to an MSYS path."""
+        import tools.environments.local as local_mod
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        commands = []
+
+        def side_effect(command, **kwargs):
+            commands.append(command)
+            if "command -v" in command:
+                return {"output": "yes", "returncode": 0}
+            return {"output": "", "returncode": 0}
+
+        mock_env.execute.side_effect = side_effect
+        ops = self._ops(mock_env)
+        ops._zero_match_probe(
+            "needle[", r"C:\Users\alice\project", file_glob=None
+        )
+        fixed_cmds = [c for c in commands if "rg -F --count-matches" in c]
+        assert len(fixed_cmds) == 1, commands
+        assert "'C:/Users/alice/project'" in fixed_cmds[0]
+        assert "/c/Users" not in fixed_cmds[0]
+
     def test_shell_linter_uses_native_form(self, mock_env, monkeypatch):
         """_check_lint must hand node/python/etc. the native C:/ path.
 
