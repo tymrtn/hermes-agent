@@ -3229,6 +3229,9 @@ def _text_to_speech_single(
     from gateway.session_context import get_session_env
     platform = get_session_env("HERMES_SESSION_PLATFORM", "").lower()
     want_opus = platform in OPUS_VOICE_PLATFORMS
+    requested_opus_output = bool(
+        output_path and Path(output_path).expanduser().suffix.lower() == ".ogg"
+    )
 
     # Determine output path
     if output_path:
@@ -3251,6 +3254,18 @@ def _text_to_speech_single(
                 ),
             }, ensure_ascii=False)
         file_path = Path(output_path).expanduser()
+        from agent.file_safety import is_write_approval_required, is_write_denied
+
+        # Check the caller's declared final path before selecting an
+        # intermediate container. Conversion may later write this path.
+        if is_write_denied(str(file_path)) or is_write_approval_required(str(file_path)):
+            return json.dumps({
+                "success": False,
+                "error": (
+                    f"output_path targets a protected credential or system path: "
+                    f"{file_path}. Choose a normal audio output location."
+                ),
+            }, ensure_ascii=False)
         if command_provider_config is not None:
             # Respect caller-supplied path but align the extension with the
             # provider's configured output_format so the command writes to a
@@ -3266,9 +3281,7 @@ def _text_to_speech_single(
             # receive a mislabeled file.
             file_path = file_path.with_suffix(".mp3")
 
-        from agent.file_safety import is_write_denied
-
-        if is_write_denied(str(file_path)):
+        if is_write_denied(str(file_path)) or is_write_approval_required(str(file_path)):
             return json.dumps({
                 "success": False,
                 "error": (
@@ -3484,7 +3497,7 @@ def _text_to_speech_single(
                         file_str = opus_path
                 voice_compatible = file_str.endswith(".ogg")
         elif (
-            want_opus
+            (want_opus or requested_opus_output)
             and provider in {"edge", "neutts", "minimax", "xai", "kittentts", "piper"}
             and not file_str.endswith(".ogg")
         ):
@@ -3625,8 +3638,8 @@ def text_to_speech_tool(
             base_path = _configured_command_tts_output_path(
                 base_path, command_provider_config,
             )
-        from agent.file_safety import is_write_denied
-        if is_write_denied(str(base_path)):
+        from agent.file_safety import is_write_approval_required, is_write_denied
+        if is_write_denied(str(base_path)) or is_write_approval_required(str(base_path)):
             return json.dumps({
                 "success": False,
                 "error": (
