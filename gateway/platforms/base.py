@@ -2906,6 +2906,31 @@ def _event_media_is_stt_input(event, index: int) -> bool:
     )
 
 
+def _stt_eligible_media_urls(event) -> List[str]:
+    """Return the attachment paths on *event* that automatic STT would read."""
+    media_urls = getattr(event, "media_urls", None) or []
+    return [
+        url for index, url in enumerate(media_urls)
+        if _event_media_is_stt_input(event, index)
+    ]
+
+
+# Gateway-owned STT cache attributes, all derived from the same transcription
+# run.  ``_gateway_pending_stt_echoed`` is deliberately absent: it is the echo
+# ledger, not derived state, and must survive invalidation (see below), and so
+# are the per-path transcripts, which are re-attached explicitly.  The sweep is
+# a superset on purpose: an event can reach a merge carrying the caption-joined
+# aggregate or the caption-independent prefix form of the cache, and either one
+# describes audio that just changed.
+_PENDING_STT_CACHE_ATTRS = (
+    "_gateway_pending_stt_text",
+    "_gateway_pending_stt_input_text",
+    "_gateway_pending_stt_prefix",
+    "_gateway_pending_stt_transcripts",
+    "_gateway_pending_stt_audio_paths",
+)
+
+
 def _invalidate_pending_stt_cache(
     event: MessageEvent,
     incoming: Optional[MessageEvent] = None,
@@ -2916,8 +2941,8 @@ def _invalidate_pending_stt_cache(
     media-bearing messages arrive in quick succession.  The gateway runner
     caches STT transcripts on the event via ``setattr`` (see
     ``_transcribe_pending_audio_event_once``); if the cached event gains new
-    media after the cache was populated, the stale transcript must be
-    discarded so the next transcription call picks up the merged attachments.
+    voice media, the stale transcript must be discarded so the next
+    transcription call picks up the merged attachments.
 
     Dropping the aggregate does not re-bill for audio nobody re-sent.  The
     per-path transcripts preserved below let the next read rebuild the prefix
@@ -2956,10 +2981,11 @@ def _invalidate_pending_stt_cache(
     if echoed_paths:
         setattr(event, "_gateway_pending_stt_echoed_paths", echoed_paths)
 
-    for attr in (
-        "_gateway_pending_stt_text",
-        "_gateway_pending_stt_transcripts",
-    ):
+    # The caption-joined aggregate goes even when the STT-eligible audio is
+    # unchanged: it was composed against the pre-merge caption, so keeping it
+    # would strand the follow-up text this merge just folded in.  Recomposing
+    # is free — the per-path transcripts above are what STT is billed against.
+    for attr in _PENDING_STT_CACHE_ATTRS:
         if hasattr(event, attr):
             delattr(event, attr)
     # Always advance a generation, even when a transcription is still in
