@@ -357,14 +357,7 @@ def test_profile_route_and_nonmultiplexed_resolution_preserve_boundaries(monkeyp
     # machine that does not happen to have it — and the route is rejected
     # before the busy-mode snapshot is consulted. Sibling coverage in
     # tests/gateway/test_profile_resolution.py patches the same seam.
-    with patch(
-        "hermes_cli.profiles.profiles_to_serve",
-        return_value=[
-            ("default", Path("/profiles/default")),
-            ("research", Path("/profiles/research")),
-        ],
-    ):
-        assert runner._effective_busy_input_mode(source) == "steer"
+    assert runner._effective_busy_input_mode(source) == "steer"
 
     runner.config.multiplex_profiles = False
     source.profile = "research"

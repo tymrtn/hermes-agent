@@ -18,11 +18,10 @@ from typing import Any, Dict, Iterator, List, Optional
 from hermes_constants import get_hermes_home
 from hermes_time import now as _hermes_now
 
-_INITIAL_EXECUTIONS_FILE = get_hermes_home().resolve() / "cron" / "executions.db"
-# Public override retained for tests/emergency tooling. The ordinary path is
-# resolved at connection time so per-profile and per-test HERMES_HOME changes
-# do not keep writing to whichever profile imported this module first.
-EXECUTIONS_FILE = _INITIAL_EXECUTIONS_FILE
+# Optional test override. Production resolves the path at transaction time so
+# dashboard operations that temporarily enter another profile cannot leak that
+# profile's execution records into the import-time home.
+EXECUTIONS_FILE: Optional[Path] = None
 MAX_TERMINAL_EXECUTIONS = 1000
 _TERMINAL_STATES = ("completed", "failed", "unknown")
 _lock = threading.RLock()
@@ -30,11 +29,9 @@ _PROCESS_ID = uuid.uuid4().hex
 
 
 def _connect() -> sqlite3.Connection:
-    db_path = Path(EXECUTIONS_FILE)
-    if db_path == _INITIAL_EXECUTIONS_FILE:
-        db_path = get_hermes_home().resolve() / "cron" / "executions.db"
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    return sqlite3.connect(db_path, timeout=5)
+    path = EXECUTIONS_FILE or (get_hermes_home().resolve() / "cron" / "executions.db")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return sqlite3.connect(path, timeout=5)
 
 
 def _initialize_schema(conn: sqlite3.Connection) -> None:

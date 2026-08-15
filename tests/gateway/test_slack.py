@@ -4629,6 +4629,7 @@ class TestClarifyReplyWatermarkCommit:
         store = MagicMock()
         store._entries = {self.SESSION_KEY: MagicMock()}
         store._ensure_loaded = MagicMock()
+        store._resolve_profile_for_key = MagicMock(return_value=None)
         store.config = MagicMock()
         store.config.group_sessions_per_user = True
         store.config.thread_sessions_per_user = False
@@ -4661,6 +4662,11 @@ class TestClarifyReplyWatermarkCommit:
         return {
             "text": "use the second option",
             "user": "U_USER",
+            # Human-authored Slack events carry client_msg_id. Without it the
+            # adapter deliberately probes users.info for unlabeled bot events;
+            # an AsyncMock client would make this fixture look bot-authored and
+            # correctly drop it before the clarify lifecycle is exercised.
+            "client_msg_id": "human-clarify-reply",
             "channel": "C123",
             "ts": "123.456",
             "thread_ts": "123.000",
