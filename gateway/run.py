@@ -1771,6 +1771,15 @@ _TOOL_MEDIA_RE = re.compile(
 )
 
 
+# Suppressed-commentary deliverable rescue (see the callback in ``run_sync``).
+# The user turned interim messages off, so only the note that accompanies the
+# attachment is released — capped at the platform caption budget rather than
+# replaying the whole suppressed message. The wait bounds how long the agent
+# thread blocks on the upload before the prompt that follows it.
+_SUPPRESSED_DELIVERABLE_NOTE_CHARS = 1024
+_SUPPRESSED_DELIVERABLE_TIMEOUT = 60.0
+
+
 def _collect_auto_append_media_tags(
     messages: List[Dict[str, Any]],
     history_offset: int = 0,
@@ -3877,6 +3886,18 @@ def _normalize_empty_agent_response(
             )
         return response
 
+    # A requested native attachment may already have been released from
+    # suppressed commentary before a blocking clarify prompt. If the model's
+    # later final answer only repeats that MEDIA tag, deduplication leaves no
+    # text — but the turn is satisfied, not missing output.
+    if (
+        agent_result.get("delivery_satisfied")
+        and not agent_result.get("failed")
+        and not agent_result.get("partial")
+        and not agent_result.get("interrupted")
+    ):
+        return ""
+
     if agent_result.get("failed"):
         # None-safe: the gateway result dict is built with
         # ``'error': holder.get('error')`` and can carry an EXPLICIT None,
@@ -5387,6 +5408,187 @@ class TurnRunner:
                 log_message="interim_assistant_callback scheduling error",
             )
 
+        # Paths released before a blocking clarify prompt. Read again at the
+        # final-response stage so an already-satisfied MEDIA tag is not sent
+        # twice. Suppressed commentary is buffered first: disabling interim
+        # messages must still mean "final response only" unless clarify would
+        # otherwise strand an explicitly requested attachment.
+        _predelivered_media_signatures: dict[str, tuple] = {}
+        _acknowledged_predelivered_paths: set[str] = set()
+        _acknowledged_predelivered_signatures: dict[str, tuple | None] = {}
+        _predelivered_notes: set[str] = set()
+        _suppressed_expected_signatures: dict[str, tuple | None] = {}
+        _suppressed_deliverable_candidates: list[str] = []
+
+        def _media_signature(path: str):
+            try:
+                stat = os.stat(path)
+            except OSError:
+                return None
+            return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+
+        def _media_is_unchanged_or_missing(path: str, signature: tuple) -> bool:
+            current = _media_signature(path)
+            return current is None or current == signature
+
+        def _suppressed_interim_deliverable_cb(text: str) -> None:
+            """Buffer suppressed commentary that carries a valid MEDIA tag."""
+            if not text or "media:" not in text.lower():
+                return
+            from gateway.platforms.base import BasePlatformAdapter
+
+            try:
+                media_files, _prose = BasePlatformAdapter.extract_media(text)
+                media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+            except Exception:
+                logger.debug(
+                    "Suppressed-commentary media extraction failed", exc_info=True
+                )
+                return
+            if media_files and text not in _suppressed_deliverable_candidates:
+                for path, _ in media_files:
+                    _suppressed_expected_signatures[path] = _media_signature(path)
+                _suppressed_deliverable_candidates.append(text)
+
+        def _release_suppressed_deliverables_before_clarify() -> None:
+            """Release buffered Telegram attachments before the blocking poll."""
+            # This regression was reproduced on Telegram, whose media methods
+            # provide acknowledged native sends and fall back through the
+            # marked BasePlatformAdapter contract. Other adapters retain their
+            # existing final-delivery behavior until they expose equally
+            # reliable native-upload acknowledgements.
+            if ctx.source.platform != Platform.TELEGRAM:
+                return
+            if not ctx._run_still_current() or not ctx._status_adapter:
+                return
+            from gateway.platforms.base import BasePlatformAdapter
+
+            while _suppressed_deliverable_candidates:
+                if not ctx._run_still_current():
+                    return
+                candidate = _suppressed_deliverable_candidates.pop(0)
+                unchanged_paths = {
+                    path
+                    for path, signature in _predelivered_media_signatures.items()
+                    if _media_is_unchanged_or_missing(path, signature)
+                }
+                payload = BasePlatformAdapter.strip_media_tags_for_paths(
+                    candidate, unchanged_paths
+                )
+                media_files, prose = BasePlatformAdapter.extract_media(payload)
+                media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+                if not media_files:
+                    continue
+
+                note = str(prose or "").strip()
+                if len(note) > _SUPPRESSED_DELIVERABLE_NOTE_CHARS:
+                    head = note[:_SUPPRESSED_DELIVERABLE_NOTE_CHARS]
+                    cut = head.rfind(" ")
+                    note = (head[:cut] if cut > 0 else head).rstrip() + "…"
+
+                delivered_paths: set[str] = set()
+                force_document = "[[as_document]]" in payload
+                for media_path, is_voice in media_files:
+                    if not ctx._run_still_current():
+                        return
+                    directives = []
+                    if force_document:
+                        directives.append("[[as_document]]")
+                    if is_voice:
+                        directives.append("[[audio_as_voice]]")
+                    directives.append(f"MEDIA:{media_path}")
+                    single_payload = "\n".join(directives)
+                    signature_before = _media_signature(media_path)
+
+                    async def _release_one(one_payload=single_payload) -> set[str]:
+                        return await self._runner._deliver_media_from_response(
+                            one_payload,
+                            MessageEvent(
+                                text="",
+                                source=ctx.source,
+                                message_id=ctx.event_message_id,
+                            ),
+                            ctx._status_adapter,
+                            thread_metadata=ctx._status_thread_metadata,
+                            require_delivery_ack=True,
+                        )
+
+                    fut = safe_schedule_threadsafe(
+                        _release_one(),
+                        ctx._loop_for_step,
+                        logger=logger,
+                        log_message="suppressed interim deliverable scheduling error",
+                    )
+                    if fut is None:
+                        break
+                    try:
+                        one_delivered = set(
+                            fut.result(timeout=_SUPPRESSED_DELIVERABLE_TIMEOUT) or ()
+                        )
+                    except TimeoutError:
+                        fut.cancel()
+                        logger.warning("Suppressed-commentary deliverable timed out")
+                        break
+                    except Exception as exc:
+                        logger.warning(
+                            "Suppressed-commentary deliverable failed: %s", exc
+                        )
+                        break
+
+                    # Record each acknowledged upload before starting the next
+                    # one. A later file can time out without forgetting the
+                    # attachments that already landed.
+                    delivered_paths.update(one_delivered)
+                    _acknowledged_predelivered_paths.update(one_delivered)
+                    for path in one_delivered:
+                        acknowledged_signature = (
+                            signature_before if path == media_path else None
+                        )
+                        _acknowledged_predelivered_signatures[path] = (
+                            acknowledged_signature
+                        )
+                        if acknowledged_signature is not None:
+                            _predelivered_media_signatures[path] = (
+                                acknowledged_signature
+                            )
+
+                # A /stop or /new may invalidate the generation while the
+                # upload is in flight. The attachment cannot be unsent, but
+                # no caption, later attachment, or poll may leak afterward.
+                if not ctx._run_still_current():
+                    return
+
+                # A caption is secondary to the acknowledged attachment. If
+                # its send fails or times out, retain the attachment record so
+                # the final response cannot upload the same file twice.
+                if delivered_paths and note and not _want_interim_messages:
+                    note_fut = safe_schedule_threadsafe(
+                        ctx._status_adapter.send(
+                            ctx._status_chat_id,
+                            note,
+                            metadata=ctx._status_thread_metadata,
+                        ),
+                        ctx._loop_for_step,
+                        logger=logger,
+                        log_message="suppressed deliverable note scheduling error",
+                    )
+                    if note_fut is not None:
+                        try:
+                            note_result = note_fut.result(timeout=15.0)
+                            if getattr(note_result, "success", False):
+                                delivered_note = note.strip()
+                                _predelivered_notes.add(delivered_note)
+                                if _stream_consumer is not None:
+                                    _stream_consumer.mark_text_predelivered(
+                                        delivered_note,
+                                        media_paths=delivered_paths,
+                                    )
+                        except TimeoutError:
+                            note_fut.cancel()
+                            logger.warning("Suppressed deliverable note timed out")
+                        except Exception as exc:
+                            logger.warning("Suppressed deliverable note failed: %s", exc)
+
         turn_route = self._runner._resolve_turn_agent_config(ctx.message, model, runtime_kwargs)
 
         # Per-platform skip_context_files — messaging platforms can opt out
@@ -5711,6 +5913,16 @@ class TurnRunner:
         agent.step_callback = ctx._step_callback_sync if ctx._hooks_ref.loaded_hooks else None
         agent.stream_delta_callback = _stream_delta_cb
         agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None
+        # Telegram display cleanup strips MEDIA tags from commentary in both
+        # interim modes. Keep the attachment rescue active either way; prose
+        # itself remains governed by the user's interim-message preference.
+        # Assign on both branches so a reused cached agent never retains a
+        # callback from a different platform turn.
+        agent.suppressed_interim_deliverable_callback = (
+            _suppressed_interim_deliverable_cb
+            if ctx.source.platform == Platform.TELEGRAM
+            else None
+        )
         agent.status_callback = ctx._status_callback_sync
         # Credits / out-of-band notices (usage bands, depletion, restored).
         # Messaging has no persistent status bar, so each notice is a
@@ -5867,13 +6079,6 @@ class TurnRunner:
                 return ""
 
             clarify_id = _uuid.uuid4().hex[:10]
-            _clarify_mod.register(
-                clarify_id=clarify_id,
-                session_key=ctx.session_key or "",
-                question=question,
-                choices=list(choices) if choices else None,
-                multi_select=bool(multi_select),
-            )
 
             # Pause typing — like approval, we don't want a "thinking..."
             # status to obscure the prompt or block the user from typing
@@ -5902,6 +6107,23 @@ class TurnRunner:
                     "Stream-consumer flush before clarify prompt failed",
                     exc_info=True,
                 )
+
+            # If interim commentary is suppressed, release only the buffered
+            # native deliverables now that a blocking clarify is certain. Do
+            # this before registering the prompt so unrelated user messages
+            # cannot answer a poll that is not visible yet.
+            _release_suppressed_deliverables_before_clarify()
+
+            if not ctx._run_still_current():
+                return "[clarify cancelled: turn no longer current]"
+
+            _clarify_mod.register(
+                clarify_id=clarify_id,
+                session_key=ctx.session_key or "",
+                question=question,
+                choices=list(choices) if choices else None,
+                multi_select=bool(multi_select),
+            )
 
             send_ok = False
             fut = safe_schedule_threadsafe(
@@ -6475,7 +6697,22 @@ class TurnRunner:
             0 if (_session_was_split or _compacted_in_place) else len(agent_history)
         )
 
+        unchanged_predelivered_paths = {
+            path
+            for path, signature in _predelivered_media_signatures.items()
+            if _media_is_unchanged_or_missing(path, signature)
+        }
+        all_suppressed_deliverables_satisfied = bool(
+            _suppressed_expected_signatures
+        ) and all(
+            path in _acknowledged_predelivered_paths
+            and _acknowledged_predelivered_signatures.get(path) == expected
+            for path, expected in _suppressed_expected_signatures.items()
+        )
+        delivery_satisfied = all_suppressed_deliverables_satisfied
+
         if not final_response:
+            result["delivery_satisfied"] = delivery_satisfied
             final_response = _normalize_empty_agent_response(
                 result, final_response or "", history_len=len(agent_history),
             )
@@ -6510,6 +6747,7 @@ class TurnRunner:
                 "output_tokens": _output_toks,
                 "model": _resolved_model,
                 "context_length": _context_length,
+                "delivery_satisfied": delivery_satisfied,
             }
 
         # Scan tool results for MEDIA:<path> tags that need to be delivered
@@ -6532,7 +6770,12 @@ class TurnRunner:
         # also the sole guard on the fallback branch taken when mid-run
         # context compression shrinks the message list below the original
         # history length, preserving the compression-safe behaviour of #160.
-        if "MEDIA:" not in final_response:
+        from gateway.platforms.base import BasePlatformAdapter
+        final_media_directives, _ = BasePlatformAdapter.extract_media(final_response)
+        final_media_directives = BasePlatformAdapter.filter_media_delivery_paths(
+            final_media_directives
+        )
+        if not final_media_directives:
             media_tags, has_voice_directive = _collect_auto_append_media_tags(
                 result.get("messages", []),
                 history_offset=len(agent_history),
@@ -6549,6 +6792,23 @@ class TurnRunner:
                 if has_voice_directive:
                     unique_tags.insert(0, "[[audio_as_voice]]")
                 final_response = final_response + "\n" + "\n".join(unique_tags)
+
+        # An attachment released ahead of a blocking prompt (the
+        # suppressed-commentary rescue) is normally restated by the model in
+        # its final reply, and can also be re-appended from this turn's tool
+        # results just above. Both would upload the same file twice, so drop
+        # exactly those paths' tags — every other directive, including a
+        # deliberate resend of a different file, is left alone.
+        if unchanged_predelivered_paths:
+            final_response = BasePlatformAdapter.strip_media_tags_for_paths(
+                final_response, unchanged_predelivered_paths
+            )
+        if str(final_response or "").strip() in _predelivered_notes:
+            final_response = ""
+        delivery_satisfied = bool(
+            all_suppressed_deliverables_satisfied
+            and not str(final_response or "").strip()
+        )
 
         # Auto-titling runs at TURN START (agent/turn_context.py) from the
         # user's message alone, so it no longer waits on final_response — a
@@ -6594,6 +6854,7 @@ class TurnRunner:
             "session_id": effective_session_id,
             "response_previewed": result.get("response_previewed", False),
             "response_transformed": result.get("response_transformed", False),
+            "delivery_satisfied": delivery_satisfied,
             # Pass through the agent_persisted flag so the persistence block
             # above can correctly determine whether the codex app-server path
             # self-persisted (it didn't — see codex_runtime.py).  Default
@@ -23687,8 +23948,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         event: MessageEvent,
         adapter: BasePlatformAdapter,
         thread_metadata: Optional[Dict[str, Any]] = None,
-    ) -> None:
-        """Extract MEDIA tags and configured bare local paths for delivery.
+        require_delivery_ack: bool = False,
+    ) -> set[str]:
+        """Deliver response media and return successfully delivered paths.
+
+        Explicit ``MEDIA:`` tags are always eligible. Configured bare local
+        paths retain the live fork's guarded auto-attach behavior.
 
         Called after streaming has already sent the text to the user, so the
         text itself is already delivered — this only handles file attachments
@@ -23702,6 +23967,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         from pathlib import Path
         from urllib.parse import quote as _quote
 
+        delivered_paths: set[str] = set()
         try:
             # Capture [[as_document]] before extract_media strips it, so the
             # dispatch partition below can route image-extension files
@@ -23709,7 +23975,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # send_multiple_images (Telegram sendPhoto recompresses to ~1280px).
             force_document_attachments = "[[as_document]]" in response
 
-            from gateway.platforms.base import BasePlatformAdapter, should_send_media_as_audio
+            from gateway.platforms.base import (
+                BasePlatformAdapter,
+                is_native_media_delivery_success,
+                should_send_media_as_audio,
+            )
 
             media_files, cleaned = adapter.extract_media(response)
             media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
@@ -23762,14 +24032,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 else:
                     non_image_local.append(file_path)
 
-            if image_paths:
+            if image_paths and require_delivery_ack:
+                # The clarify rescue lane must know whether each upload
+                # succeeded. Batch methods historically return None for both
+                # success and silent failure, so use acknowledged per-file
+                # sends here. Ordinary final delivery keeps batching below.
+                for media_path in image_paths:
+                    try:
+                        result = await adapter.send_image_file(
+                            chat_id=event.source.chat_id,
+                            image_path=media_path,
+                            metadata=_thread_meta,
+                        )
+                        if is_native_media_delivery_success(result):
+                            delivered_paths.add(media_path)
+                    except Exception as e:
+                        logger.warning(
+                            "[%s] Post-stream image delivery failed: %s",
+                            adapter.name,
+                            e,
+                        )
+            elif image_paths:
                 try:
                     images = [(f"file://{_quote(p)}", "") for p in image_paths]
-                    await adapter.send_multiple_images(
+                    result = await adapter.send_multiple_images(
                         chat_id=event.source.chat_id,
                         images=images,
                         metadata=_thread_meta,
                     )
+                    if is_native_media_delivery_success(result):
+                        delivered_paths.update(image_paths)
                 except Exception as e:
                     logger.warning("[%s] Post-stream image batch delivery failed: %s", adapter.name, e)
 
@@ -23777,23 +24069,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 try:
                     ext = Path(media_path).suffix.lower()
                     if should_send_media_as_audio(event.source.platform, ext, is_voice=is_voice):
-                        await adapter.send_voice(
+                        result = await adapter.send_voice(
                             chat_id=event.source.chat_id,
                             audio_path=media_path,
                             metadata=_thread_meta,
                         )
                     elif ext in _VIDEO_EXTS:
-                        await adapter.send_video(
+                        result = await adapter.send_video(
                             chat_id=event.source.chat_id,
                             video_path=media_path,
                             metadata=_thread_meta,
                         )
                     else:
-                        await adapter.send_document(
+                        result = await adapter.send_document(
                             chat_id=event.source.chat_id,
                             file_path=media_path,
                             metadata=_thread_meta,
                         )
+                    if is_native_media_delivery_success(result):
+                        delivered_paths.add(media_path)
                 except Exception as e:
                     logger.warning("[%s] Post-stream media delivery failed: %s", adapter.name, e)
 
@@ -23817,6 +24111,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         except Exception as e:
             logger.warning("Post-stream media extraction failed: %s", e)
+        return delivered_paths
 
     async def _deliver_queued_first_response(
         self,

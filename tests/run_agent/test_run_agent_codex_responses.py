@@ -2170,3 +2170,83 @@ def test_consume_codex_stream_leaves_unindexed_reasoning_untouched():
     )
 
     assert "".join(reasoning_streamed) == "Need to inspect files."
+
+
+# ── Suppressed-commentary deliverable rescue (#clarify-ordering) ─────────
+
+
+def _commentary_msg(text: str) -> dict:
+    """An assistant turn whose visible text lives only in commentary items.
+
+    This is the shape a Codex tool-call turn persists with: ``content`` is
+    empty by design and the user-facing narration sits in
+    ``codex_message_items`` with ``phase=commentary``.
+    """
+    return {
+        "role": "assistant",
+        "content": "",
+        "codex_message_items": [
+            {
+                "type": "message",
+                "id": "msg_1",
+                "phase": "commentary",
+                "content": [{"type": "output_text", "text": text}],
+            }
+        ],
+    }
+
+
+def test_suppressed_commentary_is_offered_to_the_deliverable_lane(monkeypatch):
+    """With no interim consumer, commentary must still reach the rescue lane.
+
+    ``interim_assistant_messages=false`` drops mid-turn commentary. When that
+    commentary carries the turn's only MEDIA: directive and the model then
+    blocks on clarify, the attachment is stranded — so the suppressed text is
+    handed to the host's deliverable callback instead of being discarded.
+    """
+    agent = _build_agent(monkeypatch)
+    agent.interim_assistant_callback = None
+    offered = []
+    agent.suppressed_interim_deliverable_callback = offered.append
+
+    agent._emit_interim_assistant_message(
+        _commentary_msg("Dossier ready.\n\nMEDIA:/tmp/dossier.txt")
+    )
+
+    assert offered == ["Dossier ready.\n\nMEDIA:/tmp/dossier.txt"]
+
+
+def test_delivered_commentary_still_reaches_the_deliverable_lane(monkeypatch):
+    """Visible prose and native attachment delivery are separate contracts.
+
+    The stream consumer strips MEDIA tags before showing commentary, so the
+    gateway rescue lane must still receive the original text and deduplicate
+    the acknowledged attachment from the later final response.
+    """
+    agent = _build_agent(monkeypatch)
+    emitted = []
+    agent.interim_assistant_callback = (
+        lambda text, *, already_streamed=False: emitted.append(text)
+    )
+    offered = []
+    agent.suppressed_interim_deliverable_callback = offered.append
+
+    agent._emit_interim_assistant_message(
+        _commentary_msg("Dossier ready.\n\nMEDIA:/tmp/dossier.txt")
+    )
+
+    expected = "Dossier ready.\n\nMEDIA:/tmp/dossier.txt"
+    assert emitted == [expected]
+    assert offered == [expected]
+
+
+def test_suppressed_commentary_lane_is_inert_without_a_host_callback(monkeypatch):
+    """No rescue callback installed (CLI, tui_gateway) → unchanged behavior."""
+    agent = _build_agent(monkeypatch)
+    agent.interim_assistant_callback = None
+
+    agent._emit_interim_assistant_message(_commentary_msg("Working on it."))
+
+    # Nothing was shown, so nothing is booked as shown — a later consumer
+    # (or a rescue lane installed mid-turn) still sees this text as pending.
+    assert not agent._interim_text_was_delivered("Working on it.")
