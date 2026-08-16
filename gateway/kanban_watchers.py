@@ -530,9 +530,16 @@ class GatewayKanbanWatchersMixin:
                     # made _authorization_adapter fail closed and the notifier
                     # claim/rewind/retry forever at debug level — subscriptions
                     # owned by the dispatching profile never delivered.
-                    if sub_profile and sub_profile == notifier_profile:
-                        sub_profile = ""
-                    adapter = self._authorization_adapter(plat, sub_profile or None)
+                    # Adapter lookup uses an empty profile for this gateway's
+                    # own default adapter, but the synthetic wake must retain
+                    # the subscription owner so session/profile continuity is
+                    # not erased. Do not mutate sub_profile for routing.
+                    routing_profile = (
+                        "" if sub_profile == notifier_profile else sub_profile
+                    )
+                    adapter = self._authorization_adapter(
+                        plat, routing_profile or None
+                    )
                     if adapter is None:
                         logger.debug(
                             "kanban notifier: adapter %s disconnected before delivery for %s; rewinding claim",
