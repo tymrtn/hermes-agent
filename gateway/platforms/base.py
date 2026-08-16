@@ -1613,7 +1613,9 @@ def _cache_dir_container_mounts() -> List[Tuple[Path, Path]]:
         return []
 
 
-def _translate_docker_container_media_path(candidate: Path) -> Optional[Path]:
+def _translate_docker_container_media_path(
+    candidate: Path, *, require_exists: bool = True
+) -> Optional[Path]:
     """Translate a container-absolute path to its host path when possible.
 
     Uses longest-prefix match across configured ``docker_volumes``, the
@@ -1673,7 +1675,7 @@ def _translate_docker_container_media_path(candidate: Path) -> Optional[Path]:
     host_root, container_root, _ = best
     try:
         relative = candidate.relative_to(container_root)
-        translated = (host_root / relative).resolve(strict=True)
+        translated = (host_root / relative).resolve(strict=require_exists)
     except (OSError, RuntimeError, ValueError):
         return None
     if translated != host_root and not _path_is_within(translated, host_root):
@@ -1985,22 +1987,54 @@ MEDIA_EXTENSIONLESS_TAG_RE = re.compile(
 )
 
 
-def _match_extensionless_path(scan_text: str, match: "re.Match") -> Optional[Tuple[str, int]]:
-    """Resolve an extensionless MEDIA tag match to a validated on-disk path.
+def _canonical_media_identity(path: str) -> Optional[str]:
+    """Canonical identity of a MEDIA path, with no delivery policy applied.
 
-    Tries the regex-captured path first. When that fails validation, the
+    Performs the same normalization as ``validate_media_delivery_path`` (user
+    expansion, container→host translation, symlink resolution) and none of its
+    checks. Only for matching a tag against paths that ALREADY passed the full
+    policy and were acknowledged by the adapter: re-running existence / trust
+    rules there would forget an upload whose file was deleted, or whose
+    strict-mode recency window expired, while a clarify prompt was blocking.
+    """
+    if not path:
+        return None
+    try:
+        candidate = Path(os.path.expanduser(path))
+        translated = _translate_docker_container_media_path(
+            candidate, require_exists=False
+        )
+        return str((translated or candidate).resolve(strict=False))
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _match_extensionless_path(
+    scan_text: str,
+    match: "re.Match",
+    accept=validate_media_delivery_path,
+) -> Optional[Tuple[str, int]]:
+    """Resolve an extensionless MEDIA tag match to an accepted path.
+
+    Tries the regex-captured path first. When ``accept`` rejects that, the
     candidate is progressively extended forward across single spaces
-    (validation-gated, bounded at 8 tokens, never past a newline or a
-    subsequent ``MEDIA:`` keyword) so unknown-extension paths containing
-    spaces deliver (#24032). Returns ``(safe_path, end_offset)`` where
-    ``end_offset`` is the index in ``scan_text`` just past the matched path,
-    or ``None`` when nothing validates.
+    (oracle-gated, bounded at 8 tokens, never past a newline or a subsequent
+    ``MEDIA:`` keyword) so unknown-extension paths containing spaces deliver
+    (#24032). Returns ``(accepted_path, end_offset)`` where ``end_offset`` is
+    the index in ``scan_text`` just past the matched path, or ``None`` when
+    nothing is accepted.
+
+    ``accept`` is the oracle deciding whether a candidate names the intended
+    file, returning its canonical form or None. Delivery uses
+    ``validate_media_delivery_path`` — the full safety policy. Stripping the
+    tag of an already-delivered file instead matches canonical identity
+    against the acknowledged set (see ``strip_media_tags_for_paths``).
     """
     raw = match.group("path")
     path = _normalize_media_tag_path(raw)
     if not path:
         return None
-    safe = validate_media_delivery_path(path)
+    safe = accept(path)
     if safe:
         return safe, match.end("path")
     start = match.start("path")
@@ -2020,7 +2054,7 @@ def _match_extensionless_path(scan_text: str, match: "re.Match") -> Optional[Tup
         while tok_end < len(segment) and segment[tok_end] not in " \t":
             tok_end += 1
         candidate = _normalize_media_tag_path(segment[:tok_end])
-        safe = validate_media_delivery_path(candidate)
+        safe = accept(candidate)
         if safe:
             return safe, start + tok_end
         pos = tok_end
@@ -2488,6 +2522,21 @@ class SendResult:
     # ``None`` (unset / not classified).  Producers should set this via
     # :func:`classify_send_error`.
     error_kind: Optional[str] = None
+
+
+def mark_media_fallback_notice(result: SendResult) -> SendResult:
+    """Mark a successful text fallback as *not* a native media upload."""
+    raw = dict(result.raw_response) if isinstance(result.raw_response, dict) else {}
+    raw["media_fallback_notice"] = True
+    result.raw_response = raw
+    return result
+
+
+def is_native_media_delivery_success(result: SendResult) -> bool:
+    """True only when an attachment, rather than its fallback notice, landed."""
+    raw = getattr(result, "raw_response", None)
+    fallback = isinstance(raw, dict) and bool(raw.get("media_fallback_notice"))
+    return bool(getattr(result, "success", False)) and not fallback
 
 
 # Machine-readable send-failure categories.  Kept platform-neutral so every
@@ -4485,7 +4534,10 @@ class BasePlatformAdapter(ABC):
         text = "⚠️ Couldn't deliver the audio attachment."
         if caption:
             text = f"{caption}\n{text}"
-        return await self.send(chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata)
+        result = await self.send(
+            chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata
+        )
+        return mark_media_fallback_notice(result)
 
     def prepare_tts_text(self, text: str) -> str:
         """Prepare a spoken script for TTS.
@@ -4629,7 +4681,10 @@ class BasePlatformAdapter(ABC):
         text = "⚠️ Couldn't deliver the video attachment."
         if caption:
             text = f"{caption}\n{text}"
-        return await self.send(chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata)
+        result = await self.send(
+            chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata
+        )
+        return mark_media_fallback_notice(result)
 
     async def send_document(
         self,
@@ -4663,7 +4718,10 @@ class BasePlatformAdapter(ABC):
             text = "⚠️ Couldn't deliver the file attachment."
         if caption:
             text = f"{caption}\n{text}"
-        return await self.send(chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata)
+        result = await self.send(
+            chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata
+        )
+        return mark_media_fallback_notice(result)
 
     async def _notify_media_delivery_failure(
         self,
@@ -4730,7 +4788,10 @@ class BasePlatformAdapter(ABC):
         text = "⚠️ Couldn't deliver the image attachment."
         if caption:
             text = f"{caption}\n{text}"
-        return await self.send(chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata)
+        result = await self.send(
+            chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata
+        )
+        return mark_media_fallback_notice(result)
 
     @staticmethod
     def validate_media_delivery_path(path: str) -> Optional[str]:
@@ -4971,6 +5032,59 @@ class BasePlatformAdapter(ABC):
                 cleaned = re.sub(r'\n{3,}', '\n\n', cleaned).strip()
         
         return media, cleaned
+
+    @staticmethod
+    def strip_media_tags_for_paths(text: str, delivered_paths) -> str:
+        """Remove only the ``MEDIA:`` tags naming a path already delivered.
+
+        Attachments released ahead of a blocking prompt (see the
+        suppressed-commentary rescue in ``gateway/run.py``) are usually
+        restated by the model in its final reply. That tag is already
+        satisfied, so it is dropped here before any delivery path can act on
+        it — while every other directive, including a genuine resend of a
+        different file, survives untouched.
+
+        ``delivered_paths`` holds the acknowledged paths as
+        ``validate_media_delivery_path`` normalized them, so both branches
+        below match on canonical identity — and on identity ALONE. The target
+        set already passed the full delivery policy; reapplying existence or
+        strict-mode recency after a long clarify wait would forget a delivery
+        that happened, leaving the repeated tag visible as raw text.
+        Protected spans are a mask-locator only, matching ``extract_media``.
+        """
+        if not delivered_paths or not text or "media:" not in text.lower():
+            return text
+        targets = {str(p) for p in delivered_paths}
+
+        def _accept_delivered(candidate: str) -> Optional[str]:
+            canonical = _canonical_media_identity(candidate)
+            return canonical if canonical in targets else None
+
+        masked = BasePlatformAdapter._mask_protected_spans(text)
+        masked = BasePlatformAdapter._mask_json_string_media(masked)
+
+        spans: list = []
+        for match in MEDIA_TAG_CLEANUP_RE.finditer(masked):
+            path = _normalize_media_tag_path(match.group("path"))
+            if path and _accept_delivered(path):
+                spans.append(match.span())
+        for match in MEDIA_EXTENSIONLESS_TAG_RE.finditer(masked):
+            path = _normalize_media_tag_path(match.group("path"))
+            if not path or not _path_lacks_deliverable_extension(path):
+                continue
+            # Identity is the oracle for the forward-extension walk too, so a
+            # spaced path whose file is gone still yields the full span
+            # instead of stranding a text fragment where the tag was.
+            resolved = _match_extensionless_path(masked, match, _accept_delivered)
+            if resolved is not None:
+                spans.append((match.start(), resolved[1]))
+
+        if not spans:
+            return text
+        chars = list(text)
+        for start, end in reversed(_merge_spans(spans)):
+            del chars[start:end]
+        return re.sub(r'\n{3,}', '\n\n', "".join(chars)).strip()
 
     @staticmethod
     def strip_media_directives_for_display(text: str) -> str:

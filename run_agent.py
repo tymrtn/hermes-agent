@@ -6616,19 +6616,47 @@ class AIAgent:
 
     def _fire_streamed_codex_commentary(self, text: str) -> None:
         """Deliver a completed live Codex commentary message immediately."""
-        cb = getattr(self, "interim_assistant_callback", None)
-        if cb is None or not isinstance(text, str):
+        if not isinstance(text, str):
             return
         visible = self._strip_think_blocks(text).strip()
         if visible:
             visible = redact_sensitive_text(visible)
         if not visible or visible == "(empty)" or self._interim_text_was_delivered(visible):
             return
+        self._offer_suppressed_interim_deliverable(visible)
+        cb = getattr(self, "interim_assistant_callback", None)
+        if cb is None:
+            return
         try:
             cb(visible, already_streamed=False)
             self._record_delivered_interim_text(visible)
         except Exception:
             logger.debug("interim_assistant_callback error", exc_info=True)
+
+    def _offer_suppressed_interim_deliverable(self, visible: str) -> None:
+        """Hand commentary the host suppressed to the deliverable rescue lane.
+
+        With no interim consumer installed, mid-turn commentary is dropped.
+        That is the user's choice for ordinary chatter, but the same message
+        may carry the turn's only ``MEDIA:`` directive — and a following
+        blocking ``clarify`` then asks about a file that was never sent.
+        Hosts install ``suppressed_interim_deliverable_callback`` to rescue
+        exactly those attachments; deciding what (if anything) is releasable
+        is the host's job, so nothing is delivered from here.
+
+        The text is redacted again because the fallback shape (top-level
+        content, used by non-Codex providers) is not redacted upstream the way
+        ``_extract_codex_interim_visible_parts`` redacts commentary items.
+        """
+        cb = getattr(self, "suppressed_interim_deliverable_callback", None)
+        if cb is None or not visible:
+            return
+        try:
+            cb(redact_sensitive_text(visible))
+        except Exception:
+            logger.debug(
+                "suppressed_interim_deliverable_callback error", exc_info=True
+            )
 
     def _emit_interim_assistant_message(
         self, assistant_msg: Dict[str, Any]
@@ -6687,6 +6715,11 @@ class AIAgent:
         except Exception:
             logger.debug("on_interim_message plugin hook enqueue failed", exc_info=True)
         cb = getattr(self, "interim_assistant_callback", None)
+        # The gateway may need to preserve deliverable-bearing commentary even
+        # when ordinary interim prose is visible: display cleanup strips the
+        # MEDIA directive before rendering, so native delivery remains a
+        # separate responsibility.
+        self._offer_suppressed_interim_deliverable(visible)
         if cb is None:
             return
         try:

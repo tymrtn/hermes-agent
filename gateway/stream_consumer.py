@@ -288,6 +288,14 @@ class GatewayStreamConsumer:
         # of what was delivered, and the gateway's final-send suppression
         # can't recognize an already-delivered response. (#65919 review)
         self._delivered_segment_texts: list[str] = []
+        # Exact visible payloads this chat already received OUTSIDE the stream.
+        # The clarify deliverable rescue (gateway/run.py) sends an attachment's
+        # note straight on the adapter before the blocking poll, and the model
+        # routinely restates it in the answer that follows.  The gateway's
+        # final-response dedup can only run once the stream has ended, so
+        # without a record here the repeat is already on screen by then.
+        self._predelivered_texts: list[str] = []
+        self._predelivered_media_paths: set[str] = set()
         # Cache adapter lifecycle capability: only platforms that need an
         # explicit finalize call (e.g. DingTalk AI Cards) force us to make
         # a redundant final edit.  Everyone else keeps the fast path.
@@ -510,6 +518,52 @@ class GatewayStreamConsumer:
             sent.strip() == target
             for sent in (*self._delivered_commentary_texts, *self._delivered_segment_texts)
         )
+
+    def mark_text_predelivered(self, text: str, *, media_paths=()) -> None:
+        """Record text the user already received outside this stream.
+
+        Called from the agent worker thread the moment such a message is
+        acknowledged by the platform, so the record is in place before the
+        deltas that repeat it arrive.
+        """
+        cleaned = self._clean_for_display(text or "").strip()
+        if cleaned and cleaned not in self._predelivered_texts:
+            self._predelivered_texts.append(cleaned)
+        self._predelivered_media_paths.update(str(path) for path in media_paths)
+
+    def _clean_for_predelivery_match(self, text: str) -> str:
+        text = _BasePlatformAdapter.strip_media_tags_for_paths(
+            text or "", self._predelivered_media_paths
+        )
+        return self._clean_for_display(text).strip()
+
+    def _repeats_predelivered_text(self, text: str) -> bool:
+        """True when the buffer says nothing beyond an out-of-stream delivery."""
+        cleaned = self._clean_for_predelivery_match(text or "")
+        return bool(cleaned) and cleaned in self._predelivered_texts
+
+    def _may_repeat_predelivered_text(self, text: str) -> bool:
+        """True while the buffer so far could still resolve to such a repeat."""
+        cleaned = self._clean_for_predelivery_match(text or "")
+        raw = str(text or "").strip()
+        if not cleaned:
+            return False
+        for seen in self._predelivered_texts:
+            if seen.startswith(cleaned):
+                return True
+            if raw.startswith(seen):
+                remainder = raw[len(seen):].lstrip()
+                upper = remainder.upper()
+                if "MEDIA:".startswith(upper):
+                    return True
+                if upper.startswith("MEDIA:"):
+                    if cleaned == seen:
+                        return True
+                    # Once a complete directive is followed by new visible
+                    # prose, the response is no longer an exact repeat and
+                    # normal progressive delivery should resume.
+                    return self._MEDIA_RE.search(raw) is None
+        return False
 
     def on_segment_break(self) -> None:
         """Finalize the current stream segment and start a fresh message."""
@@ -872,6 +926,12 @@ class GatewayStreamConsumer:
                     ):
                         await self._suppress_silence_marker()
                         return
+                    if self._repeats_predelivered_text(self._accumulated):
+                        # The same note already accompanied a native attachment
+                        # before a blocking clarify prompt.  Mid-stream updates
+                        # were held below, so there is no preview to retract.
+                        self._accumulated = ""
+                        return
 
                 # Decide whether to flush an edit
                 now = time.monotonic()
@@ -910,6 +970,17 @@ class GatewayStreamConsumer:
                         self._clean_for_display(self._accumulated)
                     )
                 ):
+                    should_edit = False
+                if (
+                    should_edit
+                    and not got_done
+                    and not got_segment_break
+                    and commentary_text is None
+                    and self._may_repeat_predelivered_text(self._accumulated)
+                ):
+                    # Hold a possible exact repeat until it either diverges
+                    # (then normal streaming resumes) or completes (then the
+                    # got_done branch above suppresses it).
                     should_edit = False
                 if should_edit and self._accumulated:
                     # Split overflow: if accumulated text exceeds the platform
