@@ -6525,10 +6525,20 @@ class AIAgent:
 
     # ── Per-turn primary restoration ─────────────────────────────────────
 
-    def _restore_primary_runtime(self) -> bool:
+    def _restore_primary_runtime(self, force: bool = False) -> bool:
         """Forwarder — see ``agent.agent_runtime_helpers.restore_primary_runtime``."""
         from agent.agent_runtime_helpers import restore_primary_runtime
-        return restore_primary_runtime(self)
+        return restore_primary_runtime(self, force=force)
+
+    def _release_local_fallback_hold(self) -> bool:
+        """Forwarder — see ``agent.agent_runtime_helpers.release_local_fallback_hold``."""
+        from agent.agent_runtime_helpers import release_local_fallback_hold
+        return release_local_fallback_hold(self)
+
+    def _activate_local_fallback(self) -> dict:
+        """Forwarder — see ``agent.chat_completion_helpers.activate_local_fallback``."""
+        from agent.chat_completion_helpers import activate_local_fallback
+        return activate_local_fallback(self)
 
     def _try_recover_primary_transport(
         self, api_error: Exception, *, retry_count: int, max_retries: int,

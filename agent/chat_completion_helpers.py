@@ -33,6 +33,12 @@ from agent.error_classifier import FailoverReason
 from agent.errors import EmptyStreamError
 from agent.turn_context import substitute_api_content
 from agent.gemini_native_adapter import is_native_gemini_base_url
+from agent.local_endpoint import (
+    ensure_local_endpoint,
+    entry_start_command,
+    is_startable_local_entry,
+    select_local_fallback_entry,
+)
 from agent.model_metadata import is_local_endpoint
 from agent.message_content import flatten_message_text
 from agent.message_sanitization import (
@@ -2006,6 +2012,25 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         )
         return agent._try_activate_fallback(reason)
 
+    # Start-on-fallback: an entry carrying ``start_command`` points at a local
+    # server that may not be running.  Bring it up BEFORE the client is built,
+    # otherwise the switch lands on a refused connection and the chain looks
+    # exhausted while the model sits idle on disk.  Entries whose endpoint is
+    # not loopback, or whose command is unusable, are skipped loudly rather
+    # than activated against a dead port.
+    started_local_endpoint = False
+    if entry_start_command(fb):
+        endpoint_status = ensure_local_endpoint(fb)
+        started_local_endpoint = bool(endpoint_status.get("started"))
+        if not endpoint_status.get("ready"):
+            unavailable.add(fb_key)
+            logger.warning(
+                "Fallback skip: local endpoint for %s/%s is unavailable (%s); "
+                "suppressing for this session",
+                fb_provider, fb_model, endpoint_status.get("error") or "unknown error",
+            )
+            return agent._try_activate_fallback(reason)
+
     # Use centralized router for client construction.
     # raw_codex=True because the main agent needs direct responses.stream()
     # access for Codex providers.
@@ -2271,10 +2296,23 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # success path surfaces exactly once via _emit_pending_fallback_notice
         # (see run_agent.py); it is discarded on terminal failure since the
         # buffered line is flushed instead.  See fallback-observability fix.
-        agent._pending_fallback_notice = (
-            f"🔄 Switched to fallback model: {old_model} via {old_provider} "
-            f"→ {fb_model} via {fb_provider}"
-        )
+        if is_startable_local_entry(fb):
+            # A local server Hermes brought up is expensive to restart and the
+            # primary that just failed is usually still failing (invalid_grant,
+            # exhausted quota).  Hold this entry across turns so the session
+            # stops flip-flopping; /model primary is the explicit release.
+            agent._hold_local_fallback = True
+            agent._pending_fallback_notice = (
+                f"🔄 Switched to local fallback: {fb_model} on {fb_base_url}. "
+                f"Primary {old_model} via {old_provider} failed."
+                + (" Started the local server." if started_local_endpoint else "")
+                + " Staying local until you run /model primary."
+            )
+        else:
+            agent._pending_fallback_notice = (
+                f"🔄 Switched to fallback model: {old_model} via {old_provider} "
+                f"→ {fb_model} via {fb_provider}"
+            )
         logger.info(
             "Fallback activated: %s → %s (%s)",
             old_model, fb_model, fb_provider,
@@ -2291,6 +2329,99 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         logger.error("Failed to activate fallback %s: %s", fb_model, e)
         return agent._try_activate_fallback(reason)  # try next in chain
 
+
+def activate_local_fallback(agent) -> dict:
+    """Switch to the configured local endpoint on demand — the ``/model local`` path.
+
+    Runs the same activation as an automatic failover (so client, api_mode,
+    context window, and prompt identity are all resolved by one owner) but
+    against a single pinned entry, and leaves ``_primary_runtime`` untouched
+    so ``/model primary`` still has somewhere to go back to.
+
+    Returns ``{"ok", "already_active", "started", "entry", "error"}``.
+    """
+    outcome = {
+        "ok": False,
+        "already_active": False,
+        "started": False,
+        "entry": None,
+        "error": "",
+    }
+    chain = list(getattr(agent, "_fallback_chain", []) or [])
+    entry = select_local_fallback_entry(chain)
+    if entry is None:
+        outcome["error"] = (
+            "No local endpoint is configured. Add a fallback_providers entry "
+            "with a loopback base_url (and a start_command to launch it)."
+        )
+        return outcome
+    outcome["entry"] = entry
+
+    status = ensure_local_endpoint(entry)
+    outcome["started"] = bool(status.get("started"))
+    if not status.get("ready"):
+        outcome["error"] = str(status.get("error") or "local endpoint is not reachable")
+        return outcome
+
+    # An explicit request overrides an earlier automatic skip — the operator
+    # may have just fixed whatever made this entry unusable.
+    fb_key = _fallback_entry_key(entry)
+    unavailable = getattr(agent, "_unavailable_fallback_keys", None)
+    if unavailable is None:
+        unavailable = set()
+        agent._unavailable_fallback_keys = unavailable
+    unavailable.discard(fb_key)
+
+    from agent.backend_identity import BackendIdentity, should_skip_candidate
+
+    current_ident = BackendIdentity.build(
+        provider=getattr(agent, "provider", ""),
+        model=getattr(agent, "model", ""),
+        base_url=str(getattr(agent, "base_url", "") or ""),
+    )
+    entry_ident = BackendIdentity.build(
+        provider=str(entry.get("provider") or ""),
+        model=str(entry.get("model") or ""),
+        base_url=str(entry.get("base_url") or ""),
+    )
+    if should_skip_candidate(entry_ident, current_ident):
+        agent._hold_local_fallback = True
+        outcome["ok"] = True
+        outcome["already_active"] = True
+        return outcome
+
+    # Pin the chain to this entry for the duration of the call so the
+    # activator's skip/recurse paths can only land on the endpoint the user
+    # asked for, then put the real chain (and the automatic walk position)
+    # back — an explicit switch must not consume the session's fallback budget.
+    saved_chain = getattr(agent, "_fallback_chain", [])
+    saved_index = getattr(agent, "_fallback_index", 0)
+    buffer_len = len(getattr(agent, "_retry_status_buffer", None) or [])
+    agent._fallback_chain = [entry]
+    agent._fallback_index = 0
+    try:
+        activated = bool(agent._try_activate_fallback())
+    finally:
+        agent._fallback_chain = saved_chain
+        agent._fallback_index = saved_index
+
+    # Drop the activator's "primary model failed" chatter: nothing failed
+    # here, the operator asked for the switch and the caller reports it.
+    buf = getattr(agent, "_retry_status_buffer", None)
+    if isinstance(buf, list) and len(buf) > buffer_len:
+        del buf[buffer_len:]
+    agent._pending_fallback_notice = None
+
+    if not activated:
+        outcome["error"] = (
+            f"Could not activate local endpoint {entry.get('model') or '?'} "
+            f"({entry.get('base_url') or '?'})."
+        )
+        return outcome
+
+    agent._hold_local_fallback = True
+    outcome["ok"] = True
+    return outcome
 
 
 def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:

@@ -98,6 +98,40 @@ fallback_providers:
     key_env: MY_LOCAL_KEY            # env var name containing the API key
 ```
 
+### Local Endpoint Fallback (start on demand)
+
+A local inference server (MLX, llama.cpp, LM Studio, vLLM) is only a useful fallback if it is running. Add `start_command` and Hermes brings it up when the port is down, before it switches:
+
+```yaml
+fallback_providers:
+  - provider: custom
+    model: /path/to/model
+    base_url: http://127.0.0.1:18765/v1
+    api_mode: chat_completions
+    api_key: local
+    start_command: /absolute/path/to/serve.command   # absolute path to an executable file
+    health_url: http://127.0.0.1:18765/v1/models     # optional; defaults to base_url + /models
+    start_timeout: 90                                # optional; seconds to wait, default 90
+```
+
+Rules Hermes enforces:
+
+- The endpoint must be **loopback** (`127.0.0.1`, `localhost`, `::1`). Hermes never starts a process for a remote host.
+- `start_command` must be an absolute path to an existing executable file. It runs as `[path]` with **no shell**, so a config value written as a shell one-liner is rejected rather than interpreted.
+- An endpoint that already answers is never started twice, and nothing is ever killed — starting is the only process action Hermes takes.
+- If the server doesn't answer within `start_timeout`, that entry is skipped for the session and the chain continues.
+
+Nothing starts at login or in the background: the command runs only when a fallback needs it or you ask for it.
+
+#### Switching by hand
+
+| Command | Effect |
+|---------|--------|
+| `/model local` | Starts the local endpoint if it's down and pins this session to it |
+| `/model primary` (or `/model cloud`) | Releases the pin and restores the model the session started with |
+
+Once a startable local endpoint is serving, Hermes **holds** it across turns instead of retrying the primary every message — a dead primary (expired OAuth grant, exhausted quota) would otherwise make the session flip-flop, and restarting a local server is expensive. `/model primary` is the release, and it works even while the primary is still in failover cooldown.
+
 ### When Fallback Triggers
 
 The fallback activates automatically when the primary model fails with:
@@ -123,6 +157,8 @@ Prompt caches are keyed to the model (and on most providers, the account) servin
 
 :::info Per-Turn, Not Per-Session
 Fallback is **turn-scoped**: each new user message starts with the primary model restored. If the primary fails mid-turn, fallback activates for that turn only. On the next message, Hermes tries the primary again. Within a single turn, fallback activates at most once — if the fallback also fails, normal error handling takes over (retries, then error message). This prevents cascading failover loops within a turn while giving the primary model a fresh chance every turn.
+
+One exception: a local endpoint with `start_command` is held across turns until you run `/model primary` (see [Local Endpoint Fallback](#local-endpoint-fallback-start-on-demand)).
 
 The per-turn retry is **reset-aware**: when the primary's credentials report a rate-limit reset time that hasn't elapsed yet (subscription windows like Claude Pro/Max's 5-hour blocks or Codex weekly limits report these as hours or days), Hermes skips the doomed retry and stays on the fallback until the reset passes — avoiding two pointless provider switches (and two prompt-cache invalidations) per turn. The moment the reset time elapses, the next turn goes back to the primary automatically. Transient 429s without a reset time keep the existing behavior: a short cooldown, then retry every turn.
 :::

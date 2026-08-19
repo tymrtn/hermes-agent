@@ -1456,7 +1456,18 @@ def drop_thinking_only_and_merge_users(
 
 
 
-def restore_primary_runtime(agent) -> bool:
+def release_local_fallback_hold(agent) -> bool:
+    """Clear the local-fallback hold so the primary can be restored again.
+
+    Returns whether a hold was actually in place.  Called by ``/model primary``
+    — the hold is deliberately sticky and only an explicit request releases it.
+    """
+    held = bool(getattr(agent, "_hold_local_fallback", False))
+    agent._hold_local_fallback = False
+    return held
+
+
+def restore_primary_runtime(agent, force: bool = False) -> bool:
     """Restore the primary runtime at the start of a new turn.
 
     In long-lived CLI sessions a single AIAgent instance spans multiple
@@ -1466,7 +1477,18 @@ def restore_primary_runtime(agent) -> bool:
 
     The gateway caches agents across messages (``_agent_cache`` in
     ``gateway/run.py``), so this restoration IS needed there too.
+
+    ``force=True`` is the explicit ``/model primary`` path: it bypasses the
+    cooldown gates below, which exist to stop *automatic* restores from
+    thrashing a provider that is still rate-limited.  A user who asks for the
+    primary back gets it (and finds out immediately if it is still broken).
     """
+    if getattr(agent, "_hold_local_fallback", False) and not force:
+        # A local endpoint is held for this session.  Returning early also
+        # leaves _fallback_index where it is, so releasing the hold resumes
+        # the chain walk instead of replaying it from the top.
+        return False
+
     if not agent._fallback_activated:
         # Reset the chain index even when no fallback was activated this
         # turn.  Without this, a turn where _try_activate_fallback() was
@@ -1478,7 +1500,7 @@ def restore_primary_runtime(agent) -> bool:
         agent._fallback_index = 0
         return False
 
-    if getattr(agent, "_rate_limited_until", 0) > time.monotonic():
+    if not force and getattr(agent, "_rate_limited_until", 0) > time.monotonic():
         return False  # primary still in rate-limit cooldown, stay on fallback
 
     # ── Reset-aware gate ──
@@ -1520,7 +1542,7 @@ def restore_primary_runtime(agent) -> bool:
             )
             pool = prefetched_primary_pool
         next_at = getattr(pool, "next_available_at", lambda: None)()
-        if next_at is not None and next_at > time.time():
+        if not force and next_at is not None and next_at > time.time():
             if not getattr(agent, "_restore_wait_logged", False):
                 agent._restore_wait_logged = True
                 logger.info(
@@ -4057,6 +4079,7 @@ __all__ = [
     "try_recover_primary_transport",
     "drop_thinking_only_and_merge_users",
     "restore_primary_runtime",
+    "release_local_fallback_hold",
     "extract_reasoning",
     "dump_api_request_debug",
     "prompt_caching_disabled_from_config",

@@ -9339,6 +9339,92 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 return
             self._close_model_picker()
 
+    def _sync_runtime_from_agent(self) -> None:
+        """Mirror the agent's live runtime onto CLI state after a runtime switch.
+
+        ``/model local`` and ``/model primary`` swap the agent in place rather
+        than going through ``model_switch.switch_model()``, so the CLI's own
+        copies of the route have to follow or the next turn re-resolves
+        credentials for the model we just left.
+        """
+        agent = self.agent
+        if agent is None:
+            return
+        self.model = agent.model
+        self.provider = agent.provider
+        self.requested_provider = getattr(agent, "requested_provider", agent.provider)
+        for attr in ("api_key", "base_url", "api_mode"):
+            value = getattr(agent, attr, None)
+            if isinstance(value, str) and value:
+                setattr(self, attr, value)
+        # Only mirror string credentials into the explicit overrides —
+        # callable api_keys (Entra ID) are resolved per request by the agent.
+        if isinstance(getattr(agent, "api_key", None), str):
+            self._explicit_api_key = agent.api_key
+        if isinstance(getattr(agent, "base_url", None), str):
+            self._explicit_base_url = agent.base_url
+
+    def _handle_runtime_model_alias(self, alias: str) -> None:
+        """Handle ``/model local`` and ``/model primary``.
+
+        These select a runtime, not a model: ``local`` starts the configured
+        loopback endpoint when it is down and pins the session to it;
+        ``primary`` releases that pin and restores the runtime the session
+        started with, even while the primary is still in failover cooldown.
+        """
+        from hermes_cli.model_switch import RUNTIME_ALIAS_LOCAL, format_model_for_display
+
+        agent = self.agent
+        if agent is None:
+            _cprint("  ✗ /model local and /model primary need a running agent.")
+            return
+
+        old_model = self.model
+
+        if alias == RUNTIME_ALIAS_LOCAL:
+            from agent.chat_completion_helpers import activate_local_fallback
+
+            # Starting a cold model server blocks for up to start_timeout, so
+            # say something before the prompt goes quiet.
+            _cprint("  Checking local endpoint...")
+            outcome = activate_local_fallback(agent)
+            if not outcome.get("ok"):
+                _cprint(f"  ✗ {outcome.get('error') or 'Could not switch to the local endpoint.'}")
+                return
+            self._sync_runtime_from_agent()
+            verb = "Already on" if outcome.get("already_active") else "Switched to"
+            _cprint(f"  ✓ {verb} local endpoint: {format_model_for_display(self.model)}")
+            _cprint(f"    Endpoint: {self.base_url}")
+            if outcome.get("started"):
+                _cprint("    Started the local server.")
+            _cprint("    Holding this endpoint until you run /model primary.")
+        else:
+            from agent.agent_runtime_helpers import release_local_fallback_hold
+
+            release_local_fallback_hold(agent)
+            if not getattr(agent, "_fallback_activated", False):
+                self._sync_runtime_from_agent()
+                _cprint(
+                    f"  ✓ Already on the primary model: "
+                    f"{format_model_for_display(self.model)} via {self.provider}"
+                )
+                return
+            if not agent._restore_primary_runtime(force=True):
+                _cprint("  ✗ Could not restore the primary model — see the log for details.")
+                return
+            self._sync_runtime_from_agent()
+            _cprint(
+                f"  ✓ Restored primary model: "
+                f"{format_model_for_display(self.model)} via {self.provider}"
+            )
+
+        if self.model != old_model:
+            self._pending_model_switch_note = (
+                f"[Note: model was just switched from {format_model_for_display(old_model)} "
+                f"to {format_model_for_display(self.model)} via {self.provider}. "
+                f"Adjust your self-identification accordingly.]"
+            )
+
     def _handle_model_switch(self, cmd_original: str):
         """Handle /model command — switch model.
 
@@ -9378,6 +9464,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if request.errors:
             # CLI decoration: "  ✗ " prefix over the canonical error copy.
             _cprint(f"  ✗ {request.error_messages()[0]}")
+            return
+        # /model local and /model primary select a runtime, not a model, so
+        # they never enter the resolution pipeline below.
+        if request.runtime_alias:
+            self._handle_runtime_model_alias(request.runtime_alias)
             return
         # Resolve the effective persistence once: --global forces persist,
         # --session/--once force session-scope, otherwise defer to

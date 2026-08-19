@@ -110,6 +110,9 @@ class TestSwitchModelReasoningOverride:
         agent._transport_cache = {}
         agent._config_context_length = None
         agent._rate_limited_until = 0
+        # MagicMock auto-vivifies attributes, so every restore gate has to be
+        # set explicitly — including the local-endpoint hold.
+        agent._hold_local_fallback = False
         agent.model = "fallback-model"
         agent.provider = "openai"
         agent.reasoning_config = {"enabled": True, "effort": "medium"}
