@@ -9,6 +9,7 @@ up; the fake health probe reports "serving" once that file exists.
 
 import os
 import stat
+import threading
 
 import pytest
 
@@ -328,6 +329,131 @@ class TestEnsureLocalEndpoint:
     def test_non_mapping_entry_is_rejected(self):
         assert ensure_local_endpoint(None)["ready"] is False
         assert ensure_local_endpoint("http://127.0.0.1:18765/v1")["ready"] is False
+
+
+class TestConcurrentStarts:
+    """Two callers reaching a down endpoint together must start one server.
+
+    Deterministic, not timing-based: a barrier holds both callers at the
+    pre-lock health probe until each has seen "down", so the race the lock
+    exists for happens on every run.
+    """
+
+    @staticmethod
+    def _run(target):
+        """Run *target* in a thread, re-raising whatever it raised."""
+        box = {}
+
+        def _body():
+            try:
+                box["result"] = target()
+            except BaseException as exc:  # surfaced by _join below
+                box["error"] = exc
+
+        thread = threading.Thread(target=_body, daemon=True)
+        thread.start()
+        return thread, box
+
+    @staticmethod
+    def _join(thread, box, timeout=15):
+        thread.join(timeout)
+        assert not thread.is_alive(), "ensure_local_endpoint never returned"
+        if "error" in box:
+            raise box["error"]
+        return box["result"]
+
+    def test_concurrent_callers_start_the_endpoint_once(self, monkeypatch, tmp_path):
+        script = _write_script(tmp_path / "serve.command", "exit 0")
+        entry = {
+            "base_url": "http://127.0.0.1:18765/v1",
+            "start_command": script,
+            "start_timeout": 5,
+        }
+        monkeypatch.setattr(local_endpoint, "HEALTH_POLL_INTERVAL_S", 0)
+
+        both_probed = threading.Barrier(2, timeout=15)
+        probed = threading.local()
+        serving = threading.Event()
+        starts = []
+
+        def _healthy(url, timeout=None):
+            if not getattr(probed, "done", False):
+                # First probe of this caller: the one before the lock. Hold
+                # both callers here so neither can take the lock until both
+                # have decided the endpoint is down.
+                probed.done = True
+                both_probed.wait()
+                return False
+            return serving.is_set()
+
+        def _fake_popen(argv, **kwargs):
+            starts.append(argv)
+            serving.set()
+            return object()
+
+        monkeypatch.setattr(local_endpoint, "endpoint_healthy", _healthy)
+        monkeypatch.setattr(local_endpoint.subprocess, "Popen", _fake_popen)
+
+        first = self._run(lambda: ensure_local_endpoint(entry))
+        second = self._run(lambda: ensure_local_endpoint(entry))
+        results = [self._join(*first), self._join(*second)]
+
+        assert starts == [[script]], "the endpoint was started more than once"
+        assert [r["ready"] for r in results] == [True, True]
+        assert [r["error"] for r in results] == ["", ""]
+        # The loser re-probed under the lock, found the winner's server, and
+        # reported no start of its own — that re-probe is what stops the
+        # duplicate spawn.
+        assert sorted(r["started"] for r in results) == [False, True]
+
+    def test_a_slow_start_does_not_block_an_unrelated_endpoint(
+        self, monkeypatch, tmp_path
+    ):
+        """The lock is per endpoint: a 90s start on one must not stall another."""
+        slow_script = _write_script(tmp_path / "slow.command", "exit 0")
+        fast_script = _write_script(tmp_path / "fast.command", "exit 0")
+        slow_entry = {
+            "base_url": "http://127.0.0.1:18765/v1",
+            "start_command": slow_script,
+            "start_timeout": 5,
+        }
+        fast_entry = {
+            "base_url": "http://127.0.0.1:18766/v1",
+            "start_command": fast_script,
+            "start_timeout": 5,
+        }
+        monkeypatch.setattr(local_endpoint, "HEALTH_POLL_INTERVAL_S", 0)
+
+        serving = set()
+        in_slow_start = threading.Event()
+        release_slow = threading.Event()
+
+        def _healthy(url, timeout=None):
+            return url in serving
+
+        def _fake_popen(argv, **kwargs):
+            if argv == [slow_script]:
+                in_slow_start.set()
+                assert release_slow.wait(15), "slow start was never released"
+                serving.add(endpoint_health_url(slow_entry))
+            else:
+                serving.add(endpoint_health_url(fast_entry))
+            return object()
+
+        monkeypatch.setattr(local_endpoint, "endpoint_healthy", _healthy)
+        monkeypatch.setattr(local_endpoint.subprocess, "Popen", _fake_popen)
+
+        slow = self._run(lambda: ensure_local_endpoint(slow_entry))
+        assert in_slow_start.wait(15), "the slow endpoint never began starting"
+
+        fast_thread, fast_box = self._run(lambda: ensure_local_endpoint(fast_entry))
+        fast_thread.join(10)
+        blocked = fast_thread.is_alive()
+        release_slow.set()
+
+        assert not blocked, "an unrelated endpoint waited behind another's start"
+        assert self._join(fast_thread, fast_box)["ready"] is True
+        assert self._join(*slow)["ready"] is True
 
 
 class TestEndpointHealthy:

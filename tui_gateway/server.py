@@ -4435,6 +4435,151 @@ def _restore_agent_model_runtime(agent, snapshot: dict | None) -> None:
         )
 
 
+def _runtime_alias_display_target(session: dict | None, alias: str) -> tuple[str, str]:
+    """(model, provider) a runtime alias lands on — display only, no side effects.
+
+    A switch queued mid-turn is reported through ``_session_info`` until it
+    applies, so the UI has to name the model the next turn will run rather than
+    the literal word ("local", "primary") the user typed.
+    """
+    from hermes_cli.model_switch import RUNTIME_ALIAS_LOCAL
+
+    agent = (session or {}).get("agent")
+    if alias == RUNTIME_ALIAS_LOCAL:
+        from agent.local_endpoint import select_local_fallback_entry
+        from hermes_cli.model_switch import resolve_local_fallback_entry
+
+        entry = select_local_fallback_entry(getattr(agent, "_fallback_chain", None))
+        if entry is None:
+            try:
+                entry = resolve_local_fallback_entry(_load_cfg())
+            except Exception:
+                logger.debug("local fallback entry lookup failed", exc_info=True)
+                entry = None
+        if not entry:
+            return "", ""
+        return str(entry.get("model") or ""), str(entry.get("provider") or "")
+
+    primary = getattr(agent, "_primary_runtime", None)
+    if isinstance(primary, dict) and primary.get("model"):
+        return str(primary.get("model") or ""), str(primary.get("provider") or "")
+    return _config_model_target()
+
+
+def _commit_runtime_alias_switch(
+    sid: str, session: dict, *, changed: bool, pin: bool
+) -> None:
+    """Land a runtime-alias switch on the session.
+
+    ``pin`` records the live runtime as the session's ``model_override`` (what
+    survives a rebuild/resume, the TUI's equivalent of the gateway's session
+    override); clearing it hands the session back to config.  The post-switch
+    side effects are the same ones ``_apply_model_switch`` runs, and they are
+    skipped when nothing moved — a marker appended for a no-op would rewrite
+    the cached prompt prefix for free.
+    """
+    agent = session.get("agent")
+    if pin:
+        session["model_override"] = {
+            "model": getattr(agent, "model", ""),
+            "provider": getattr(agent, "provider", ""),
+            "base_url": getattr(agent, "base_url", ""),
+            "api_key": getattr(agent, "api_key", ""),
+            "api_mode": getattr(agent, "api_mode", ""),
+        }
+    else:
+        session.pop("model_override", None)
+    if not changed:
+        return
+    _restart_slash_worker(sid, session)
+    _persist_live_session_runtime(session)
+    _persist_live_session_system_prompt(session)
+    _append_model_switch_marker(
+        session,
+        model=str(getattr(agent, "model", "") or ""),
+        provider=str(getattr(agent, "provider", "") or ""),
+    )
+    _emit("session.info", sid, _session_info(agent, session))
+
+
+def _runtime_alias_result(agent, warning: str = "") -> dict:
+    return {
+        "value": str(getattr(agent, "model", "") or ""),
+        "warning": warning,
+        "confirm_required": False,
+        "scope": "session",
+    }
+
+
+def _apply_runtime_model_alias(sid: str, session: dict, alias: str) -> dict:
+    """Apply ``/model local`` / ``/model primary`` to a live session.
+
+    These name a runtime, not a model: running them through ``switch_model()``
+    would overwrite the ``_primary_runtime`` snapshot ``primary`` restores.
+    Mirrors cli.py's ``_handle_runtime_model_alias`` and the gateway's — the
+    TUI, dashboard and desktop app all arrive here via ``config.set model``.
+    """
+    from hermes_cli.model_switch import RUNTIME_ALIAS_LOCAL
+
+    agent = (session or {}).get("agent")
+    if agent is None:
+        raise ValueError("/model local and /model primary need a running agent.")
+
+    if alias == RUNTIME_ALIAS_LOCAL:
+        from agent.chat_completion_helpers import activate_local_fallback
+
+        # Blocking: probes the endpoint and can wait out a cold server start.
+        outcome = activate_local_fallback(agent)
+        if not outcome.get("ok"):
+            raise ValueError(
+                str(outcome.get("error") or "Could not switch to the local endpoint.")
+            )
+        # Pin even when the session was already local — it may have got there
+        # through an automatic failover, which leaves no override behind.
+        _commit_runtime_alias_switch(
+            sid, session, changed=not outcome.get("already_active"), pin=True
+        )
+        started = " Started the local server." if outcome.get("started") else ""
+        return _runtime_alias_result(
+            agent,
+            f"Holding the local endpoint until you run /model primary.{started}",
+        )
+
+    from agent.agent_runtime_helpers import release_local_fallback_hold
+
+    release_local_fallback_hold(agent)
+    if getattr(agent, "_fallback_activated", False):
+        # Forced: the primary is normally still inside its failover cooldown,
+        # which is exactly why the session went local in the first place.
+        if not agent._restore_primary_runtime(force=True):
+            raise ValueError(
+                "Could not restore the primary model — see the log for details."
+            )
+        _commit_runtime_alias_switch(sid, session, changed=True, pin=False)
+        return _runtime_alias_result(agent)
+
+    # No fallback state to unwind: a resumed session was rebuilt straight onto
+    # the local endpoint from its stored override, so dropping the pin is not
+    # enough — the live agent is still local.  Switch it back to the configured
+    # model, which is what the gateway's evict-and-rebuild amounts to.
+    had_override = bool(session.pop("model_override", None))
+    model, provider = _config_model_target()
+    if had_override and model and model != str(getattr(agent, "model", "") or ""):
+        raw = f"{model} --provider {provider}" if provider else model
+        return _apply_model_switch(
+            sid,
+            session,
+            raw,
+            # The user asked for the primary back; do not re-prompt for it, and
+            # never write this restore to config.yaml.
+            confirm_expensive_model=True,
+            pin_session_override=False,
+            persist_override=False,
+            allow_runtime_alias=False,
+        )
+    return _runtime_alias_result(agent, "Already on the primary model.")
+
+
 def _apply_model_switch(
     sid: str,
     session: dict,
@@ -4444,6 +4589,7 @@ def _apply_model_switch(
     pin_session_override: bool = True,
     parsed_flags: Any | None = None,
     persist_override: bool | None = None,
+    allow_runtime_alias: bool = True,
 ) -> dict:
     from hermes_cli.model_switch import (
         parse_model_switch_args,
@@ -4470,6 +4616,17 @@ def _apply_model_switch(
     # using the canonical error copy.
     if is_global_flag and one_turn:
         raise ValueError(MODEL_SWITCH_ERROR_TEXT[MODEL_SWITCH_ERR_ONCE_WITH_GLOBAL])
+    # /model local and /model primary select a runtime, not a model, so they
+    # never enter the resolution pipeline below.  Callers that pass a target
+    # read out of config.yaml opt out: `model.default` names a model, and
+    # resolving it as an alias would silently pin the session to a runtime.
+    runtime_alias = (
+        str(getattr(parsed_flags, "runtime_alias", "") or "")
+        if allow_runtime_alias
+        else ""
+    )
+    if runtime_alias:
+        return _apply_runtime_model_alias(sid, session, runtime_alias)
     persist_global = (
         persist_override
         if persist_override is not None
@@ -4687,6 +4844,9 @@ def _sync_agent_model_with_config(sid: str, session: dict) -> None:
             # target the sync computed — the path that leaked `hermes --tui -m`
             # into config.yaml as the permanent global model.
             persist_override=False,
+            # `model.default: local` is a model named "local", not the runtime
+            # alias — a per-turn sync must not pin the session to an endpoint.
+            allow_runtime_alias=False,
         )
     except Exception as e:
         _emit(
@@ -10686,6 +10846,17 @@ def _(rid, params: dict) -> dict:
                         pending_model = parsed.model_input
                     except Exception:
                         pending_model = str(value)
+                    pending_provider = (
+                        getattr(parsed, "explicit_provider", "") or ""
+                    ).strip()
+                    if getattr(parsed, "runtime_alias", ""):
+                        # "local"/"primary" name a runtime: report the model the
+                        # queued switch will land on, not the word typed.
+                        alias_model, alias_provider = _runtime_alias_display_target(
+                            session, parsed.runtime_alias
+                        )
+                        pending_model = alias_model or pending_model
+                        pending_provider = alias_provider or pending_provider
                     session["pending_model_switch"] = {
                         "raw": value,
                         "confirm_expensive_model": bool(
@@ -10696,9 +10867,7 @@ def _(rid, params: dict) -> dict:
                         # so the end-of-turn settle keeps showing the user's pick
                         # instead of blipping back to the still-live old model.
                         "display_model": pending_model,
-                        "display_provider": (
-                            getattr(parsed, "explicit_provider", "") or ""
-                        ).strip(),
+                        "display_provider": pending_provider,
                     }
                     return _ok(
                         rid,

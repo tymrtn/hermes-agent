@@ -17,6 +17,7 @@ Safety rules, all enforced here rather than by callers:
   and is executed as ``[path]`` with no shell, so nothing is interpolated
 * the wait is bounded by ``start_timeout`` (default 90s)
 * an endpoint that already answers is never started a second time
+* concurrent callers serialize per endpoint, so one server is started once
 * nothing is ever killed — starting is the only process action taken
 """
 
@@ -26,6 +27,7 @@ import ipaddress
 import logging
 import os
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -38,6 +40,27 @@ DEFAULT_START_TIMEOUT_S = 90.0
 MAX_START_TIMEOUT_S = 600.0
 HEALTH_PROBE_TIMEOUT_S = 1.0
 HEALTH_POLL_INTERVAL_S = 1.0
+
+# One lock per (health_url, start_command).  Several callers can reach
+# ensure_local_endpoint for the same endpoint at the same moment — two gateway
+# sessions failing over together, or an automatic failover racing a /model
+# local — and each would otherwise pass the health probe, spawn its own server
+# on the same port, and leave the losers thrashing on a bound address.
+# Keying by endpoint (rather than one module-wide lock) means a 90s start on
+# one endpoint never blocks a caller of a different one.
+_START_LOCKS: dict[tuple[str, str], threading.Lock] = {}
+_START_LOCKS_GUARD = threading.Lock()
+
+
+def _start_lock(health_url: str, command: str) -> threading.Lock:
+    """The lock serializing start attempts for one endpoint+command pair."""
+    key = (str(health_url), str(command))
+    with _START_LOCKS_GUARD:
+        lock = _START_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _START_LOCKS[key] = lock
+        return lock
 
 
 def _hostname(url: Any) -> str:
@@ -209,30 +232,40 @@ def ensure_local_endpoint(entry: Any) -> dict:
         result["error"] = invalid
         return result
 
-    try:
-        subprocess.Popen(
-            [command],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            cwd=os.path.dirname(command) or None,
-            # Detach: the server outlives this turn, and Ctrl-C in Hermes
-            # must not take down a server the user may still be using.
-            start_new_session=True,
-        )
-    except Exception as exc:
-        result["error"] = f"failed to launch {command}: {exc}"
-        return result
-
-    result["started"] = True
-    timeout = resolve_start_timeout(entry)
-    logger.info("Started local endpoint %s; waiting up to %.0fs for %s", command, timeout, health_url)
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        time.sleep(HEALTH_POLL_INTERVAL_S)
+    # Everything below spawns a process, so it runs under this endpoint's lock:
+    # concurrent callers queue here instead of each starting their own server.
+    with _start_lock(health_url, command):
+        # Re-probe: the caller that held the lock may have just brought this
+        # endpoint up, in which case there is nothing left to start.  The probe
+        # before the lock is the fast path; this one is the correctness gate.
         if endpoint_healthy(health_url):
             result["ready"] = True
             return result
+
+        try:
+            subprocess.Popen(
+                [command],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                cwd=os.path.dirname(command) or None,
+                # Detach: the server outlives this turn, and Ctrl-C in Hermes
+                # must not take down a server the user may still be using.
+                start_new_session=True,
+            )
+        except Exception as exc:
+            result["error"] = f"failed to launch {command}: {exc}"
+            return result
+
+        result["started"] = True
+        timeout = resolve_start_timeout(entry)
+        logger.info("Started local endpoint %s; waiting up to %.0fs for %s", command, timeout, health_url)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            time.sleep(HEALTH_POLL_INTERVAL_S)
+            if endpoint_healthy(health_url):
+                result["ready"] = True
+                return result
 
     result["error"] = (
         f"launched {command} but {health_url} did not answer within {timeout:.0f}s"
