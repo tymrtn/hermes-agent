@@ -62,9 +62,21 @@ def get_memory_dir() -> Path:
 MEMORY_BLOCK_HEADERS = {
     "memory": "MEMORY (your personal notes)",
     "user": "USER PROFILE (who the user is)",
+    "shared_user": "SHARED USER PROFILE (read-only, shared across profiles)",
 }
 
 ENTRY_DELIMITER = "\n§\n"
+
+# Default bound for the optional shared user profile (memory.shared_user_char_limit).
+DEFAULT_SHARED_USER_CHAR_LIMIT = 1200
+
+# Guidance line rendered above the shared profile body. Keeps the model from
+# spending a tool call trying to edit a file the memory tool cannot write, and
+# points profile-specific facts at the local USER.md store instead.
+SHARED_USER_BLOCK_NOTE = (
+    "Shared across every Hermes profile and read-only: save new or "
+    "profile-specific facts with the memory tool's 'user' target instead."
+)
 
 
 # ---------------------------------------------------------------------------
@@ -86,6 +98,92 @@ from tools.threat_patterns import first_threat_message as _first_threat_message
 def _scan_memory_content(content: str) -> Optional[str]:
     """Scan memory content for injection/exfil patterns. Returns error string if blocked."""
     return _first_threat_message(content, scope="strict")
+
+
+def _load_shared_user_profile(
+    path_value: Any, char_limit: int
+) -> Tuple[str, Optional[str]]:
+    """Read the optional shared, read-only user profile file.
+
+    Returns ``(body, warning)``.  ``body`` is the text to inject — or a
+    ``[BLOCKED: …]`` placeholder when the strict threat scanner fires; an empty
+    body means no shared block is injected at all.  ``warning`` carries the
+    reason the configured file was rejected.
+
+    Every failure mode fails closed for the shared block ONLY: the agent still
+    starts, and the profile-local USER.md keeps working.  A configured path that
+    is relative, missing, a directory, unreadable, or over the char limit is
+    never silently swapped for another file — the block is simply dropped and
+    the reason logged.
+    """
+    if path_value is None or path_value == "":
+        raw = ""
+    elif not isinstance(path_value, str):
+        return "", (
+            "memory.shared_user_profile_path must be a string absolute path; "
+            f"got {type(path_value).__name__}."
+        )
+    else:
+        raw = path_value.strip()
+    if not raw:
+        return "", None  # not configured — the default, not an error
+    if char_limit <= 0:
+        return "", (
+            f"memory.shared_user_char_limit must be a positive number "
+            f"(got {char_limit!r})"
+        )
+
+    path = Path(raw)
+    if not path.is_absolute():
+        return "", (
+            f"memory.shared_user_profile_path must be an absolute path, got {raw!r}. "
+            f"A relative path would resolve differently per process, so the shared "
+            f"profile is disabled rather than guessed."
+        )
+
+    try:
+        if not path.exists():
+            return "", f"shared user profile file does not exist: {raw}"
+        if path.is_dir():
+            return "", f"shared user profile path is a directory, not a file: {raw}"
+        if not path.is_file():
+            return "", f"shared user profile path is not a regular file: {raw}"
+        size = path.stat().st_size
+        # UTF-8 spends at most 4 bytes per character, so anything larger than
+        # 4x the char limit cannot fit — refuse before reading it into memory.
+        if size > char_limit * 4:
+            return "", (
+                f"shared user profile is too large ({size:,} bytes) for "
+                f"memory.shared_user_char_limit ({char_limit:,} chars): {raw}"
+            )
+        text = path.read_text(encoding="utf-8").strip()
+    except (OSError, IOError, UnicodeDecodeError, ValueError) as e:
+        return "", (
+            f"shared user profile could not be read "
+            f"({e.__class__.__name__}: {e}): {raw}"
+        )
+
+    if not text:
+        return "", None  # configured but empty — nothing to inject, nothing wrong
+    if len(text) > char_limit:
+        return "", (
+            f"shared user profile is {len(text):,} chars, over the "
+            f"memory.shared_user_char_limit of {char_limit:,}: {raw}. "
+            f"Trim the file or raise the limit — it is not truncated, because "
+            f"cutting a profile mid-sentence can invert what it says."
+        )
+
+    from tools.threat_patterns import scan_for_threats
+
+    findings = scan_for_threats(text, scope="strict")
+    if findings:
+        ids = ", ".join(findings)
+        return (
+            f"[BLOCKED: the shared user profile contained threat pattern(s): "
+            f"{ids}. Removed from the system prompt.]",
+            f"shared user profile blocked by the memory threat scanner ({ids}): {raw}",
+        )
+    return text, None
 
 
 def _drift_error(path: "Path", bak_path: str) -> Dict[str, Any]:
@@ -165,6 +263,8 @@ class MemoryStore:
         warm_memory_enabled: bool = True,
         warm_memory_char_limit: int = 50000,
         warm_user_char_limit: int = 25000,
+        shared_user_profile_path: str = "",
+        shared_user_char_limit: int = DEFAULT_SHARED_USER_CHAR_LIMIT,
     ):
         self.memory_entries: List[str] = []
         self.user_entries: List[str] = []
@@ -175,9 +275,20 @@ class MemoryStore:
         self.warm_memory_enabled = warm_memory_enabled
         self.warm_memory_char_limit = warm_memory_char_limit
         self.warm_user_char_limit = warm_user_char_limit
+        # Optional shared user profile: an external file read ONCE and never
+        # written by the memory tool.  Its whole purpose is that several
+        # profiles can share one identity source, so a profile-local write must
+        # never reach it — see _path_for, which refuses the target outright.
+        self.shared_user_profile_path = shared_user_profile_path
+        self.shared_user_char_limit = shared_user_char_limit
+        self.shared_user_warning: Optional[str] = None
+        self._shared_user_block = ""
+        self._shared_user_loaded = False
         # Frozen snapshot for system prompt -- set once at load_from_disk()
         # Warm entries are retrievable but never injected here.
-        self._system_prompt_snapshot: Dict[str, str] = {"memory": "", "user": ""}
+        self._system_prompt_snapshot: Dict[str, str] = {
+            "memory": "", "user": "", "shared_user": "",
+        }
         # Per-turn counter of failed at-capacity consolidation attempts; reset
         # at each turn boundary by reset_consolidation_failures() (#42405).
         self._consolidation_failures = 0
@@ -229,6 +340,8 @@ class MemoryStore:
         mem_dir = get_memory_dir()
         mem_dir.mkdir(parents=True, exist_ok=True)
 
+        self._load_shared_user_once()
+
         self.memory_entries = self._read_file(mem_dir / "MEMORY.md")
         self.user_entries = self._read_file(mem_dir / "USER.md")
         self.warm_memory_entries = self._read_file(mem_dir / "WARM_MEMORY.md")
@@ -250,7 +363,42 @@ class MemoryStore:
         self._system_prompt_snapshot = {
             "memory": self._render_block("memory", sanitized_memory),
             "user": self._render_block("user", sanitized_user),
+            # Resolved once per store (see _load_shared_user_once) and carried
+            # across reloads unchanged.
+            "shared_user": self._shared_user_block,
         }
+
+    def _load_shared_user_once(self) -> None:
+        """Resolve the shared read-only user profile exactly once per store.
+
+        ``load_from_disk()`` runs again on every ``memory(action=read)``.
+        Re-reading the shared file there would let an external edit change the
+        system prompt mid-session, so the shared block is frozen the first time
+        instead — the same guarantee the local snapshot gives, one level
+        stronger because nothing in-process can write this file.
+        """
+        if self._shared_user_loaded:
+            return
+        self._shared_user_loaded = True
+        body, warning = _load_shared_user_profile(
+            self.shared_user_profile_path, self.shared_user_char_limit
+        )
+        self.shared_user_warning = warning
+        if warning:
+            logger.warning("Shared user profile not injected: %s", warning)
+        self._shared_user_block = self._render_shared_user_block(body) if body else ""
+
+    def _render_shared_user_block(self, body: str) -> str:
+        """Render the shared profile block, bounded by its own char limit."""
+        limit = self.shared_user_char_limit
+        current = len(body)
+        pct = min(100, int((current / limit) * 100)) if limit > 0 else 0
+        header = (
+            f"{MEMORY_BLOCK_HEADERS['shared_user']} "
+            f"[{pct}% — {current:,}/{limit:,} chars]"
+        )
+        separator = "═" * 46
+        return f"{separator}\n{header}\n{separator}\n{SHARED_USER_BLOCK_NOTE}\n{body}"
 
     @staticmethod
     def _sanitize_entries_for_snapshot(entries: List[str], filename: str) -> List[str]:
@@ -327,6 +475,15 @@ class MemoryStore:
 
     @staticmethod
     def _path_for(target: str, tier: str = "hot") -> Path:
+        # Fail loud rather than falling through to MEMORY.md: the shared
+        # profile has no writable path, and silently writing a profile-local
+        # file for a "shared_user" write would be the exact contamination this
+        # store exists to prevent.
+        if target == "shared_user":
+            raise ValueError(
+                "The shared user profile is read-only and has no writable memory "
+                "file. Write profile-local facts with target='user'."
+            )
         mem_dir = get_memory_dir()
         if tier == "warm":
             if target == "user":
@@ -769,6 +926,10 @@ class MemoryStore:
         """
         Return the frozen snapshot for system prompt injection.
 
+        Targets: ``"memory"``, ``"user"``, and ``"shared_user"`` (the optional
+        read-only shared profile, bounded independently by
+        ``shared_user_char_limit``).
+
         This returns the state captured at load_from_disk() time, NOT the live
         state. Mid-session writes do not affect this. This keeps the system
         prompt stable across all turns, preserving the prefix cache.
@@ -963,34 +1124,75 @@ class MemoryStore:
             raise RuntimeError(f"Failed to write memory file {path}: {e}")
 
 
+def _int_setting(cfg: Dict[str, Any], key: str, default: int) -> int:
+    """Read an int from a config mapping, falling back on junk values."""
+    try:
+        return int(cfg.get(key, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _bool_setting(cfg: Dict[str, Any], key: str, default: bool) -> bool:
+    """Read a boolean config value without treating ``\"false\"`` as truthy."""
+    value = cfg.get(key, default)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "off", ""}:
+            return False
+        return default
+    if isinstance(value, bool):
+        return value
+    return default
+
+
+def build_memory_store(mem_config: Optional[Dict[str, Any]] = None) -> "MemoryStore":
+    """Construct a :class:`MemoryStore` from a ``memory:`` config mapping.
+
+    The single construction point shared by the live agent
+    (``agent/agent_init.py``) and every agentless surface
+    (:func:`load_on_disk_store`), so both enforce the same char caps and resolve
+    the same read-only shared user profile. The store is returned unloaded —
+    callers decide when to hit disk.
+    """
+    cfg = mem_config if isinstance(mem_config, dict) else {}
+    return MemoryStore(
+        memory_char_limit=_int_setting(cfg, "memory_char_limit", 2200),
+        user_char_limit=_int_setting(cfg, "user_char_limit", 1375),
+        warm_memory_enabled=_bool_setting(cfg, "warm_memory_enabled", True),
+        warm_memory_char_limit=_int_setting(cfg, "warm_memory_char_limit", 50000),
+        warm_user_char_limit=_int_setting(cfg, "warm_user_char_limit", 25000),
+        shared_user_profile_path=cfg.get("shared_user_profile_path", ""),
+        shared_user_char_limit=_int_setting(
+            cfg, "shared_user_char_limit", DEFAULT_SHARED_USER_CHAR_LIMIT
+        ),
+    )
+
+
 def load_on_disk_store() -> "MemoryStore":
     """Build a fresh on-disk :class:`MemoryStore`, honoring configured char limits.
 
     Use this from any context that has no live agent (the messaging gateway, the
     Desktop GUI, the bare CLI ``/memory`` handler) but still needs to read or
     apply approved memory writes. Mirrors how the live agent constructs its store
-    in ``agent/agent_init.py`` — including the user's ``memory.memory_char_limit``
-    / ``memory.user_char_limit`` overrides — so an approval applied without a live
-    agent enforces the SAME caps as one applied with one.
+    in ``agent/agent_init.py`` — both go through :func:`build_memory_store` — so
+    an approval applied without a live agent enforces the SAME caps as one
+    applied with one. The shared user profile is read here too, and is no more
+    writable from this path than from a live agent's.
 
     Falls back to the built-in defaults if config can't be loaded, so this can
     never raise on a missing/unreadable config.
     """
-    memory_char_limit = 2200
-    user_char_limit = 1375
+    mem_cfg: Dict[str, Any] = {}
     try:
         from hermes_cli.config import load_config
 
         mem_cfg = (load_config() or {}).get("memory", {}) or {}
-        memory_char_limit = int(mem_cfg.get("memory_char_limit", memory_char_limit))
-        user_char_limit = int(mem_cfg.get("user_char_limit", user_char_limit))
     except Exception:
         pass  # config optional — fall back to defaults rather than break /memory
 
-    store = MemoryStore(
-        memory_char_limit=memory_char_limit,
-        user_char_limit=user_char_limit,
-    )
+    store = build_memory_store(mem_cfg)
     store.load_from_disk()
     return store
 

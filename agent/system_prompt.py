@@ -546,8 +546,13 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             mem_block = agent._memory_store.format_for_system_prompt("memory")
             if mem_block:
                 volatile_parts.append(mem_block)
-        # USER.md is always included when enabled.
+        # USER.md is always included when enabled. The optional shared profile
+        # (memory.shared_user_profile_path) is read-only and goes FIRST, so the
+        # profile-local USER.md reads as the delta on top of it.
         if agent._user_profile_enabled:
+            shared_user_block = agent._memory_store.format_for_system_prompt("shared_user")
+            if shared_user_block:
+                volatile_parts.append(shared_user_block)
             user_block = agent._memory_store.format_for_system_prompt("user")
             if user_block:
                 volatile_parts.append(user_block)

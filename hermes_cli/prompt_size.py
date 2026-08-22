@@ -261,6 +261,7 @@ def compute_prompt_breakdown(platform: str = "cli") -> Dict[str, Any]:
     # blocks directly from the memory store so the numbers are attributable
     # even though they're joined into ``volatile``.
     memory_block = ""
+    shared_user_block = ""
     user_block = ""
     store = getattr(agent, "_memory_store", None)
     if store is not None:
@@ -268,6 +269,7 @@ def compute_prompt_breakdown(platform: str = "cli") -> Dict[str, Any]:
             if getattr(agent, "_memory_enabled", True):
                 memory_block = store.format_for_system_prompt("memory") or ""
             if getattr(agent, "_user_profile_enabled", True):
+                shared_user_block = store.format_for_system_prompt("shared_user") or ""
                 user_block = store.format_for_system_prompt("user") or ""
         except Exception:
             pass
@@ -288,6 +290,7 @@ def compute_prompt_breakdown(platform: str = "cli") -> Dict[str, Any]:
         "system_prompt": {"chars": len(full), "bytes": _bytes(full)},
         "skills_index": {"chars": len(skills_index), "bytes": _bytes(skills_index)},
         "memory": {"chars": len(memory_block), "bytes": _bytes(memory_block)},
+        "shared_user_profile": {"chars": len(shared_user_block), "bytes": _bytes(shared_user_block)},
         "user_profile": {"chars": len(user_block), "bytes": _bytes(user_block)},
         "tools": {"count": len(tools), "json_bytes": _bytes(tools_json)},
         "sections": sections,
@@ -311,9 +314,11 @@ def render_breakdown(data: Dict[str, Any]) -> str:
     lines.append("  Major blocks:")
     si = data["skills_index"]
     mem = data["memory"]
+    sup = data["shared_user_profile"]
     up = data["user_profile"]
     lines.append(f"    skills index       : {si['bytes']:>8,} B  ({_fmt_kb(si['bytes'])})")
     lines.append(f"    memory             : {mem['bytes']:>8,} B  ({_fmt_kb(mem['bytes'])})")
+    lines.append(f"    shared user profile: {sup['bytes']:>8,} B  ({_fmt_kb(sup['bytes'])})")
     lines.append(f"    user profile       : {up['bytes']:>8,} B  ({_fmt_kb(up['bytes'])})")
     lines.append("")
     lines.append("  Prompt tiers:")

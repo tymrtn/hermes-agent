@@ -692,6 +692,13 @@ memory:
   memory_char_limit: 2200   # ~800 tokens
   user_char_limit: 1375     # ~500 tokens
 
+  # Optional shared user profile — identity/preferences every profile reads.
+  # Absolute path to a Markdown/text file, read-only: the memory tool never
+  # writes it, so each profile's own USER.md stays the profile-local delta.
+  # Empty (default) disables it; a bad path only drops the shared block.
+  shared_user_profile_path: ""
+  shared_user_char_limit: 1200   # ~450 tokens
+
   # Periodic memory nudge: remind the agent to consider saving memories
   # every N user turns. Set to 0 to disable. Only active when memory is enabled.
   nudge_interval: 10        # Nudge every 10 user turns (0 = disabled)
