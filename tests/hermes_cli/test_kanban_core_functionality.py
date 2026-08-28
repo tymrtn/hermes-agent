@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import subprocess
 import threading
 import time
@@ -1306,6 +1307,15 @@ def test_reclaim_task_resets_running_to_ready(kanban_home, monkeypatch):
 
 
 
+def _exited_status(code: int) -> int:
+    """Raw wait-status for a WIFEXITED child with the given exit code.
+
+    ``os.W_EXITCODE`` is not available on every platform we run on, and the
+    encoding is stable: low byte = signal, high byte = exit status.
+    """
+    return int(code) << 8
+
+
 def _drive_worker_exit(conn, tid, fake_pid, raw_status):
     """Claim ``tid``, record ``raw_status`` for its dead worker pid, and run
     one reaper pass.
@@ -1347,15 +1357,56 @@ def _drive_nonzero_crash(conn, tid, fake_pid):
     return _drive_worker_exit(conn, tid, fake_pid, 256)
 
 
+def _drive_signal_interrupt(conn, tid, fake_pid, signum):
+    """One reaper pass for a worker that took the kanban hard-exit path.
+
+    ``cli.py:_signal_handler_q`` calls ``os._exit(128 + signum)`` for
+    dispatcher-owned workers on SIGTERM/SIGHUP, so the reaped status is a
+    normal exit carrying the conventional signal code.
+    """
+    return _drive_worker_exit(
+        conn, tid, fake_pid, _exited_status(128 + int(signum)),
+    )
+
+
+def test_clean_exit_backstop_fails_closed_without_respawn_recursion(kanban_home):
+    """A clean exit with the task still running means the worker's own
+    terminal reconciliation (``agent.kanban_finalize``) failed to run.
+
+    Respawning against a broken finalizer is blind recursion — the same
+    worker exits rc=0 again. Fail closed on the first occurrence with one
+    durable blocker that names the log to read.
+    """
+    import hermes_cli.kanban_db as _kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="clean exit", assignee="worker")
+
+        _drive_protocol_violation(conn, tid, 991100)
+
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked", (
+            "an unreconciled clean exit must not be retried blindly"
+        )
+        gave_up = [e for e in kb.list_events(conn, tid) if e.kind == "gave_up"]
+        assert len(gave_up) == 1
+        assert (gave_up[0].payload or {}).get("protocol_violations") == 1
+        # Durable blocker points at the exact log to read.
+        assert str(_kb.worker_log_path(tid)) in (task.last_failure_error or "")
+    finally:
+        conn.close()
+
+
 def test_protocol_violation_budget_not_consumed_by_other_failures(kanban_home):
     """Mixed failure kinds must not consume the violation retry budget.
 
     Regression for the #61233 review finding: expressed as a plain
     ``failure_limit`` over the unified ``consecutive_failures`` counter, the
     violation budget was consumed by earlier timeouts / nonzero exits. As a
-    violation-only streak, a prior real crash must not eat violation
-    retries, and below-budget violations must leave the unified counter
-    untouched (so the two budgets stay independent).
+    violation-only streak it stays independent — a prior real crash neither
+    counts as a violation nor changes how the next one is accounted, and a
+    per-task ``max_retries`` override still wins over the (now fail-closed)
+    default bound.
     """
     import hermes_cli.kanban_db as _kb
     conn = kb.connect()
@@ -1369,28 +1420,190 @@ def test_protocol_violation_budget_not_consumed_by_other_failures(kanban_home):
         assert task.status == "ready"
         assert task.consecutive_failures == 1
 
-        # Two violations after it: streak 1 and 2 — both retry, unified
-        # counter untouched. (Pre-fix: the crash consumed the budget and the
-        # violations blocked well before three of them happened.)
-        for i, pid in enumerate((991001, 991002)):
-            _drive_protocol_violation(conn, tid, pid)
-            task = kb.get_task(conn, tid)
-            assert task.status == "ready", (
-                f"violation {i + 1} after a crash must still retry, "
-                f"got {task.status}"
-            )
-            assert task.consecutive_failures == 1, (
-                "below-budget violations must not tick the unified counter"
-            )
-
-        # Third consecutive violation: streak hits the bound — blocked.
-        _drive_protocol_violation(conn, tid, 991003)
+        # The violation that follows is accounted against its own streak: the
+        # crash is not counted as a violation.
+        _drive_protocol_violation(conn, tid, 991001)
         task = kb.get_task(conn, tid)
         assert task.status == "blocked"
         gave_up = [e for e in kb.list_events(conn, tid) if e.kind == "gave_up"]
         assert len(gave_up) == 1
-        assert (gave_up[0].payload or {}).get("protocol_violations") == \
+        assert (gave_up[0].payload or {}).get("protocol_violations") == 1
+        assert (gave_up[0].payload or {}).get("protocol_violation_limit") == \
             _kb._PROTOCOL_VIOLATION_FAILURE_LIMIT
+
+        # A per-task max_retries override keeps its top precedence: 2 grants
+        # one violation retry before the breaker trips.
+        tid2 = kb.create_task(
+            conn, title="override", assignee="worker", max_retries=2,
+        )
+        _drive_protocol_violation(conn, tid2, 991010)
+        assert kb.get_task(conn, tid2).status == "ready"
+        _drive_protocol_violation(conn, tid2, 991011)
+        assert kb.get_task(conn, tid2).status == "blocked"
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Intentional shutdown — a dispatcher-owned worker killed by SIGTERM/SIGHUP
+# exits ``128 + signum`` (cli.py:_signal_handler_q) rather than 0, so the
+# reaper can tell "the operator restarted me" apart from "my finalizer
+# silently failed to reconcile the task".
+# ---------------------------------------------------------------------------
+
+
+def test_worker_signal_exit_codes_classify_as_interrupted(kanban_home):
+    """128+SIGTERM / 128+SIGHUP must get their own exit kind.
+
+    Folding them into ``nonzero_exit`` charges a retry to the task for a
+    shutdown nobody asked the task to survive; folding them into
+    ``clean_exit`` (the old rc=0 hard exit) blocks the card permanently.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    for signum in (signal.SIGTERM, signal.SIGHUP):
+        pid = 992000 + int(signum)
+        _kb._record_worker_exit(pid, _exited_status(128 + int(signum)))
+        assert _kb._classify_worker_exit(pid) == (
+            "interrupted", 128 + int(signum),
+        )
+
+    # Neighbouring codes keep their existing meaning.
+    _kb._record_worker_exit(992900, _exited_status(1))
+    assert _kb._classify_worker_exit(992900) == ("nonzero_exit", 1)
+    _kb._record_worker_exit(992901, _exited_status(0))
+    assert _kb._classify_worker_exit(992901) == ("clean_exit", 0)
+    _kb._record_worker_exit(
+        992902, _exited_status(_kb.KANBAN_RATE_LIMIT_EXIT_CODE),
+    )
+    assert _kb._classify_worker_exit(992902) == (
+        "rate_limited", _kb.KANBAN_RATE_LIMIT_EXIT_CODE,
+    )
+
+
+def test_interrupted_worker_requeues_without_counting_a_failure(kanban_home):
+    """SIGTERM on a dispatcher-owned worker is an intentional shutdown.
+
+    The task is released for another run and the run is closed as
+    ``interrupted`` — no failure counted, no violation streak consumed, and
+    not reported as a crash.
+    """
+    import hermes_cli.kanban_db as _kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="sigterm", assignee="worker")
+
+        crashed = _drive_signal_interrupt(conn, tid, 992100, signal.SIGTERM)
+
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready", (
+            "an intentional shutdown must leave the task recoverable"
+        )
+        assert task.consecutive_failures == 0
+        assert tid not in crashed, "an interrupt is not a crash"
+        assert tid in getattr(
+            _kb.detect_crashed_workers, "_last_interrupted", [],
+        )
+        assert tid not in getattr(
+            _kb.detect_crashed_workers, "_last_auto_blocked", [],
+        )
+
+        run = conn.execute(
+            "SELECT outcome, status FROM task_runs WHERE task_id = ? "
+            "AND ended_at IS NOT NULL ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+        assert run is not None
+        assert run["outcome"] == "interrupted"
+        assert run["status"] == "interrupted"
+
+        events = kb.list_events(conn, tid)
+        kinds = [e.kind for e in events]
+        assert "interrupted" in kinds
+        assert "crashed" not in kinds
+        assert "protocol_violation" not in kinds
+        assert "gave_up" not in kinds
+        payload = next(
+            e.payload or {} for e in events if e.kind == "interrupted"
+        )
+        assert payload.get("pid") == 992100
+        assert payload.get("exit_code") == 128 + int(signal.SIGTERM)
+        assert payload.get("claimer")
+
+        # Nothing was charged to the clean-exit violation budget, so a real
+        # rc=0 violation still fails closed on its first occurrence.
+        assert _kb._protocol_violation_streak(conn, tid) == 0
+    finally:
+        conn.close()
+
+
+def test_interrupt_does_not_reset_protocol_violation_streak(kanban_home):
+    """An interruption is neutral for the violation streak, like a quota wall.
+
+    A restart landing between two clean-exit violations must not hand the
+    broken finalizer a fresh retry budget.
+    """
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="violation then restart", assignee="worker",
+            max_retries=2,
+        )
+
+        _drive_protocol_violation(conn, tid, 992200)
+        assert kb.get_task(conn, tid).status == "ready"
+
+        _drive_signal_interrupt(conn, tid, 992201, signal.SIGTERM)
+        assert kb.get_task(conn, tid).status == "ready"
+
+        _drive_protocol_violation(conn, tid, 992202)
+        assert kb.get_task(conn, tid).status == "blocked", (
+            "the interrupt must not have reset the violation streak"
+        )
+    finally:
+        conn.close()
+
+
+def test_interrupt_after_rate_limit_does_not_strand_task_behind_guard(
+    kanban_home,
+):
+    """An interrupt must not supersede the rate-limit respawn guard.
+
+    The quota-wall requeue stamps a rate-limit-flavoured
+    ``last_failure_error`` that ``_RESPAWN_BLOCKER_RE`` matches. Only the
+    "latest run was rate_limited" branch of ``check_respawn_guard`` keeps the
+    card moving past it, and neither the rate-limit nor the interrupt path
+    increments ``consecutive_failures`` — so if an ``interrupted`` run were
+    allowed to become the latest run, the task would defer on
+    ``blocker_auth`` forever with no breaker to free it.
+    """
+    import hermes_cli.kanban_db as _kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="quota then restart", assignee="worker")
+
+        _drive_worker_exit(
+            conn, tid, 992300,
+            _exited_status(_kb.KANBAN_RATE_LIMIT_EXIT_CODE),
+        )
+        assert kb.check_respawn_guard(conn, tid) == "rate_limit_cooldown"
+
+        # Age the quota-wall run past the cooldown — the task is spawnable.
+        conn.execute(
+            "UPDATE task_runs SET ended_at = ? WHERE task_id = ?",
+            (int(time.time()) - (_kb.DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS * 10),
+             tid),
+        )
+        conn.commit()
+        assert kb.check_respawn_guard(conn, tid) is None
+
+        # Operator restarts the gateway mid-run.
+        _drive_signal_interrupt(conn, tid, 992301, signal.SIGTERM)
+
+        assert kb.check_respawn_guard(conn, tid) is None, (
+            "an intentional shutdown must not park the task on the stale "
+            "quota blocker text"
+        )
     finally:
         conn.close()
 

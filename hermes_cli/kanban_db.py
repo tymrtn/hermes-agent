@@ -78,6 +78,7 @@ import re
 import random
 import secrets
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -280,6 +281,26 @@ DEFAULT_CRASH_GRACE_SECONDS = 30
 # conventional "temporary failure, retry later" code, and well clear of the
 # 0/1/2 codes the worker uses for success / generic failure / usage error.
 KANBAN_RATE_LIMIT_EXIT_CODE = 75
+
+
+# Exit codes a dispatcher-owned worker uses to say "I was shut down on
+# purpose, my task never got its chance."
+#
+# ``cli.py:_signal_handler_q`` hard-exits (``os._exit``) instead of unwinding
+# when ``HERMES_KANBAN_TASK`` is set, because a non-daemon tool thread can
+# wedge graceful shutdown and leave the PID alive forever. That hard exit
+# bypasses the worker's own terminal reconciliation
+# (``agent.kanban_finalize``), so it must not look like a clean exit — rc=0
+# with the task still ``running`` is a protocol violation that fails closed
+# on the first occurrence. Exiting ``128 + signum`` (the conventional shell
+# code) keeps the immediate teardown and names the shutdown as intentional.
+#
+# The set covers exactly the signals cli.py routes through that handler.
+_WORKER_SIGNAL_EXIT_CODES = frozenset(
+    128 + int(getattr(signal, _name))
+    for _name in ("SIGINT", "SIGTERM", "SIGHUP")
+    if hasattr(signal, _name)
+)
 
 
 def _resolve_crash_grace_seconds() -> int:
@@ -7006,6 +7027,13 @@ class DispatchResult:
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
     counting a failure. These never trip the circuit breaker — a long quota
     window just makes the task bounce cheaply until the window clears."""
+    interrupted: list[str] = field(default_factory=list)
+    """Task ids whose workers were shut down on purpose (SIGTERM/SIGHUP/SIGINT
+    → the ``128 + signum`` hard exit in ``cli.py:_signal_handler_q``) and were
+    released back to ``ready`` WITHOUT counting a failure. An operator restart
+    or a gateway bounce must never consume a task's retry budget, and must
+    never be mistaken for the clean-exit protocol violation that fails
+    closed."""
     skipped_locked: bool = False
     """True when this tick was skipped because another process already held
     the board's dispatch lock (issue #35240). A losing dispatcher does no
@@ -7079,6 +7107,12 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
       provider rate-limited / exhausted quota, NOT because the task failed.
       ``detect_crashed_workers`` releases the task back to ``ready`` without
       counting a failure, so a long quota window can't trip the breaker.
+    * ``"interrupted"`` — ``WIFEXITED`` with a status in
+      ``_WORKER_SIGNAL_EXIT_CODES`` (``128 + signum``). The worker took the
+      dispatcher-owned hard-exit path in ``cli.py:_signal_handler_q`` after a
+      shutdown signal: an intentional teardown, NOT a task failure and NOT a
+      protocol violation. ``detect_crashed_workers`` releases the task back
+      to ``ready`` without counting a failure.
     * ``"nonzero_exit"`` — ``WIFEXITED`` with non-zero status. Real error.
     * ``"signaled"`` — ``WIFSIGNALED`` (OOM killer, SIGKILL, etc). Real crash.
     * ``"unknown"`` — pid was not in the reap registry (either reaped by
@@ -7086,8 +7120,8 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
       back to existing crashed-counter behavior.
 
     ``code`` is the exit status (for ``clean_exit`` / ``rate_limited`` /
-    ``nonzero_exit``) or the signal number (for ``signaled``), or ``None``
-    for ``unknown``.
+    ``interrupted`` / ``nonzero_exit``) or the signal number (for
+    ``signaled``), or ``None`` for ``unknown``.
     """
     entry = _recent_worker_exits.get(int(pid))
     if entry is None:
@@ -7100,6 +7134,8 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
                 return ("clean_exit", 0)
             if code == KANBAN_RATE_LIMIT_EXIT_CODE:
                 return ("rate_limited", code)
+            if code in _WORKER_SIGNAL_EXIT_CODES:
+                return ("interrupted", code)
             return ("nonzero_exit", code)
         if os.WIFSIGNALED(raw):
             return ("signaled", os.WTERMSIG(raw))
@@ -7708,6 +7744,33 @@ def reconcile_orphaned_running(
     return reconciled
 
 
+def _worker_log_path_for_conn(
+    conn: sqlite3.Connection, task_id: str
+) -> Optional[Path]:
+    """Worker log path for ``task_id`` on the board ``conn`` is attached to.
+
+    The reaper runs against boards other than the active one (the
+    admission-only reconcile path connects by slug), so resolving the log
+    through the ambient ``get_current_board()`` would name the wrong file.
+    Matching the connection's own database file against each board's
+    ``kanban_db_path`` reuses the canonical resolution instead of restating
+    it. Returns None when the board can't be identified — a durable blocker
+    is better with no path than with a wrong one.
+    """
+    try:
+        row = conn.execute("PRAGMA database_list").fetchone()
+        db_file = Path(row["file"]).resolve()
+        slugs = [DEFAULT_BOARD] + [
+            b["slug"] for b in list_boards() if b.get("slug")
+        ]
+        for slug in slugs:
+            if kanban_db_path(board=slug).resolve() == db_file:
+                return worker_log_path(task_id, board=slug)
+    except Exception:
+        _log.debug("kanban reaper: worker log path resolution failed", exc_info=True)
+    return None
+
+
 def _error_fingerprint(error_text: str) -> str:
     """Normalize an error message for grouping identical failures.
 
@@ -7719,19 +7782,22 @@ def _error_fingerprint(error_text: str) -> str:
     return fp.lower().strip()
 
 
-# Empirically ~96% of "clean exit without a terminal tool call" tasks complete
-# on a later run (a goal-mode finalize nudge, or the model simply emitting the
-# tool call next time), so a protocol violation is NOT deterministic — give it a
-# bounded retry before the breaker trips instead of blocking on the first hit.
+# Clean-exit protocol violations used to get a bounded retry, because most of
+# them completed on a later run once the model emitted the tool call. Workers
+# now reconcile their own terminal state before exiting
+# (``agent.kanban_finalize``): the nudge budget running out no longer produces
+# a clean exit with the task still ``running``. So reaching this reaper means
+# the worker's finalizer itself failed — a respawn just re-runs the same broken
+# finalizer. Fail closed on the first occurrence with one durable blocker
+# naming the log, instead of three blind retries.
 #
-# The budget is a violation-only STREAK, not a share of the unified
+# The budget is still a violation-only STREAK, not a share of the unified
 # ``consecutive_failures`` counter: it counts consecutive clean-exit protocol
 # violations (derived from run history by ``_protocol_violation_streak``), so
-# earlier timeouts / nonzero exits neither consume nor extend it, and a
-# below-budget violation does not tick the unified counter either. A per-task
+# earlier timeouts / nonzero exits neither consume nor extend it. A per-task
 # ``max_retries`` overrides this bound — the same "task override wins"
 # precedence ``_record_task_failure`` documents for every other failure kind.
-_PROTOCOL_VIOLATION_FAILURE_LIMIT = 3
+_PROTOCOL_VIOLATION_FAILURE_LIMIT = 1
 
 # How far back to walk a task's closed runs when counting the violation
 # streak. The streak trips at a handful of violations, so anything beyond a
@@ -7747,9 +7813,12 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     ``detect_crashed_workers`` just closed — and counts how many in a row were
     clean-exit protocol violations:
 
-    * ``rate_limited`` runs are neutral and skipped: a quota wall says nothing
-      about the task, exactly as it is neutral for the unified
-      ``consecutive_failures`` counter.
+    * ``rate_limited`` and ``interrupted`` runs are neutral and skipped: a
+      quota wall and an operator-initiated shutdown both say nothing about
+      the task, exactly as they are neutral for the unified
+      ``consecutive_failures`` counter. Skipping (rather than breaking) also
+      means a restart landing between two violations cannot hand a broken
+      finalizer a fresh retry budget.
     * Any other closed run (completed, plain crash, timeout, spawn failure,
       reclaim, …) breaks the streak, so the bounded retry budget counts ONLY
       protocol violations — mixed failure kinds can neither consume nor
@@ -7769,7 +7838,7 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     ).fetchall()
     for row in rows:
         outcome = row["outcome"] or ""
-        if outcome == "rate_limited":
+        if outcome in ("rate_limited", "interrupted"):
             continue
         if outcome == "crashed":
             is_violation = False
@@ -7817,9 +7886,19 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     ``check_respawn_guard`` defers their respawn until the window clears.
     The ids are returned via the ``_last_rate_limited`` function attribute
     (the public return stays the crashed-only ``list[str]``).
+
+    When the reap registry shows one of the worker signal-exit codes
+    (``_WORKER_SIGNAL_EXIT_CODES``, i.e. ``128 + signum``), the worker was
+    shut down on purpose — SIGTERM/SIGHUP from an operator, a gateway
+    restart, a supervisor. That hard exit deliberately skips the worker's own
+    terminal reconciliation, so the task is simply released back to ``ready``
+    with an ``interrupted`` run + event and NO failure counted. Reported via
+    the ``_last_interrupted`` function attribute, the same side-channel shape
+    as ``_last_rate_limited``.
     """
     crashed: list[str] = []
     rate_limited: list[str] = []
+    interrupted: list[str] = []
     # Per-crash details collected inside the main txn, used after it
     # closes to run ``_record_task_failure`` (which needs its own
     # write_txn so can't nest). ``protocol_violation`` flags the
@@ -7853,22 +7932,25 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             pid = int(row["worker_pid"])
             kind, code = _classify_worker_exit(pid)
             rate_limited_exit = False
+            interrupted_exit = False
             if kind == "clean_exit":
                 # Worker subprocess returned 0 but its task is still
                 # ``running`` in the DB — it exited without calling
-                # ``kanban_complete`` / ``kanban_block``. Overwhelmingly the
-                # work itself succeeded and only the paperwork was skipped, so
-                # a retry usually completes; the corrective sentence below is
-                # surfaced to the retry worker via the prior-attempt error in
-                # ``build_worker_context`` (guidance approach from #61817).
+                # ``kanban_complete`` / ``kanban_block`` AND without its own
+                # terminal reconciliation landing a block
+                # (``agent.kanban_finalize``, which runs on every one-shot exit
+                # route). Both failing means the exit path itself is broken, so
+                # this text is a diagnostic for a human rather than guidance
+                # for a retry worker.
                 protocol_violation = True
+                _log_path = _worker_log_path_for_conn(conn, row["id"])
+                _log_hint = f" Worker log: {_log_path}." if _log_path else ""
                 error_text = (
                     "worker exited cleanly (rc=0) without calling "
-                    "kanban_complete or kanban_block — protocol violation. "
-                    "If the prior run already did the work, verify it and "
-                    "report the result via kanban_complete; a run that ends "
-                    "without a terminal kanban call counts as failed no "
-                    "matter what it did."
+                    "kanban_complete or kanban_block, and its own terminal "
+                    "reconciliation did not run — protocol violation. Read the "
+                    "worker log before retrying: a respawn re-runs the same "
+                    "broken exit path." + _log_hint
                 )
                 event_kind = "protocol_violation"
                 event_payload = {
@@ -7900,6 +7982,33 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     "claimer": row["claim_lock"],
                     "exit_code": code,
                 }
+            elif kind == "interrupted":
+                # Worker took the dispatcher-owned hard-exit path in
+                # ``cli.py:_signal_handler_q`` after SIGTERM/SIGHUP/SIGINT.
+                # The shutdown was intentional and says nothing about the
+                # task: the exit deliberately skips the worker's own terminal
+                # reconciliation to guarantee the PID is reclaimed even with a
+                # non-daemon thread wedged. Release the task for another run
+                # WITHOUT counting a failure and WITHOUT charging the
+                # clean-exit violation streak — an operator restarting the
+                # gateway must never permanently block recoverable work.
+                #
+                # Deliberately no ``last_failure_error`` stamp either: this is
+                # not a failure, and the respawn guard's blocker regex would
+                # otherwise get a chance to park the task on the text.
+                protocol_violation = False
+                interrupted_exit = True
+                error_text = (
+                    f"pid {pid} shut down on signal (exit {code}) before "
+                    f"reconciling its task — requeued without counting a "
+                    f"failure"
+                )
+                event_kind = "interrupted"
+                event_payload = {
+                    "pid": pid,
+                    "claimer": row["claim_lock"],
+                    "exit_code": code,
+                }
             else:
                 protocol_violation = False
                 if kind == "nonzero_exit":
@@ -7922,10 +8031,16 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 (row["id"], pid, row["claim_lock"]),
             )
             if cur.rowcount == 1:
-                # Rate-limited requeues are a clean release, not a crash —
-                # record the run outcome as ``rate_limited`` so the board
-                # history doesn't show a phantom crash for a quota wall.
-                _run_outcome = "rate_limited" if rate_limited_exit else "crashed"
+                # Rate-limited requeues and signal shutdowns are clean
+                # releases, not crashes — record the matching run outcome so
+                # the board history doesn't show a phantom crash for a quota
+                # wall or an operator restart.
+                if rate_limited_exit:
+                    _run_outcome = "rate_limited"
+                elif interrupted_exit:
+                    _run_outcome = "interrupted"
+                else:
+                    _run_outcome = "crashed"
                 run_id = _end_run(
                     conn, row["id"],
                     outcome=_run_outcome, status=_run_outcome,
@@ -7948,6 +8063,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                         (error_text[:500], row["id"]),
                     )
                     rate_limited.append(row["id"])
+                elif interrupted_exit:
+                    interrupted.append(row["id"])
                 else:
                     if protocol_violation:
                         # Stamp the failure error now: a below-budget
@@ -7970,18 +8087,16 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # breaker (the task transitions ready → blocked with a ``gave_up`` event
     # on top of the event we already emitted).
     #
-    # Protocol-violation crashes (clean exit, no terminal tool call) get a
-    # BOUNDED retry, not an immediate trip: empirically ~96% of these tasks
-    # complete on a later run (a goal-mode finalize nudge, or the model simply
-    # emitting kanban_complete/kanban_block next time), so blocking on the first
-    # occurrence just churned them through the respawn cycle. The retry budget
-    # is a violation-only streak (``_protocol_violation_streak``): earlier
-    # timeouts / nonzero exits neither consume nor extend it, and a
-    # below-budget violation does not tick the unified
-    # ``consecutive_failures`` counter, so the two budgets stay independent.
-    # A per-task ``max_retries`` overrides the violation bound with the same
-    # top precedence it has for every other failure kind. Systemic same-error
-    # crashes still trip immediately.
+    # Protocol-violation crashes (clean exit, no terminal tool call) are
+    # accounted against their own violation-only streak
+    # (``_protocol_violation_streak``): earlier timeouts / nonzero exits
+    # neither consume nor extend it, so the two budgets stay independent.
+    # Since workers reconcile their own terminal state before exiting, that
+    # streak now trips on the first violation — respawning against a finalizer
+    # that already failed is blind recursion. A per-task ``max_retries``
+    # overrides the violation bound with the same top precedence it has for
+    # every other failure kind. Systemic same-error crashes still trip
+    # immediately.
     auto_blocked: list[str] = []
     if crash_details:
         # Fingerprint errors to detect systemic failures.
@@ -8057,6 +8172,9 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # Same side-channel for rate-limited requeues — these did NOT count a
     # failure and are NOT crashes, so they stay out of the ``crashed`` return.
     detect_crashed_workers._last_rate_limited = rate_limited  # type: ignore[attr-defined]
+    # And for signal-shutdown requeues, for the same reason: an intentional
+    # teardown is neither a crash nor a failure.
+    detect_crashed_workers._last_interrupted = interrupted  # type: ignore[attr-defined]
     return crashed
 
 
@@ -8353,10 +8471,20 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     #    We look at the LATEST run only (ORDER BY ended_at DESC LIMIT 1): if a
     #    newer crash/completion superseded the rate-limit run, this guard
     #    no longer applies and the normal paths take over.
+    #
+    #    ``interrupted`` runs are excluded from "latest": an intentional
+    #    shutdown (SIGTERM/SIGHUP) says nothing about quota and, like the
+    #    rate-limit path, never increments ``consecutive_failures``. Letting
+    #    one become the latest run would hide the rate-limit branch while the
+    #    quota-flavoured ``last_failure_error`` stays stamped — the task would
+    #    fall through to ``blocker_auth`` and defer forever with no breaker
+    #    able to free it. Same neutrality it gets in
+    #    ``_protocol_violation_streak``.
     rl_cooldown = _resolve_rate_limit_cooldown_seconds()
     latest_run = conn.execute(
         "SELECT outcome, ended_at FROM task_runs "
         "WHERE task_id = ? AND ended_at IS NOT NULL "
+        "  AND outcome IS NOT 'interrupted' "
         "ORDER BY ended_at DESC LIMIT 1",
         (task_id,),
     ).fetchone()
@@ -9270,6 +9398,14 @@ def _dispatch_once_locked(
     )
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
+    # Signal-shutdown requeues (intentional teardown, no failure counted) —
+    # same side-channel shape. These tasks went straight back to ``ready``
+    # with no respawn guard stamped, so the next tick can re-spawn them.
+    _crash_interrupted = getattr(
+        detect_crashed_workers, "_last_interrupted", []
+    )
+    if _crash_interrupted:
+        result.interrupted.extend(_crash_interrupted)
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 

@@ -11,9 +11,18 @@ dispatcher's ``_pid_alive`` check returns True forever, and the task stays
 ``running`` indefinitely.
 
 The fix: when the process is a dispatcher-spawned worker (``HERMES_KANBAN_TASK``
-env var set), flush logging + stdout/stderr and call ``os._exit(0)`` instead.
-The kernel reclaims the PID immediately, and ``detect_crashed_workers``
+env var set), flush logging + stdout/stderr and call ``os._exit(128 + signum)``
+instead. The kernel reclaims the PID immediately, and ``detect_crashed_workers``
 reclaims the stale claim on the next dispatcher tick.
+
+The exit *code* matters as much as the hard exit. The original fix exited 0,
+but that hard exit skips the worker's own terminal reconciliation
+(``agent.kanban_finalize``) — so rc=0 with the task still ``running`` reaches
+the reaper as a clean-exit protocol violation, which fails closed on the first
+occurrence and permanently blocks recoverable work. ``128 + signum`` (the
+conventional shell code) keeps the immediate teardown while naming the
+shutdown as intentional; ``kanban_db._classify_worker_exit`` maps it to
+``interrupted`` and the task is simply released back to ``ready``.
 
 These tests use a synthetic Python script that mirrors the cli.py signal
 handler shape so we can exercise the exit-path contract without booting the
@@ -29,6 +38,15 @@ import textwrap
 import time
 
 import pytest
+
+
+# The shutdown signals cli.py routes through the kanban worker hard-exit
+# path. SIGHUP is absent on Windows, where the dispatcher does not run.
+_WORKER_SHUTDOWN_SIGNALS = [
+    getattr(signal, _name)
+    for _name in ("SIGTERM", "SIGHUP")
+    if hasattr(signal, _name)
+]
 
 
 def _synthetic_worker_script() -> str:
@@ -57,18 +75,23 @@ def _synthetic_worker_script() -> str:
             except Exception:
                 pass
             if os.environ.get("HERMES_KANBAN_TASK"):
+                exit_code = 128 + signum
                 try:
                     if hasattr(signal, "SIGALRM"):
-                        signal.signal(signal.SIGALRM, lambda *_: os._exit(0))
+                        signal.signal(
+                            signal.SIGALRM, lambda *_: os._exit(exit_code)
+                        )
                         signal.alarm(2)
                 except Exception:
                     pass
                 sys.stdout.flush()
                 sys.stderr.flush()
-                os._exit(0)
+                os._exit(exit_code)
             raise KeyboardInterrupt()
 
         signal.signal(signal.SIGTERM, handler)
+        if hasattr(signal, "SIGHUP"):
+            signal.signal(signal.SIGHUP, handler)
         print("READY", flush=True)
         try:
             threading.Event().wait()
@@ -178,6 +201,39 @@ def test_sigterm_with_kanban_task_env_terminates_quickly():
         pytest.fail(
             "process still alive 2s after SIGTERM with HERMES_KANBAN_TASK set "
             "(dispatcher would keep extending claim) — fix regressed"
+        )
+    finally:
+        _cleanup(proc)
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="SIGTERM semantics differ on Windows; kanban dispatcher is POSIX-only",
+)
+@pytest.mark.parametrize("signum", _WORKER_SHUTDOWN_SIGNALS)
+def test_kanban_worker_hard_exit_uses_128_plus_signum(signum):
+    """The hard exit must carry the signal in its exit code.
+
+    ``os._exit(0)`` reaches the dispatcher's reaper as a clean exit with the
+    task still ``running`` — which the reaper reads as a protocol violation
+    and blocks the card permanently on the first occurrence. Exiting
+    ``128 + signum`` keeps the immediate-teardown property (non-daemon thread
+    still alive) while naming the shutdown as intentional.
+    """
+    proc = _spawn_synthetic({"HERMES_KANBAN_TASK": "t_test_28181"})
+    try:
+        t0 = time.time()
+        os.kill(proc.pid, signum)
+        rc = proc.wait(timeout=5)
+        elapsed = time.time() - t0
+        assert rc == 128 + int(signum), (
+            f"expected exit code {128 + int(signum)} for signal {signum}, "
+            f"got {rc} — the reaper cannot distinguish an intentional "
+            f"shutdown from a broken finalizer"
+        )
+        assert elapsed < 2.0, (
+            f"hard exit took {elapsed:.2f}s — the non-daemon thread wedged "
+            f"shutdown, so the dispatcher would keep extending the claim"
         )
     finally:
         _cleanup(proc)

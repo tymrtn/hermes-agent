@@ -1982,6 +1982,52 @@ KANBAN_GOAL_FINALIZE_TEMPLATE = (
 )
 
 
+def _kanban_goal_decision(
+    outcome: str,
+    *,
+    turns_used: int,
+    reason: str,
+    last_response: str = "",
+    verdict: str = "",
+) -> Dict[str, Any]:
+    """Decision dict returned to the caller.
+
+    ``last_response`` and ``verdict`` ride along so the worker's terminal
+    finalizer can persist real evidence when the loop stops without blocking
+    (``agent.kanban_finalize``) instead of a generic "stopped".
+    """
+    return {
+        "outcome": outcome,
+        "turns_used": turns_used,
+        "reason": reason,
+        "last_response": last_response,
+        "verdict": verdict,
+    }
+
+
+def _kanban_goal_block_reason(
+    headline: str,
+    *,
+    turns_used: int,
+    max_turns: int,
+    verdict: str,
+    reason: str,
+    last_response: str,
+) -> str:
+    """Durable blocker text: what the judge said AND what the worker produced.
+
+    A bare "Last judge verdict: …" line leaves a human with no idea what the
+    worker actually did before it gave up, so the last response rides along.
+    """
+    parts = [
+        f"{headline} ({turns_used}/{max_turns} turns used).",
+        f"Last judge verdict: {verdict or 'n/a'} — {_truncate(reason, 300)}",
+    ]
+    if last_response:
+        parts.append(f"Last worker response: {_truncate(last_response, 600)}")
+    return "\n".join(parts)
+
+
 def run_kanban_goal_loop(
     *,
     task_id: str,
@@ -2036,6 +2082,8 @@ def run_kanban_goal_loop(
     # The first turn already consumed one unit of budget.
     turns_used = 1
     nudged_to_finalize = False
+    verdict = ""
+    consecutive_transport_failures = 0
 
     while True:
         # Did the worker terminate the task itself this turn?
@@ -2043,18 +2091,33 @@ def run_kanban_goal_loop(
             status = task_status_fn()
         except Exception as exc:
             _log(f"kanban goal loop: status check failed ({exc}); stopping")
-            return {"outcome": "stopped", "turns_used": turns_used, "reason": "status check failed"}
+            return _kanban_goal_decision(
+                "stopped", turns_used=turns_used,
+                reason=f"status check failed: {type(exc).__name__}",
+                last_response=last_response, verdict=verdict,
+            )
 
         if status == "done":
             _log(f"kanban goal loop: task {task_id} completed by worker after {turns_used} turn(s)")
-            return {"outcome": "completed_by_worker", "turns_used": turns_used, "reason": "worker completed the task"}
+            return _kanban_goal_decision(
+                "completed_by_worker", turns_used=turns_used,
+                reason="worker completed the task",
+                last_response=last_response, verdict=verdict,
+            )
         if status == "blocked":
             _log(f"kanban goal loop: task {task_id} blocked by worker after {turns_used} turn(s)")
-            return {"outcome": "blocked_by_worker", "turns_used": turns_used, "reason": "worker blocked the task"}
+            return _kanban_goal_decision(
+                "blocked_by_worker", turns_used=turns_used,
+                reason="worker blocked the task",
+                last_response=last_response, verdict=verdict,
+            )
         if status not in ("running", "ready"):
             # Reclaimed / archived / unexpected — let the dispatcher own it.
             _log(f"kanban goal loop: task {task_id} status={status!r}; stopping")
-            return {"outcome": "stopped", "turns_used": turns_used, "reason": f"status={status}"}
+            return _kanban_goal_decision(
+                "stopped", turns_used=turns_used, reason=f"status={status}",
+                last_response=last_response, verdict=verdict,
+            )
 
         # Still open — judge whether the latest response satisfies the card.
         # The kanban worker loop has no wait-barrier concept (workers finish
@@ -2065,19 +2128,56 @@ def run_kanban_goal_loop(
             verdict = "continue"
         _log(f"kanban goal loop: turn {turns_used}/{max_turns} verdict={verdict} reason={_truncate(reason, 120)}")
 
+        # ``judge_goal`` is fail-open: an unreachable judge returns CONTINUE,
+        # which is indistinguishable from "not done yet". That is right for a
+        # blip and wrong for a broken judge (bad key, bad model slug — the
+        # BadRequestError class), which would otherwise spend the entire turn
+        # budget on turns nothing can ever approve. Block with the diagnostic
+        # once the failures are clearly not transient.
+        if _transport_failed:
+            consecutive_transport_failures += 1
+        else:
+            consecutive_transport_failures = 0
+        if consecutive_transport_failures >= DEFAULT_MAX_CONSECUTIVE_TRANSPORT_FAILURES:
+            _log(
+                f"kanban goal loop: judge unreachable "
+                f"{consecutive_transport_failures} turns in a row; blocking"
+            )
+            try:
+                block_fn(_kanban_goal_block_reason(
+                    "Goal-mode judge was unreachable "
+                    f"{consecutive_transport_failures} turns in a row — check the "
+                    "auxiliary.goal_judge provider/model/key",
+                    turns_used=turns_used, max_turns=max_turns,
+                    verdict=verdict, reason=reason, last_response=last_response,
+                ))
+            except Exception as exc:
+                _log(f"kanban goal loop: block_fn failed ({exc})")
+            return _kanban_goal_decision(
+                "blocked_judge_failure", turns_used=turns_used,
+                reason=f"judge unreachable {consecutive_transport_failures} turns in a row: {reason}",
+                last_response=last_response, verdict=verdict,
+            )
+
         if verdict == "done":
             if nudged_to_finalize:
                 # Already asked once to call kanban_complete and it still
                 # didn't — block for review rather than spin.
                 _log(f"kanban goal loop: task {task_id} judged done but worker won't finalize; blocking")
                 try:
-                    block_fn(
-                        f"Goal-mode worker's output looked complete but it never "
-                        f"called kanban_complete after a finalize nudge ({reason})."
-                    )
+                    block_fn(_kanban_goal_block_reason(
+                        "Goal-mode worker's output looked complete but it never "
+                        "called kanban_complete after a finalize nudge",
+                        turns_used=turns_used, max_turns=max_turns,
+                        verdict=verdict, reason=reason, last_response=last_response,
+                    ))
                 except Exception as exc:
                     _log(f"kanban goal loop: block_fn failed ({exc})")
-                return {"outcome": "blocked_budget", "turns_used": turns_used, "reason": "judged done, never finalized"}
+                return _kanban_goal_decision(
+                    "blocked_budget", turns_used=turns_used,
+                    reason="judged done, never finalized",
+                    last_response=last_response, verdict=verdict,
+                )
             prompt = KANBAN_GOAL_FINALIZE_TEMPLATE.format(reason=_truncate(reason, 400))
             nudged_to_finalize = True
         else:
@@ -2087,21 +2187,30 @@ def run_kanban_goal_loop(
         if turns_used >= max_turns:
             _log(f"kanban goal loop: task {task_id} exhausted {turns_used}/{max_turns} turns; blocking")
             try:
-                block_fn(
-                    f"Goal-mode worker exhausted its turn budget "
-                    f"({turns_used}/{max_turns}) without completing the task. "
-                    f"Last judge verdict: {_truncate(reason, 300)}"
-                )
+                block_fn(_kanban_goal_block_reason(
+                    "Goal-mode worker exhausted its turn budget without "
+                    "completing the task",
+                    turns_used=turns_used, max_turns=max_turns,
+                    verdict=verdict, reason=reason, last_response=last_response,
+                ))
             except Exception as exc:
                 _log(f"kanban goal loop: block_fn failed ({exc})")
-            return {"outcome": "blocked_budget", "turns_used": turns_used, "reason": "turn budget exhausted"}
+            return _kanban_goal_decision(
+                "blocked_budget", turns_used=turns_used,
+                reason="turn budget exhausted",
+                last_response=last_response, verdict=verdict,
+            )
 
         # Run another turn in the same session.
         try:
             last_response = run_turn(prompt) or ""
         except Exception as exc:
             _log(f"kanban goal loop: run_turn failed ({exc}); stopping")
-            return {"outcome": "stopped", "turns_used": turns_used, "reason": f"run_turn error: {type(exc).__name__}"}
+            return _kanban_goal_decision(
+                "stopped", turns_used=turns_used,
+                reason=f"run_turn error: {type(exc).__name__}",
+                last_response=last_response, verdict=verdict,
+            )
         turns_used += 1
 
 

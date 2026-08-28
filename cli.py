@@ -1367,8 +1367,8 @@ def _reset_terminal_input_modes_on_exit() -> None:
     (#36823). Called from ``_run_cleanup`` (atexit-registered + invoked on the
     normal / EOF / interrupt exit paths) this covers normal quit, Ctrl+C and
     SIGTERM/SIGHUP. ``kill -9`` is uncatchable, and the kanban worker's
-    ``os._exit(0)`` path bypasses ``atexit``; neither runs this — but both are
-    non-TTY / non-TUI, so there is nothing to reset there.
+    ``os._exit(128 + signum)`` path bypasses ``atexit``; neither runs this —
+    but both are non-TTY / non-TUI, so there is nothing to reset there.
 
     Gated on ``_tui_input_modes_active`` so one-shot non-TUI CLI runs (which
     share ``_run_cleanup`` via ``atexit``) never emit these codes. Writes to the
@@ -18152,21 +18152,112 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 # Main Entry Point
 # ============================================================================
 
-def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
+def _note_kanban_worker_outcome(
+    cli,
+    *,
+    result: Optional[dict] = None,
+    response: Optional[str] = None,
+    goal_decision: Optional[dict] = None,
+    skip: Optional[str] = None,
+) -> None:
+    """Record what this one-shot run produced, for the exit-time finalizer.
+
+    The evidence is collected where it exists (the quiet path's result dict,
+    the goal loop's decision) and consumed once in the single-query ``finally``
+    so every exit route — rc=0, rc=1, credential failure — reconciles through
+    the same code. ``skip`` opts an exit route out (interrupts are crashes,
+    which the dispatcher's reaper already accounts for correctly).
+    """
+    outcome = getattr(cli, "_kanban_worker_outcome", None)
+    if outcome is None:
+        outcome = {}
+        try:
+            cli._kanban_worker_outcome = outcome
+        except Exception:
+            return
+    if result is not None:
+        outcome["result"] = result
+    if response is not None:
+        outcome["response"] = response
+    if goal_decision is not None:
+        outcome["goal_decision"] = goal_decision
+    if skip is not None:
+        outcome["skip"] = skip
+
+
+def _last_assistant_text(cli) -> str:
+    """Last assistant reply in this session, for exit paths that kept no result.
+
+    Non-goal workers spawn as ``chat -q`` (no ``-Q``), so they finish through
+    ``cli.chat()`` and never see a result dict — the conversation history is
+    the only place their final text survives.
+    """
+    history = getattr(cli, "conversation_history", None) or []
+    for msg in reversed(history):
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+        content = msg.get("content")
+        if isinstance(content, str) and content.strip():
+            return content
+        if isinstance(content, list):
+            parts = [
+                str(p.get("text") or "")
+                for p in content
+                if isinstance(p, dict) and p.get("type") == "text"
+            ]
+            joined = "\n".join(p for p in parts if p).strip()
+            if joined:
+                return joined
+    return ""
+
+
+def _reconcile_kanban_terminal_state(cli) -> None:
+    """Fail closed if this worker is exiting with its kanban task still running.
+
+    A no-op for every non-kanban run. Never raises: a finalizer that throws
+    would turn a recoverable exit into an uncatchable one, and the dispatcher's
+    crash handling is still the backstop underneath it.
+    """
+    outcome = getattr(cli, "_kanban_worker_outcome", None) or {}
+    if outcome.get("skip"):
+        logger.debug(
+            "kanban terminal reconciliation skipped (%s)", outcome["skip"],
+        )
+        return
+    try:
+        from agent.kanban_finalize import reconcile_terminal_state
+
+        reconcile_terminal_state(
+            result=outcome.get("result"),
+            final_response=outcome.get("response") or _last_assistant_text(cli),
+            goal_decision=outcome.get("goal_decision"),
+        )
+    except Exception as exc:
+        logger.warning("kanban terminal reconciliation failed: %s", exc)
+
+
+def _run_kanban_goal_loop_q(
+    cli: "HermesCLI", first_response: str
+) -> Optional[dict]:
     """Drive a kanban goal_mode worker through the Ralph-style goal loop.
 
     Called from the quiet single-query path AFTER the worker's first turn,
     only when ``HERMES_KANBAN_GOAL_MODE`` is set (dispatcher-spawned
     goal_mode card). Wires the worker's ``run_conversation`` and the kanban
     DB into ``goals.run_kanban_goal_loop``. All errors are swallowed by the
-    caller — a broken goal loop must never wedge a worker, the dispatcher's
-    claim TTL / crash detection is the backstop.
+    caller — a broken goal loop must never wedge a worker, and the worker's
+    own terminal finalizer plus the dispatcher's crash detection are the
+    backstops.
+
+    Returns the loop's decision dict (or None when the loop didn't run) so the
+    caller can hand its evidence to the terminal finalizer; a loop that stops
+    without blocking would otherwise lose the last response and verdict.
     """
     import os as _os
 
     task_id = (_os.environ.get("HERMES_KANBAN_TASK") or "").strip()
     if not task_id:
-        return
+        return None
 
     from hermes_cli import kanban_db as _kb
     from hermes_cli.goals import run_kanban_goal_loop as _run_loop, DEFAULT_MAX_TURNS as _DEF_TURNS
@@ -18182,14 +18273,14 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
         except Exception:
             pass
     if task is None:
-        return
+        return None
 
     goal_parts = [task.title or ""]
     if task.body:
         goal_parts.append(task.body)
     goal_text = "\n\n".join(p for p in goal_parts if p).strip()
     if not goal_text:
-        return
+        return None
 
     max_turns = task.goal_max_turns or _DEF_TURNS
 
@@ -18221,16 +18312,14 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
                 pass
 
     def _block(reason: str) -> None:
-        c = _kb.connect()
-        try:
-            _kb.block_task(c, task_id, reason=reason)
-        finally:
-            try:
-                c.close()
-            except Exception:
-                pass
+        # Same durable-write boundary the terminal finalizer uses: bound to
+        # this worker's run id (a stale goal loop must not close a newer run)
+        # and redacted before it lands on the board.
+        from agent.kanban_finalize import block_current_worker_task
 
-    _run_loop(
+        block_current_worker_task(reason)
+
+    return _run_loop(
         task_id=task_id,
         goal_text=goal_text,
         run_turn=_run_turn,
@@ -18498,19 +18587,33 @@ def main(
         # unwinds the main thread; the worker thread keeps running, the
         # process gets reparented to init, and the dispatcher's _pid_alive
         # check returns True forever — task stuck in 'running' indefinitely.
-        # Skip the controlled-unwind dance and call os._exit(0) so the kernel
+        # Skip the controlled-unwind dance and hard-exit so the kernel
         # reclaims the PID immediately and detect_crashed_workers can reclaim
         # the stale claim on the next tick. Flush logging + stdout/stderr
         # first so the final debug trace isn't lost; SIGALRM deadman guards
         # the flush against any rare blocking-I/O case (the reporter measured
         # flush in <1ms; the alarm is a failsafe, not the common path).
+        #
+        # Exit ``128 + signum`` (the conventional shell code for "terminated
+        # by this signal"), never 0: the hard exit bypasses the worker's own
+        # terminal reconciliation (``agent.kanban_finalize``), so rc=0 would
+        # reach the reaper as a clean exit with the task still ``running`` —
+        # a protocol violation, which now fails closed on the first
+        # occurrence and permanently blocks recoverable work. The signal code
+        # is what ``kanban_db._classify_worker_exit`` maps to ``interrupted``
+        # so the task is simply released back to ``ready``. Precomputed
+        # before the alarm is armed so the deadman path exits with the same
+        # code as the normal path.
         if os.environ.get("HERMES_KANBAN_TASK"):
+            _exit_code = 128 + int(signum)
             try:
                 import signal as _sig_mod
                 if hasattr(_sig_mod, "SIGALRM"):
                     # Cancel any pre-existing alarm to avoid colliding with
                     # caller-installed timers.
-                    _sig_mod.signal(_sig_mod.SIGALRM, lambda *_: os._exit(0))
+                    _sig_mod.signal(
+                        _sig_mod.SIGALRM, lambda *_: os._exit(_exit_code)
+                    )
                     _sig_mod.alarm(2)
             except Exception:
                 pass
@@ -18524,7 +18627,7 @@ def main(
                     _stream.flush()
                 except Exception:
                     pass
-            os._exit(0)
+            os._exit(_exit_code)
         raise KeyboardInterrupt()
     try:
         import signal as _signal
@@ -18666,6 +18769,13 @@ def main(
                                 conversation_history=cli.conversation_history,
                             )
                         except KeyboardInterrupt:
+                            # An interrupt is a crash, not a clean exit: the
+                            # dispatcher's reaper already accounts for it and
+                            # releases the task for a retry. Blocking here
+                            # would convert every Ctrl-C into human triage.
+                            _note_kanban_worker_outcome(
+                                cli, skip="keyboard_interrupt",
+                            )
                             _emit_interrupted_session_end(cli, reason="keyboard_interrupt")
                             print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
                             sys.exit(130)
@@ -18679,6 +18789,16 @@ def main(
                         ):
                             cli.session_id = cli.agent.session_id
                         response = result.get("final_response", "") if isinstance(result, dict) else str(result)
+                        # Hold the run's evidence for the terminal finalizer in
+                        # the ``finally`` below: a kanban worker that reaches
+                        # exit with its task still ``running`` blocks with this
+                        # attached, instead of exiting quietly for the
+                        # dispatcher to reap as a protocol violation.
+                        _note_kanban_worker_outcome(
+                            cli,
+                            result=result if isinstance(result, dict) else None,
+                            response=response,
+                        )
                         # Surface backend errors that produced no visible output
                         # (e.g. invalid model slug → provider 4xx). Mirrors the
                         # interactive CLI path. Write to stderr so piped stdout
@@ -18702,7 +18822,12 @@ def main(
                         # normal worker and every non-kanban `-q` run.
                         if os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1":
                             try:
-                                _run_kanban_goal_loop_q(cli, response)
+                                _note_kanban_worker_outcome(
+                                    cli,
+                                    goal_decision=_run_kanban_goal_loop_q(
+                                        cli, response,
+                                    ),
+                                )
                             except Exception as _goal_exc:
                                 logger.debug("kanban goal loop failed: %s", _goal_exc)
 
@@ -18761,6 +18886,9 @@ def main(
                 cli.chat(query, images=single_query_images or None)
                 cli._print_exit_summary(clear_screen=False)
         finally:
+            # Last thing a one-shot worker does: never let the process exit
+            # with its kanban task still ``running``.
+            _reconcile_kanban_terminal_state(cli)
             _finalize_single_query(cli)
         return
     
