@@ -299,3 +299,19 @@ async def test_internal_afk_response_delivers_even_if_user_message_arrived_mid_r
     assert adapter.sent[0][1] == "AFK task completed: checked logs."
     assert adapter.sent[0][2].get("reply_to") is None
     assert len(adapter.sent) >= 1
+
+
+def test_enabled_afk_watcher_is_registered_at_gateway_startup(monkeypatch):
+    from unittest.mock import MagicMock
+    from gateway.afk_followup import AfkFollowupConfig
+
+    runner = object.__new__(GatewayRunner)
+    runner._afk_followup_config = AfkFollowupConfig(enabled=True)
+    runner._failed_platforms = {}
+    runner._spawn_supervised = MagicMock()
+    runner._spawn_reconnect_watcher = lambda: None
+    runner._scale_to_zero_should_arm = lambda: False
+    runner._log_scale_to_zero_not_armed_reason = lambda: None
+    runner._start_spawn_background_watchers()
+    assert any(call.args == (runner._afk_followup_watcher, "afk_followup_watcher")
+               for call in runner._spawn_supervised.call_args_list)

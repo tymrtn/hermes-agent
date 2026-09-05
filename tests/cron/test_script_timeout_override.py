@@ -32,36 +32,36 @@ class TestGetScriptTimeoutOverride:
     """Precedence: per-job override > module patch > env > config > default."""
 
     def test_valid_override_wins(self, monkeypatch):
-        from cron import scheduler
+        from cron import scheduler_script
 
         monkeypatch.setenv("HERMES_CRON_SCRIPT_TIMEOUT", "300")
-        assert scheduler._get_script_timeout(2400) == 2400
+        assert scheduler_script._get_script_timeout(override=2400) == 2400
 
     def test_string_override_accepted(self):
-        from cron import scheduler
+        from cron import scheduler_script
 
-        assert scheduler._get_script_timeout("1800") == 1800
+        assert scheduler_script._get_script_timeout(override="1800") == 1800
 
     def test_invalid_override_falls_through(self, monkeypatch):
-        from cron import scheduler
+        from cron import scheduler_script
 
         monkeypatch.delenv("HERMES_CRON_SCRIPT_TIMEOUT", raising=False)
-        default = scheduler._get_script_timeout()
-        assert scheduler._get_script_timeout("not-a-number") == default
+        default = scheduler_script._get_script_timeout()
+        assert scheduler_script._get_script_timeout(override="not-a-number") == default
 
     def test_nonpositive_override_falls_through(self, monkeypatch):
-        from cron import scheduler
+        from cron import scheduler_script
 
         monkeypatch.delenv("HERMES_CRON_SCRIPT_TIMEOUT", raising=False)
-        default = scheduler._get_script_timeout()
-        assert scheduler._get_script_timeout(0) == default
-        assert scheduler._get_script_timeout(-5) == default
+        default = scheduler_script._get_script_timeout()
+        assert scheduler_script._get_script_timeout(override=0) == default
+        assert scheduler_script._get_script_timeout(override=-5) == default
 
     def test_none_override_preserves_existing_chain(self, monkeypatch):
-        from cron import scheduler
+        from cron import scheduler_script
 
         monkeypatch.setenv("HERMES_CRON_SCRIPT_TIMEOUT", "777")
-        assert scheduler._get_script_timeout(None) == 777
+        assert scheduler_script._get_script_timeout(override=None) == 777
 
 
 class TestRunJobScriptTimeoutOverride:
@@ -72,7 +72,7 @@ class TestRunJobScriptTimeoutOverride:
         """Real signal delivery required: subprocess.run kills the child on
         timeout, and the conftest live-system guard would otherwise block
         that kill and mask the TimeoutExpired path under test."""
-        from cron.scheduler import _run_job_script
+        from cron.scheduler_script import _run_job_script
 
         script = cron_env / "scripts" / "sleepy.py"
         script.write_text(
@@ -90,7 +90,7 @@ class TestRunJobScriptTimeoutOverride:
         assert "timed out after 1s" in output
 
     def test_override_allows_completion_within_budget(self, cron_env):
-        from cron.scheduler import _run_job_script
+        from cron.scheduler_script import _run_job_script
 
         script = cron_env / "scripts" / "quick.py"
         script.write_text('print("quick ok")\n')

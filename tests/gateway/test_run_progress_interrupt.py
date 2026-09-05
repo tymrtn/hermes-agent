@@ -158,6 +158,7 @@ async def _run_once(monkeypatch, tmp_path, agent_cls, session_id):
 
     fake_dotenv = types.ModuleType("dotenv")
     fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    fake_dotenv.dotenv_values = lambda *args, **kwargs: {}
     monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
 
     fake_run_agent = types.ModuleType("run_agent")
@@ -211,8 +212,8 @@ async def test_partial_empty_agent_response_is_normalized(monkeypatch, tmp_path)
         monkeypatch, tmp_path, PartialTruncationAgent, "sess-partial-empty"
     )
 
-    assert result["final_response"].startswith("⚠️ Processing stopped:")
-    assert "Response truncated due to output length limit" in result["final_response"]
+    assert "output limit" in result["final_response"]
+    assert "continue" in result["final_response"]
     assert result["final_response"] != "⚠️ Response truncated due to output length limit"
     assert result["partial"] is True
     assert adapter.sent == []

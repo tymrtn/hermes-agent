@@ -286,3 +286,18 @@ def test_combined_prompt_boundaries_with_hot_memory(monkeypatch, tmp_path):
                                          entry.wake_packet_text]))
     assert len(combined) - len(without_wake) <= 1600 + len("\n\n")
     assert "100% — 10,000/2,200 chars" in memory_block_before  # unchanged accounting
+
+
+@pytest.fixture(autouse=True)
+def stable_wake_clock(monkeypatch):
+    # Project freshness is meaningful; lifecycle fixtures must not age with wall time.
+    from datetime import datetime as real_datetime
+    import gateway.continuity_wake as wake
+
+    class FixtureClock(real_datetime):
+        @classmethod
+        def now(cls, tz=None):
+            fixed = real_datetime.fromisoformat(NOW_ISO)
+            return fixed.astimezone(tz) if tz else fixed.replace(tzinfo=None)
+
+    monkeypatch.setattr(wake, "datetime", FixtureClock)

@@ -15,6 +15,8 @@ would otherwise never see.
 
 from __future__ import annotations
 
+import hermes_cli.kanban_db_connect as _reconciled_hermes_cli_kanban_db_connect
+import hermes_cli.kanban_db_dispatch as _reconciled_hermes_cli_kanban_db_dispatch
 import argparse
 import json
 import threading
@@ -47,9 +49,9 @@ def captured_dispatch(monkeypatch):
 
     def fake_dispatch_once(_conn, **kwargs):
         calls.append(kwargs)
-        return kb.DispatchResult()
+        return _reconciled_hermes_cli_kanban_db_dispatch.DispatchResult()
 
-    monkeypatch.setattr(kb, "dispatch_once", fake_dispatch_once)
+    monkeypatch.setattr(_reconciled_hermes_cli_kanban_db_dispatch, "dispatch_once", fake_dispatch_once)
     return calls
 
 
@@ -61,7 +63,7 @@ ALL_BOARDS = {"default", "board-a", "board-b", "board-c"}
 
 
 def _create_tasks(board: str, assignee: str, count: int, *, priority: int = 0):
-    with kb.connect_closing(board=board) as conn:
+    with _reconciled_hermes_cli_kanban_db_connect.connect_closing(board=board) as conn:
         return [
             kb.create_task(
                 conn,
@@ -74,7 +76,7 @@ def _create_tasks(board: str, assignee: str, count: int, *, priority: int = 0):
 
 
 def _mark_running(board: str, task_ids: list[str]) -> None:
-    with kb.connect_closing(board=board) as conn:
+    with _reconciled_hermes_cli_kanban_db_connect.connect_closing(board=board) as conn:
         for task_id in task_ids:
             conn.execute(
                 "UPDATE tasks SET status = 'running' WHERE id = ?", (task_id,)
@@ -121,9 +123,9 @@ def test_dashboard_dispatch_nudge_falls_back_to_conservative_defaults(
     plugin_api.dispatch(dry_run=True, max_n=8, board="board-a")
 
     (kwargs,) = captured_dispatch
-    assert kwargs["max_in_progress"] == kb.DEFAULT_MAX_IN_PROGRESS
+    assert kwargs["max_in_progress"] == _reconciled_hermes_cli_kanban_db_dispatch.DEFAULT_MAX_IN_PROGRESS
     assert kwargs["max_in_progress_per_profile"] == (
-        kb.DEFAULT_MAX_IN_PROGRESS_PER_PROFILE
+        _reconciled_hermes_cli_kanban_db_dispatch.DEFAULT_MAX_IN_PROGRESS_PER_PROFILE
     )
     assert kwargs["admission_boards"]
 
@@ -170,7 +172,7 @@ def test_run_daemon_applies_configured_caps_and_scope(
     )
     stop_event = threading.Event()
 
-    kb.run_daemon(
+    _reconciled_hermes_cli_kanban_db_dispatch.run_daemon(
         interval=0.01,
         stop_event=stop_event,
         on_tick=lambda _res: stop_event.set(),
@@ -199,7 +201,7 @@ def test_run_daemon_counts_boards_created_after_it_started(
         else:
             stop_event.set()
 
-    kb.run_daemon(interval=0.01, stop_event=stop_event, on_tick=_on_tick)
+    _reconciled_hermes_cli_kanban_db_dispatch.run_daemon(interval=0.01, stop_event=stop_event, on_tick=_on_tick)
 
     assert len(captured_dispatch) >= 2
     assert "board-late" not in captured_dispatch[0]["admission_boards"]
@@ -252,7 +254,7 @@ def test_cli_dispatch_without_configured_scope_still_counts_every_board(
     (kwargs,) = captured_dispatch
     assert set(kwargs["admission_boards"]) == ALL_BOARDS
     # Selection is still the profile's own lane — the two scopes differ.
-    assert len(kb.resolve_board_scope({})) == 1
+    assert len(_reconciled_hermes_cli_kanban_db_dispatch.resolve_board_scope({})) == 1
 
 
 def test_cli_dispatch_counts_a_configured_board_missing_from_disk(
@@ -376,7 +378,7 @@ def test_cli_human_output_warns_about_boards_left_out_of_the_count(
 )
 def test_resolve_default_assignee_normalizes_whatever_was_configured(raw, expected):
     """Only a non-empty string is a profile name; the rest read as unset."""
-    assert kb.resolve_default_assignee({"default_assignee": raw}) == expected
+    assert _reconciled_hermes_cli_kanban_db_dispatch.resolve_default_assignee({"default_assignee": raw}) == expected
 
 
 def test_cli_dispatch_survives_a_non_string_default_assignee(

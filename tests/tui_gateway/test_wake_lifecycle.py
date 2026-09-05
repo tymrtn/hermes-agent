@@ -65,7 +65,7 @@ def make_session(**overrides) -> dict:
 
 
 def test_first_prompt_binds_with_message_evidence(tmp_path, monkeypatch):
-    from tui_gateway.server import _attach_wake_for_prompt
+    from tui_gateway.continuity import _attach_wake_for_prompt
     seed_store()
     db = make_db(tmp_path, monkeypatch)
     session = make_session()
@@ -93,7 +93,7 @@ def test_first_prompt_binds_with_message_evidence(tmp_path, monkeypatch):
 
 
 def test_no_binding_without_pending_marker(tmp_path, monkeypatch):
-    from tui_gateway.server import _attach_wake_for_prompt
+    from tui_gateway.continuity import _attach_wake_for_prompt
     seed_store()
     db = make_db(tmp_path, monkeypatch)
     session = make_session()
@@ -105,7 +105,7 @@ def test_no_binding_without_pending_marker(tmp_path, monkeypatch):
 
 
 def test_resumed_session_reattaches_original_binding(tmp_path, monkeypatch):
-    from tui_gateway.server import _attach_wake_for_prompt
+    from tui_gateway.continuity import _attach_wake_for_prompt
     seed_store()  # a store exists, but the resumed session must NOT rebuild
     db = make_db(tmp_path, monkeypatch)
     import hashlib
@@ -130,8 +130,8 @@ def test_titled_zero_message_row_binds_after_restart(tmp_path, monkeypatch):
     with the row keeps it bind-eligible: the first real prompt after the
     restart binds exactly once, with that message as evidence."""
     from gateway.continuity_wake import wake_state_from_json
-    from tui_gateway.server import (_attach_wake_for_prompt,
-                                    _ensure_session_db_row)
+    from tui_gateway.continuity import _attach_wake_for_prompt
+    from tui_gateway.server import _ensure_session_db_row
     seed_store(tmp_path)
     db = make_db(tmp_path, monkeypatch)
     draft = make_session(profile_home=str(tmp_path))
@@ -166,8 +166,8 @@ def test_history_bearing_resumed_row_never_becomes_eligible(tmp_path,
     """A row with real history and no durable wake state stays packetless
     across restart/resume: neither the resumed prompt path nor the row
     re-persist on prompt.submit may mark it pending or bind it."""
-    from tui_gateway.server import (_attach_wake_for_prompt,
-                                    _ensure_session_db_row)
+    from tui_gateway.continuity import _attach_wake_for_prompt
+    from tui_gateway.server import _ensure_session_db_row
     seed_store(tmp_path)  # a rebuild WOULD produce a packet if allowed
     db = make_db(tmp_path, monkeypatch)
     db.create_session(session_id="legacy-0001", source="tui")
@@ -220,8 +220,8 @@ def test_seeded_string_history_session_is_never_rearmed(tmp_path, monkeypatch):
     """session.create with seeded string history: the verdict is not-new at
     the source of truth, the deferred build never re-widens it, the row
     persist writes NO pending sentinel, and the first prompt never binds."""
-    from tui_gateway.server import (_arm_deferred_wake, _attach_wake_for_prompt,
-                                    _ensure_session_db_row)
+    from tui_gateway.continuity import _arm_deferred_wake, _attach_wake_for_prompt
+    from tui_gateway.server import _ensure_session_db_row
     seed_store()  # a bind WOULD produce a packet if allowed
     db = make_db(tmp_path, monkeypatch)
     session = create_session_rpc(monkeypatch, db,
@@ -247,8 +247,8 @@ def test_seeded_multimodal_history_session_is_never_rearmed(tmp_path,
     """Multimodal seed entries (list-of-parts content, including image-only)
     coerce to no displayable text — the verdict must key off the PRESENCE of
     the entries, not the truthiness of their coerced text."""
-    from tui_gateway.server import (_arm_deferred_wake, _attach_wake_for_prompt,
-                                    _ensure_session_db_row)
+    from tui_gateway.continuity import _arm_deferred_wake, _attach_wake_for_prompt
+    from tui_gateway.server import _ensure_session_db_row
     seed_store()
     db = make_db(tmp_path, monkeypatch)
     session = create_session_rpc(monkeypatch, db,
@@ -280,8 +280,8 @@ def test_empty_history_session_create_stays_eligible(tmp_path, monkeypatch,
     or absent messages — is still wake-new: the row persist writes the pending
     sentinel and the first prompt binds with message evidence."""
     from gateway.continuity_wake import wake_state_from_json
-    from tui_gateway.server import (_arm_deferred_wake, _attach_wake_for_prompt,
-                                    _ensure_session_db_row)
+    from tui_gateway.continuity import _arm_deferred_wake, _attach_wake_for_prompt
+    from tui_gateway.server import _ensure_session_db_row
     seed_store()
     db = make_db(tmp_path, monkeypatch)
     session = create_session_rpc(monkeypatch, db, params)
@@ -309,8 +309,8 @@ def test_zero_message_titled_rpc_session_binds_after_restart(tmp_path,
     session.create: zero-message draft → titled row (pending sentinel) →
     restart-resume classified not-new → first real prompt binds once."""
     from gateway.continuity_wake import wake_state_from_json
-    from tui_gateway.server import (_arm_deferred_wake, _attach_wake_for_prompt,
-                                    _ensure_session_db_row)
+    from tui_gateway.continuity import _arm_deferred_wake, _attach_wake_for_prompt
+    from tui_gateway.server import _ensure_session_db_row
     seed_store()
     db = make_db(tmp_path, monkeypatch)
     draft = create_session_rpc(monkeypatch, db)
@@ -336,8 +336,8 @@ def test_seeded_session_restart_remains_ineligible(tmp_path, monkeypatch):
     """A seeded session whose row was persisted pre-prompt (no sentinel)
     stays packetless after a restart-resume: nothing on the resumed path
     may mark it pending or bind it."""
-    from tui_gateway.server import (_arm_deferred_wake, _attach_wake_for_prompt,
-                                    _ensure_session_db_row)
+    from tui_gateway.continuity import _arm_deferred_wake, _attach_wake_for_prompt
+    from tui_gateway.server import _ensure_session_db_row
     seed_store()
     db = make_db(tmp_path, monkeypatch)
     session = create_session_rpc(monkeypatch, db,
@@ -377,12 +377,12 @@ def test_seed_presence_is_row_based(messages):
     """The seededness contract is row PRESENCE: any entry in a seeded
     messages list — a supported role row regardless of content, or an
     unsupported/malformed entry (fail closed) — is history."""
-    from tui_gateway.server import _seed_history_present
+    from tui_gateway.continuity import _seed_history_present
     assert _seed_history_present(messages) is True
 
 
 def test_seed_presence_only_absent_or_empty_is_eligible():
-    from tui_gateway.server import _seed_history_present
+    from tui_gateway.continuity import _seed_history_present
     assert _seed_history_present(None) is False
     assert _seed_history_present([]) is False
     # A non-list messages param is malformed, never a zero-message draft.
@@ -397,8 +397,8 @@ def test_empty_content_seed_rows_never_rearm(tmp_path, monkeypatch, messages):
     history-bearing: verdict not-new at create, no pending sentinel on row
     persist, no bind at the first prompt, and still ineligible after a
     restart-resume."""
-    from tui_gateway.server import (_arm_deferred_wake, _attach_wake_for_prompt,
-                                    _ensure_session_db_row)
+    from tui_gateway.continuity import _arm_deferred_wake, _attach_wake_for_prompt
+    from tui_gateway.server import _ensure_session_db_row
     seed_store()  # a bind WOULD produce a packet if allowed
     db = make_db(tmp_path, monkeypatch)
     session = create_session_rpc(monkeypatch, db, {"messages": messages})
@@ -430,7 +430,7 @@ def test_empty_content_seed_rows_never_rearm(tmp_path, monkeypatch, messages):
 
 
 def test_personality_and_prompt_preserve_wake(tmp_path, monkeypatch):
-    from tui_gateway.server import _compose_ephemeral_prompt
+    from tui_gateway.continuity import _compose_ephemeral_prompt
     db = make_db(tmp_path, monkeypatch)
     agent = FakeAgent(db)
     agent._wake_packet_text = "[Continuity wake packet — test]"
@@ -532,8 +532,8 @@ def test_blocked_context_reference_prompt_never_consumes_wake(tmp_path,
 
 def test_failed_attempt_never_retries_after_model_bound_turn(tmp_path, monkeypatch):
     """A failed wake read must not mutate prompt bytes on a later turn."""
-    from tui_gateway.server import (_attach_wake_for_prompt,
-                                    _ensure_session_db_row)
+    from tui_gateway.continuity import _attach_wake_for_prompt
+    from tui_gateway.server import _ensure_session_db_row
     seed_store()
     db = make_db(tmp_path, monkeypatch)
     session = make_session()
@@ -560,7 +560,7 @@ def test_history_bearing_pending_record_settles_without_late_binding(tmp_path,
                                                                      monkeypatch):
     """A restart after an unavailable first turn must not bind into history."""
     from gateway.continuity_wake import wake_state_from_json
-    from tui_gateway.server import _attach_wake_for_prompt
+    from tui_gateway.continuity import _attach_wake_for_prompt
     seed_store()
     db = make_db(tmp_path, monkeypatch)
     session = make_session(history=[{"role": "user", "content": "old"}],
@@ -684,3 +684,18 @@ def test_deep_session_create_branch_chain_keeps_binding(tmp_path,
     assert db.get_session_wake_packet(prev) == raw
     state, binding = load_wake_state_for_session(db, prev)
     assert state == "bound" and binding["text"] == "deep chain packet"
+
+
+@pytest.fixture(autouse=True)
+def stable_wake_clock(monkeypatch):
+    # Project freshness is meaningful; lifecycle fixtures must not age with wall time.
+    from datetime import datetime as real_datetime
+    import gateway.continuity_wake as wake
+
+    class FixtureClock(real_datetime):
+        @classmethod
+        def now(cls, tz=None):
+            fixed = real_datetime.fromisoformat(NOW_ISO)
+            return fixed.astimezone(tz) if tz else fixed.replace(tzinfo=None)
+
+    monkeypatch.setattr(wake, "datetime", FixtureClock)

@@ -1,31 +1,27 @@
-"""Regression tests for #62034 and its 2026-07-29 live follow-on.
+"""Regression tests for #62034 — pending multi-choice clarify prompts must not
+swallow unrelated thread follow-up messages.
 
 When a NATIVE interactive multi-choice clarify (buttons rendered,
-``awaiting_text=False``) is pending, the gateway text-intercept must NOT
-consume arbitrary prose as the clarify answer (#62034). But it also must not
-leave that prose stranded: the agent worker thread is blocked on the clarify's
-``threading.Event`` (up to the 1h clarify timeout), so simply falling through
-queues the prose *behind* the blocked turn and it never runs until the clarify
-resolves — the live regression observed on Telegram 2026-07-29.
+``awaiting_text=False``) is pending, the gateway text-intercept used to
+consume ANY non-command message in the session as the clarify answer —
+arbitrary prose vanished into clarify resolution and the agent appeared to
+ignore the user's thread messages.
 
-Correct behavior for arbitrary prose during a native button/choice clarify:
+After the fix (``tools/clarify_gateway._coerce_text_response`` rejects
+arbitrary prose for native multi-choice prompts):
 
-  * numeric selections ("2") and exact choice labels still resolve it, and
-  * arbitrary prose SUPERSEDES the pending clarify — the waiting agent thread
-    unblocks with the established empty/no-response sentinel — and the prose
-    then enters the normal busy-session path exactly once (queued/steered/
-    interrupted), never waiting behind the clarify.
+  * numeric selections ("2") and exact choice labels still resolve, and
+  * arbitrary prose falls through the intercept and continues as a normal
+    message-handling turn.
 
 Open-ended clarifies, explicit "Other" text-capture mode, and the base
 adapter's numbered-text fallback (which flips ``awaiting_text`` at send time)
-keep accepting free text as the answer.
-
-Authorization is enforced before a clarify can be superseded: an unauthorized
-sender's prose cannot cancel the pending clarify.
+keep accepting free text.
 """
 
 import threading
 import time
+
 from unittest.mock import patch
 
 import pytest
@@ -62,19 +58,6 @@ class _StubAdapter(BasePlatformAdapter):
 
 class _FellThroughIntercept(Exception):
     """Sentinel: _handle_message got PAST the clarify text-intercept."""
-
-
-class _StubAgent:
-    """A running agent with recent activity so the staleness sweep in
-    _handle_message does not evict it before the busy path runs."""
-
-    def get_activity_summary(self):
-        return {
-            "seconds_since_activity": 0,
-            "api_call_count": 1,
-            "max_iterations": 60,
-            "current_tool": None,
-        }
 
 
 def _event(text, *, chat_type="dm", user_id="U1"):
@@ -114,19 +97,6 @@ def _make_runner(adapter):
     return runner
 
 
-def _make_busy_runner(adapter):
-    """A runner whose session is actively running an agent turn (busy),
-    configured for busy_input_mode=queue like the production gateway."""
-    runner = _make_runner(adapter)
-    runner._running_agents = {SESSION_KEY: _StubAgent()}
-    runner._running_agents_ts = {SESSION_KEY: time.time()}
-    runner._busy_input_mode = "queue"
-    runner._busy_text_mode = "queue"
-    runner._busy_ack_ts = {}
-    runner._draining = False
-    return runner
-
-
 async def _dispatch(runner, event):
     """Run _handle_message with a tripwire installed AFTER the clarify
     intercept (the slash-confirm pending lookup is the next statement), so a
@@ -141,12 +111,281 @@ async def _dispatch(runner, event):
         return await runner._handle_message(event)
 
 
-async def _dispatch_full(runner, event):
-    """Run _handle_message with only the plugin hook stubbed — used for the
-    supersede path, which must reach the busy handler rather than fall through
-    to the slash-confirm lookup."""
-    with patch("hermes_cli.plugins.invoke_hook", return_value=[]):
-        return await runner._handle_message(event)
+@pytest.mark.asyncio
+async def test_thread_prose_not_swallowed_by_native_multi_choice_clarify():
+    """Arbitrary prose during a pending button-clarify continues as a normal turn."""
+    _clear_clarify_state()
+    from tools import clarify_gateway as cm
+
+    adapter = _StubAdapter()
+    runner = _make_runner(adapter)
+    # Native interactive multi-choice prompt: awaiting_text stays False.
+    entry = cm.register("cl-native", SESSION_KEY, "Pick a UI variant", ["buttons", "dropdown"])
+    assert entry.awaiting_text is False
+
+    with pytest.raises(_FellThroughIntercept):
+        await _dispatch(runner, _event("just checking the visual UI, no need to pass any data"))
+
+    # The prose is not accepted as the answer, but the clarify must be
+    # released before normal busy routing so redirect-to-steer can drain.
+    with cm._lock:
+        entry = cm._entries.get("cl-native")
+    assert entry is not None
+    assert not entry.event.is_set()
+    assert entry.response is None
+    _clear_clarify_state()
+
+
+@pytest.mark.asyncio
+async def test_thread_prose_does_not_overwrite_concurrent_button_choice():
+    """A button result that wins the race remains the clarify response."""
+    _clear_clarify_state()
+    from tools import clarify_gateway as cm
+
+    adapter = _StubAdapter()
+    runner = _make_runner(adapter)
+    entry = cm.register(
+        "cl-button-race",
+        SESSION_KEY,
+        "Pick a UI variant",
+        ["buttons", "dropdown"],
+    )
+    assert cm.resolve_gateway_clarify("cl-button-race", "buttons") is True
+
+    with pytest.raises(_FellThroughIntercept):
+        await _dispatch(runner, _event("one more unrelated thought"))
+
+    assert entry.event.is_set()
+    assert entry.response == "buttons"
+    _clear_clarify_state()
+
+
+@pytest.mark.asyncio
+async def test_native_multi_select_out_of_range_keeps_clarify_pending():
+    """Out-of-range multi-select numbers must not cancel the pending prompt."""
+    _clear_clarify_state()
+    from tools import clarify_gateway as cm
+
+    adapter = _StubAdapter()
+    runner = _make_runner(adapter)
+    entry = cm.register(
+        "cl-ms-oor",
+        SESSION_KEY,
+        "Pick some targets",
+        ["staging", "prod", "canary"],
+        multi_select=True,
+    )
+    assert entry.awaiting_text is False
+
+    result = await _dispatch(runner, _event("99"))
+
+    assert result == ""
+    with cm._lock:
+        still = cm._entries.get("cl-ms-oor")
+    assert still is not None
+    assert not still.event.is_set()
+    assert still.response is None
+    _clear_clarify_state()
+
+
+@pytest.mark.asyncio
+async def test_native_multi_select_bad_comma_list_keeps_clarify_pending():
+    """Unrecognised comma-lists are retryable selection attempts, not prose."""
+    _clear_clarify_state()
+    from tools import clarify_gateway as cm
+
+    adapter = _StubAdapter()
+    runner = _make_runner(adapter)
+    entry = cm.register(
+        "cl-ms-bad",
+        SESSION_KEY,
+        "Pick some targets",
+        ["staging", "prod", "canary"],
+        multi_select=True,
+    )
+    assert entry.awaiting_text is False
+
+    result = await _dispatch(runner, _event("1,99"))
+
+    assert result == ""
+    with cm._lock:
+        still = cm._entries.get("cl-ms-bad")
+    assert still is not None
+    assert not still.event.is_set()
+    assert still.response is None
+    _clear_clarify_state()
+
+
+@pytest.mark.asyncio
+async def test_native_multi_select_prose_releases_clarify_before_routing():
+    """Free prose on multi-select still breaks the redirect/steer deadlock."""
+    _clear_clarify_state()
+    from tools import clarify_gateway as cm
+
+    adapter = _StubAdapter()
+    runner = _make_runner(adapter)
+    cm.register(
+        "cl-ms-prose",
+        SESSION_KEY,
+        "Pick some targets",
+        ["staging", "prod"],
+        multi_select=True,
+    )
+
+    with pytest.raises(_FellThroughIntercept):
+        await _dispatch(
+            runner,
+            _event("just checking the visual UI, no need to pass any data"),
+        )
+
+    with cm._lock:
+        entry = cm._entries.get("cl-ms-prose")
+    assert entry is not None
+    assert not entry.event.is_set()
+    assert entry.response is None
+    _clear_clarify_state()
+
+
+@pytest.mark.asyncio
+async def test_prose_still_accepted_after_other_flips_text_capture():
+    """After the user taps 'Other', free text IS the answer — must resolve."""
+    _clear_clarify_state()
+    from tools import clarify_gateway as cm
+
+    adapter = _StubAdapter()
+    runner = _make_runner(adapter)
+    cm.register("cl-other", SESSION_KEY, "Pick a UI variant", ["buttons", "dropdown"])
+    assert cm.mark_awaiting_text("cl-other") is True
+
+    result = await _dispatch(runner, _event("a carousel actually"))
+
+    assert result == ""
+    with cm._lock:
+        entry = cm._entries.get("cl-other")
+    assert entry is not None
+    assert entry.event.is_set()
+    assert entry.response == "a carousel actually"
+    _clear_clarify_state()
+
+
+
+@pytest.mark.asyncio
+async def test_draining_gateway_does_not_prequeue_or_claim_clarify_prose():
+    _clear_clarify_state()
+    from tools import clarify_gateway as cm
+
+    adapter = _StubAdapter()
+    adapter._pending_messages = {}
+    runner = _make_busy_runner(adapter)
+    runner._draining = True
+    entry = cm.register("cl-drain", SESSION_KEY, "Pick", ["A", "B"])
+
+    with pytest.raises(_FellThroughIntercept):
+        await _dispatch(runner, _event("new request during restart"))
+
+    assert adapter._pending_messages == {}
+    assert entry.superseding is False
+    assert not entry.event.is_set()
+    _clear_clarify_state()
+
+
+
+@pytest.mark.asyncio
+async def test_internal_event_queues_without_superseding_or_interrupting_clarify():
+    """Synthetic completions cascade silently while the user prompt stays pending."""
+    _clear_clarify_state()
+    from tools import clarify_gateway as cm
+
+    adapter = _StubAdapter()
+    adapter._pending_messages = {}
+    runner = _make_busy_runner(adapter)
+    cm.register("cl-internal", SESSION_KEY, "Pick a UI variant", ["buttons", "dropdown"])
+
+    event = _event("Background process completed")
+    event.internal = True
+    result = await _dispatch_full(runner, event)
+
+    assert result is None
+    with cm._lock:
+        entry = cm._entries.get("cl-internal")
+    assert entry is not None
+    assert not entry.event.is_set()
+    # The completion is preserved as a cascading next turn, not discarded.
+    assert list(adapter._pending_messages) == [SESSION_KEY]
+    _clear_clarify_state()
+
+
+
+@pytest.mark.asyncio
+async def test_invalid_numeric_selection_keeps_native_choice_clarify_pending():
+    """A mistyped/out-of-range numbered selection ("3" for a 2-choice prompt)
+    is a selection attempt, not prose: keep the clarify pending for retry —
+    do NOT supersede it and do NOT queue the reply as a turn."""
+    _clear_clarify_state()
+    from tools import clarify_gateway as cm
+
+    adapter = _StubAdapter()
+    adapter._pending_messages = {}
+    runner = _make_busy_runner(adapter)
+
+    cm.register("cl-oob", SESSION_KEY, "Pick a UI variant", ["buttons", "dropdown"])
+
+    result = await _dispatch_full(runner, _event("3"))
+
+    # Intercepted silently; the buttons stay visible for a valid retry.
+    assert result == ""
+    # The clarify is still pending and its waiter was NOT released.
+    with cm._lock:
+        entry = cm._entries.get("cl-oob")
+    assert entry is not None
+    assert not entry.event.is_set()
+    # The invalid selection was not queued as a follow-up turn.
+    assert adapter._pending_messages == {}
+
+    # A subsequent valid selection still resolves the same pending clarify.
+    result2 = await _dispatch_full(runner, _event("1"))
+    assert result2 == ""
+    with cm._lock:
+        entry = cm._entries.get("cl-oob")
+    assert entry is not None
+    assert entry.event.is_set()
+    assert entry.response == "buttons"
+    _clear_clarify_state()
+
+
+
+@pytest.mark.asyncio
+async def test_prose_does_not_clobber_button_resolved_clarify(monkeypatch):
+    """Race: a button tap resolved the clarify (event+response set) but the
+    waiter has not cleaned it up when a prose follow-up arrives. The supersede
+    must NOT overwrite the real button answer with the empty sentinel."""
+    _clear_clarify_state()
+    from tools import clarify_gateway as cm
+
+    monkeypatch.setenv("HERMES_GATEWAY_BUSY_ACK_ENABLED", "false")
+
+    adapter = _StubAdapter()
+    adapter._pending_messages = {}
+    runner = _make_busy_runner(adapter)
+
+    cm.register("cl-race", SESSION_KEY, "Pick a UI variant", ["buttons", "dropdown"])
+    # Button tap resolves the entry; no waiter has run cleanup yet, so it is
+    # still listed in the session index.
+    assert cm.resolve_gateway_clarify("cl-race", "buttons") is True
+
+    result = await _dispatch_full(runner, _event("actually never mind, different topic"))
+
+    assert result is None
+    # The real button answer must be preserved, not clobbered with "".
+    with cm._lock:
+        entry = cm._entries.get("cl-race")
+    assert entry is not None
+    assert entry.event.is_set()
+    assert entry.response == "buttons"
+    # The prose still lands as a follow-up turn.
+    assert list(adapter._pending_messages.keys()) == [SESSION_KEY]
+    _clear_clarify_state()
+
 
 
 @pytest.mark.asyncio
@@ -220,74 +459,26 @@ async def test_prose_supersedes_native_choice_clarify_and_queues_once(monkeypatc
     _clear_clarify_state()
 
 
-@pytest.mark.asyncio
-async def test_prose_does_not_clobber_button_resolved_clarify(monkeypatch):
-    """Race: a button tap resolved the clarify (event+response set) but the
-    waiter has not cleaned it up when a prose follow-up arrives. The supersede
-    must NOT overwrite the real button answer with the empty sentinel."""
-    _clear_clarify_state()
-    from tools import clarify_gateway as cm
-
-    monkeypatch.setenv("HERMES_GATEWAY_BUSY_ACK_ENABLED", "false")
-
-    adapter = _StubAdapter()
-    adapter._pending_messages = {}
-    runner = _make_busy_runner(adapter)
-
-    cm.register("cl-race", SESSION_KEY, "Pick a UI variant", ["buttons", "dropdown"])
-    # Button tap resolves the entry; no waiter has run cleanup yet, so it is
-    # still listed in the session index.
-    assert cm.resolve_gateway_clarify("cl-race", "buttons") is True
-
-    result = await _dispatch_full(runner, _event("actually never mind, different topic"))
-
-    assert result is None
-    # The real button answer must be preserved, not clobbered with "".
-    with cm._lock:
-        entry = cm._entries.get("cl-race")
-    assert entry is not None
-    assert entry.event.is_set()
-    assert entry.response == "buttons"
-    # The prose still lands as a follow-up turn.
-    assert list(adapter._pending_messages.keys()) == [SESSION_KEY]
-    _clear_clarify_state()
-
 
 @pytest.mark.asyncio
-async def test_invalid_numeric_selection_keeps_native_choice_clarify_pending():
-    """A mistyped/out-of-range numbered selection ("3" for a 2-choice prompt)
-    is a selection attempt, not prose: keep the clarify pending for retry —
-    do NOT supersede it and do NOT queue the reply as a turn."""
+async def test_queue_rejection_leaves_clarify_pending_and_reports_retry(monkeypatch):
     _clear_clarify_state()
     from tools import clarify_gateway as cm
 
     adapter = _StubAdapter()
     adapter._pending_messages = {}
     runner = _make_busy_runner(adapter)
+    entry = cm.register("cl-full", SESSION_KEY, "Pick", ["A", "B"])
 
-    cm.register("cl-oob", SESSION_KEY, "Pick a UI variant", ["buttons", "dropdown"])
+    monkeypatch.setattr(runner, "_queue_or_replace_pending_event", lambda *_: False)
+    result = await _dispatch_full(runner, _event("new unrelated request"))
 
-    result = await _dispatch_full(runner, _event("3"))
-
-    # Intercepted silently; the buttons stay visible for a valid retry.
-    assert result == ""
-    # The clarify is still pending and its waiter was NOT released.
-    with cm._lock:
-        entry = cm._entries.get("cl-oob")
-    assert entry is not None
+    assert "Queue is full" in result
     assert not entry.event.is_set()
-    # The invalid selection was not queued as a follow-up turn.
-    assert adapter._pending_messages == {}
-
-    # A subsequent valid selection still resolves the same pending clarify.
-    result2 = await _dispatch_full(runner, _event("1"))
-    assert result2 == ""
-    with cm._lock:
-        entry = cm._entries.get("cl-oob")
-    assert entry is not None
-    assert entry.event.is_set()
-    assert entry.response == "buttons"
+    assert entry.superseding is False
+    assert cm.get_pending_for_session(SESSION_KEY, include_choice_prompts=True) is entry
     _clear_clarify_state()
+
 
 
 @pytest.mark.asyncio
@@ -320,90 +511,39 @@ async def test_unauthorized_prose_cannot_supersede_pending_clarify():
     _clear_clarify_state()
 
 
-@pytest.mark.asyncio
-async def test_internal_event_queues_without_superseding_or_interrupting_clarify():
-    """Synthetic completions cascade silently while the user prompt stays pending."""
-    _clear_clarify_state()
-    from tools import clarify_gateway as cm
 
-    adapter = _StubAdapter()
-    adapter._pending_messages = {}
-    runner = _make_busy_runner(adapter)
-    cm.register("cl-internal", SESSION_KEY, "Pick a UI variant", ["buttons", "dropdown"])
-
-    event = _event("Background process completed")
-    event.internal = True
-    result = await _dispatch_full(runner, event)
-
-    assert result is None
-    with cm._lock:
-        entry = cm._entries.get("cl-internal")
-    assert entry is not None
-    assert not entry.event.is_set()
-    # The completion is preserved as a cascading next turn, not discarded.
-    assert list(adapter._pending_messages) == [SESSION_KEY]
-    _clear_clarify_state()
+async def _dispatch_full(runner, event):
+    """Run _handle_message with only the plugin hook stubbed — used for the
+    supersede path, which must reach the busy handler rather than fall through
+    to the slash-confirm lookup."""
+    with patch("hermes_cli.plugins.invoke_hook", return_value=[]):
+        return await runner._handle_message(event)
 
 
-@pytest.mark.asyncio
-async def test_queue_rejection_leaves_clarify_pending_and_reports_retry(monkeypatch):
-    _clear_clarify_state()
-    from tools import clarify_gateway as cm
 
-    adapter = _StubAdapter()
-    adapter._pending_messages = {}
-    runner = _make_busy_runner(adapter)
-    entry = cm.register("cl-full", SESSION_KEY, "Pick", ["A", "B"])
+class _StubAgent:
+    """A running agent with recent activity so the staleness sweep in
+    _handle_message does not evict it before the busy path runs."""
 
-    monkeypatch.setattr(runner, "_queue_or_replace_pending_event", lambda *_: False)
-    result = await _dispatch_full(runner, _event("new unrelated request"))
-
-    assert "Queue is full" in result
-    assert not entry.event.is_set()
-    assert entry.superseding is False
-    assert cm.get_pending_for_session(SESSION_KEY, include_choice_prompts=True) is entry
-    _clear_clarify_state()
+    def get_activity_summary(self):
+        return {
+            "seconds_since_activity": 0,
+            "api_call_count": 1,
+            "max_iterations": 60,
+            "current_tool": None,
+        }
 
 
-@pytest.mark.asyncio
-async def test_draining_gateway_does_not_prequeue_or_claim_clarify_prose():
-    _clear_clarify_state()
-    from tools import clarify_gateway as cm
 
-    adapter = _StubAdapter()
-    adapter._pending_messages = {}
-    runner = _make_busy_runner(adapter)
-    runner._draining = True
-    entry = cm.register("cl-drain", SESSION_KEY, "Pick", ["A", "B"])
-
-    with pytest.raises(_FellThroughIntercept):
-        await _dispatch(runner, _event("new request during restart"))
-
-    assert adapter._pending_messages == {}
-    assert entry.superseding is False
-    assert not entry.event.is_set()
-    _clear_clarify_state()
-
-
-@pytest.mark.asyncio
-async def test_prose_still_accepted_after_other_flips_text_capture():
-    """After the user taps 'Other', free text IS the answer — must resolve."""
-    _clear_clarify_state()
-    from tools import clarify_gateway as cm
-
-    adapter = _StubAdapter()
+def _make_busy_runner(adapter):
+    """A runner whose session is actively running an agent turn (busy),
+    configured for busy_input_mode=queue like the production gateway."""
     runner = _make_runner(adapter)
-    cm.register("cl-other", SESSION_KEY, "Pick a UI variant", ["buttons", "dropdown"])
-    assert cm.mark_awaiting_text("cl-other") is True
-
-    result = await _dispatch(runner, _event("a carousel actually"))
-
-    assert result == ""
-    with cm._lock:
-        entry = cm._entries.get("cl-other")
-    assert entry is not None
-    assert entry.event.is_set()
-    assert entry.response == "a carousel actually"
-    _clear_clarify_state()
-
+    runner._running_agents = {SESSION_KEY: _StubAgent()}
+    runner._running_agents_ts = {SESSION_KEY: time.time()}
+    runner._busy_input_mode = "queue"
+    runner._busy_text_mode = "queue"
+    runner._busy_ack_ts = {}
+    runner._draining = False
+    return runner
 

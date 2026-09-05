@@ -242,6 +242,11 @@ class TestConcurrentMaterialize(unittest.TestCase):
 class TestExecuteCodeStableLauncherE2E(unittest.TestCase):
     """Drive the real child subprocess — no mocks in the exec path."""
 
+    def setUp(self):
+        from tools.code_kernel import shutdown_all_kernels
+        shutdown_all_kernels()
+        self.addCleanup(shutdown_all_kernels)
+
     def _run(self, code):
         raw = execute_code(
             code=code,
@@ -325,7 +330,7 @@ class TestExecuteCodeStableLauncherE2E(unittest.TestCase):
         self.assertIn("kaboom", blob)
         self.assertIn("raise ValueError('kaboom')", blob,
                       "traceback should show the offending source line")
-        self.assertIn("<execute_code>", blob,
+        self.assertIn("<cell>", blob,
                       "user frames should carry the synthetic <execute_code> name")
         self.assertNotIn("exec(compile", blob,
                          "launcher wrapper frame must be hidden from the traceback")

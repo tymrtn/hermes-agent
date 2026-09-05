@@ -248,7 +248,7 @@ def block_current_worker_task(
     try:
         from hermes_cli import kanban_db as kb
 
-        conn = kb.connect()
+        conn = _reconciled_hermes_cli_kanban_db_connect.connect()
         task = kb.get_task(conn, task_id)
         if task is None:
             logger.warning("kanban finalize: task %s not found on this board", task_id)
@@ -346,3 +346,5 @@ __all__ = [
     "build_handoff_reason",
     "reconcile_terminal_state",
 ]
+
+import hermes_cli.kanban_db_connect as _reconciled_hermes_cli_kanban_db_connect

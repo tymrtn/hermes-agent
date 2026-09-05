@@ -10,6 +10,7 @@ All tests drive the real ``hermes_cli.kanban_db`` against a per-test board.
 
 from __future__ import annotations
 
+import hermes_cli.kanban_db_connect as _reconciled_hermes_cli_kanban_db_connect
 from pathlib import Path
 
 import pytest
@@ -25,7 +26,7 @@ def kanban_home(tmp_path, monkeypatch):
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    kb.init_db()
+    _reconciled_hermes_cli_kanban_db_connect.init_db()
     return home
 
 
@@ -60,7 +61,7 @@ def test_clean_exit_blocks_current_run_with_final_response_evidence(
     kanban_home, monkeypatch
 ):
     """rc=0 + task still running → sticky block on THIS run, response kept."""
-    conn = kb.connect()
+    conn = _reconciled_hermes_cli_kanban_db_connect.connect()
     try:
         tid, run_id = _claim_running(conn)
         _as_worker(monkeypatch, tid, run_id)
@@ -90,7 +91,7 @@ def test_clean_exit_block_records_workspace_and_artifact_inventory(
     workspace.mkdir()
     (workspace / "report.md").write_text("SECRET BODY TEXT", encoding="utf-8")
 
-    conn = kb.connect()
+    conn = _reconciled_hermes_cli_kanban_db_connect.connect()
     try:
         tid, run_id = _claim_running(conn)
         _as_worker(monkeypatch, tid, run_id)
@@ -114,7 +115,7 @@ def test_failed_result_blocks_with_sanitized_failure_evidence(
     kanban_home, monkeypatch
 ):
     """A failed result blocks first, and the durable reason carries no secrets."""
-    conn = kb.connect()
+    conn = _reconciled_hermes_cli_kanban_db_connect.connect()
     try:
         tid, run_id = _claim_running(conn)
         _as_worker(monkeypatch, tid, run_id)
@@ -146,7 +147,7 @@ def test_redactor_failure_omits_evidence_instead_of_leaking_it(
     """Shutdown-time redactor failure must fail closed, never preserve input."""
     from agent import redact
 
-    conn = kb.connect()
+    conn = _reconciled_hermes_cli_kanban_db_connect.connect()
     try:
         tid, run_id = _claim_running(conn)
         _as_worker(monkeypatch, tid, run_id)
@@ -172,7 +173,7 @@ def test_rate_limited_result_is_left_to_the_dispatcher_sentinel(
     kanban_home, monkeypatch
 ):
     """Quota walls keep the EX_TEMPFAIL requeue path — never a sticky block."""
-    conn = kb.connect()
+    conn = _reconciled_hermes_cli_kanban_db_connect.connect()
     try:
         tid, run_id = _claim_running(conn)
         _as_worker(monkeypatch, tid, run_id)
@@ -192,7 +193,7 @@ def test_rate_limited_result_is_left_to_the_dispatcher_sentinel(
 # ---------------------------------------------------------------------------
 
 def test_stale_run_id_cannot_block_a_newer_run(kanban_home, monkeypatch):
-    conn = kb.connect()
+    conn = _reconciled_hermes_cli_kanban_db_connect.connect()
     try:
         tid, stale_run_id = _claim_running(conn)
         # Task is reclaimed and re-dispatched: a NEW run owns it now.
@@ -218,7 +219,7 @@ def test_missing_run_id_without_pid_ownership_does_not_block(
     kanban_home, monkeypatch
 ):
     """No run id and no pid proof → refuse to transition someone else's task."""
-    conn = kb.connect()
+    conn = _reconciled_hermes_cli_kanban_db_connect.connect()
     try:
         tid, _run_id = _claim_running(conn)
         _as_worker(monkeypatch, tid, None)
@@ -236,7 +237,7 @@ def test_missing_run_id_without_pid_ownership_does_not_block(
 # ---------------------------------------------------------------------------
 
 def test_reconciliation_is_a_noop_after_kanban_complete(kanban_home, monkeypatch):
-    conn = kb.connect()
+    conn = _reconciled_hermes_cli_kanban_db_connect.connect()
     try:
         tid, run_id = _claim_running(conn)
         assert kb.complete_task(conn, tid, summary="done properly") is True
@@ -253,7 +254,7 @@ def test_reconciliation_is_a_noop_after_kanban_complete(kanban_home, monkeypatch
 
 
 def test_reconciliation_is_a_noop_after_kanban_block(kanban_home, monkeypatch):
-    conn = kb.connect()
+    conn = _reconciled_hermes_cli_kanban_db_connect.connect()
     try:
         tid, run_id = _claim_running(conn)
         assert kb.block_task(
@@ -273,7 +274,7 @@ def test_reconciliation_is_a_noop_after_kanban_block(kanban_home, monkeypatch):
 
 
 def test_reconciliation_is_idempotent_when_called_twice(kanban_home, monkeypatch):
-    conn = kb.connect()
+    conn = _reconciled_hermes_cli_kanban_db_connect.connect()
     try:
         tid, run_id = _claim_running(conn)
         _as_worker(monkeypatch, tid, run_id)
@@ -304,7 +305,7 @@ def test_no_kanban_task_env_is_a_noop(kanban_home, monkeypatch):
 def test_delegated_child_context_never_reconciles(kanban_home, monkeypatch):
     from agent import delegation_context
 
-    conn = kb.connect()
+    conn = _reconciled_hermes_cli_kanban_db_connect.connect()
     try:
         tid, run_id = _claim_running(conn)
         _as_worker(monkeypatch, tid, run_id)
@@ -422,7 +423,7 @@ def test_goal_loop_hook_returns_its_decision_and_blocks_with_evidence(
     import cli as hermes_cli
 
     _patch_judge(monkeypatch, ["continue", "continue"])
-    conn = kb.connect()
+    conn = _reconciled_hermes_cli_kanban_db_connect.connect()
     try:
         tid = kb.create_task(
             conn, title="ship the report", body="with all three sections",
@@ -460,7 +461,7 @@ def test_cli_finalizer_blocks_a_clean_quiet_worker_exit(kanban_home, monkeypatch
 
     import cli as hermes_cli
 
-    conn = kb.connect()
+    conn = _reconciled_hermes_cli_kanban_db_connect.connect()
     try:
         tid, run_id = _claim_running(conn)
         _as_worker(monkeypatch, tid, run_id)
@@ -484,7 +485,7 @@ def test_cli_finalizer_blocks_a_failed_result_before_exit_1(kanban_home, monkeyp
 
     import cli as hermes_cli
 
-    conn = kb.connect()
+    conn = _reconciled_hermes_cli_kanban_db_connect.connect()
     try:
         tid, run_id = _claim_running(conn)
         _as_worker(monkeypatch, tid, run_id)
@@ -518,7 +519,7 @@ def test_cli_finalizer_recovers_evidence_from_conversation_history(
 
     import cli as hermes_cli
 
-    conn = kb.connect()
+    conn = _reconciled_hermes_cli_kanban_db_connect.connect()
     try:
         tid, run_id = _claim_running(conn)
         _as_worker(monkeypatch, tid, run_id)
@@ -545,7 +546,7 @@ def test_cli_finalizer_leaves_interrupts_to_dispatcher_crash_handling(
 
     import cli as hermes_cli
 
-    conn = kb.connect()
+    conn = _reconciled_hermes_cli_kanban_db_connect.connect()
     try:
         tid, run_id = _claim_running(conn)
         _as_worker(monkeypatch, tid, run_id)
@@ -565,7 +566,7 @@ def test_cli_finalizer_is_a_noop_for_a_normal_cli_run(kanban_home, monkeypatch):
 
     import cli as hermes_cli
 
-    conn = kb.connect()
+    conn = _reconciled_hermes_cli_kanban_db_connect.connect()
     try:
         tid, _run_id = _claim_running(conn)
         monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
@@ -581,7 +582,7 @@ def test_cli_finalizer_is_a_noop_for_a_normal_cli_run(kanban_home, monkeypatch):
 
 def test_goal_decision_evidence_reaches_the_durable_blocker(kanban_home, monkeypatch):
     """Goal evidence the loop returned is persisted by the terminal finalizer."""
-    conn = kb.connect()
+    conn = _reconciled_hermes_cli_kanban_db_connect.connect()
     try:
         tid, run_id = _claim_running(conn)
         _as_worker(monkeypatch, tid, run_id)

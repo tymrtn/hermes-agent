@@ -9,12 +9,14 @@ engine works on sqlite3.Row objects as well as dataclasses.
 
 from __future__ import annotations
 
+import hermes_cli.kanban_db_connect as _reconciled_hermes_cli_kanban_db_connect
 import time
 from pathlib import Path
 
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_diagnostics as kd
 
 
@@ -29,7 +31,7 @@ def kanban_home(tmp_path, monkeypatch):
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    kb.init_db()
+    _reconciled_hermes_cli_kanban_db_connect.init_db()
     return home
 
 
@@ -138,7 +140,7 @@ def test_engine_works_on_sqlite_row_objects(kanban_home):
     as well as dataclass Task / plain dict. The API layer passes Row
     objects directly.
     """
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         parent = kb.create_task(conn, title="p", assignee="w")
         real = kb.create_task(conn, title="r", assignee="x", created_by="w")

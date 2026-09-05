@@ -1,3 +1,4 @@
+import pytest
 """Phase 3 wake-packet lifecycle on the ACP surface.
 
 Packet construction is deferred from create_session to the first
@@ -417,3 +418,18 @@ def test_restore_unavailable_history_bearing_session_never_binds(tmp_path,
     mgr.ensure_wake_for_prompt(restored, "acpproj status please")
     assert restored.agent.ephemeral_system_prompt is None
     assert db.get_session_wake_packet("legacy-acp-2") is None
+
+
+@pytest.fixture(autouse=True)
+def stable_wake_clock(monkeypatch):
+    # Project freshness is meaningful; lifecycle fixtures must not age with wall time.
+    from datetime import datetime as real_datetime
+    import gateway.continuity_wake as wake
+
+    class FixtureClock(real_datetime):
+        @classmethod
+        def now(cls, tz=None):
+            fixed = real_datetime.fromisoformat(NOW_ISO)
+            return fixed.astimezone(tz) if tz else fixed.replace(tzinfo=None)
+
+    monkeypatch.setattr(wake, "datetime", FixtureClock)

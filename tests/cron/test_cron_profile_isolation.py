@@ -67,3 +67,18 @@ def test_cron_storage_anchors_at_profile_home(tmp_path, monkeypatch):
         importlib.reload(jobs)
 
 
+
+
+def test_job_creation_and_update_persist_profile_memory_overrides(tmp_path, monkeypatch):
+    from pathlib import Path
+    from cron.jobs import create_job, get_job, update_job
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    job = create_job(prompt=None, schedule="every 5m", script="check.py", no_agent=True,
+                     profile="default", memory_mode="read-only")
+    stored = get_job(job["id"])
+    assert (stored["profile"], stored["memory_mode"]) == ("default", "read_only")
+    update_job(job["id"], {"profile": "", "memory_mode": "full"})
+    stored = get_job(job["id"])
+    assert (stored["profile"], stored["memory_mode"]) == (None, "full")

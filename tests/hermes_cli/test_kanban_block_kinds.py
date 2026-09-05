@@ -17,11 +17,13 @@ forever. The fix gives ``block_task`` a typed ``kind`` and a persistent
 
 from __future__ import annotations
 
+import hermes_cli.kanban_db_connect as _reconciled_hermes_cli_kanban_db_connect
 from pathlib import Path
 
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
 
 
 @pytest.fixture
@@ -30,14 +32,14 @@ def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    kb.init_db()
+    _reconciled_hermes_cli_kanban_db_connect.init_db()
     return home
 
 
 def _running_task(conn, title="t"):
     """Create a task and drive it to ``running`` so block_task can act."""
     tid = kb.create_task(conn, title=title, assignee="worker")
-    with kb.write_txn(conn):
+    with _reconciled_hermes_cli_kanban_db_connect.write_txn(conn):
         conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
     claimed = kb.claim_task(conn, tid, claimer="worker")
     assert claimed is not None
@@ -45,7 +47,7 @@ def _running_task(conn, title="t"):
 
 
 def _make_running_again(conn, tid):
-    with kb.write_txn(conn):
+    with _reconciled_hermes_cli_kanban_db_connect.write_txn(conn):
         conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
     assert kb.claim_task(conn, tid, claimer="worker") is not None
 
@@ -64,7 +66,7 @@ def _make_running_again(conn, tid):
 
 
 def test_block_loop_detected_event_emitted(kanban_home: Path) -> None:
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         tid = _running_task(conn)
         kb.block_task(conn, tid, reason="x", kind="capability")
         kb.unblock_task(conn, tid)
@@ -85,14 +87,14 @@ def test_block_loop_detected_event_emitted(kanban_home: Path) -> None:
 
 def test_dependency_then_parent_done_promotes(kanban_home: Path) -> None:
     """A dependency-parked child becomes ready once its parent completes."""
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         parent = kb.create_task(conn, title="parent", assignee="worker")
         child = _running_task(conn, title="child")
         kb.link_tasks(conn, parent_id=parent, child_id=child)
         kb.block_task(conn, child, reason="wait", kind="dependency")
         assert kb.get_task(conn, child).status == "todo"
         # Finish the parent, then let recompute_ready run.
-        with kb.write_txn(conn):
+        with _reconciled_hermes_cli_kanban_db_connect.write_txn(conn):
             conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (parent,))
         kb.claim_task(conn, parent, claimer="worker")
         kb.complete_task(conn, parent, result="done")

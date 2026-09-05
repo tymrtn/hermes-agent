@@ -8,6 +8,7 @@ Direct-SQL setup is used to construct that state deterministically.
 
 from __future__ import annotations
 
+import hermes_cli.kanban_db_connect as _reconciled_hermes_cli_kanban_db_connect
 import argparse
 import json
 from pathlib import Path
@@ -16,6 +17,7 @@ import pytest
 
 from hermes_cli import kanban as kb_cli
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
 
 
 @pytest.fixture
@@ -26,13 +28,13 @@ def kanban_home(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     db_path = kb.kanban_db_path(board="default")
     kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
-    kb.init_db()
+    _reconciled_hermes_cli_kanban_db_connect.init_db()
     return home
 
 
 @pytest.fixture
 def conn(kanban_home):
-    with kb.connect() as c:
+    with kbc.connect() as c:
         yield c
 
 
@@ -88,7 +90,7 @@ def _promote_ns(task_id, *, ids=None, reason=None, force=False,
 
 
 def test_cli_promote_bulk_ids_promotes_all(kanban_home, capsys):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         parent = kb.create_task(conn, title="parent")
         children = [
             kb.create_task(conn, title=f"c{i}", parents=[parent])
@@ -100,7 +102,7 @@ def test_cli_promote_bulk_ids_promotes_all(kanban_home, capsys):
     out = capsys.readouterr().out
     for c in children:
         assert c in out
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         for c in children:
             assert kb.get_task(conn, c).status == "ready"
 

@@ -12,11 +12,14 @@ empty ``DispatchResult`` with ``skipped_locked=True`` and does no DB writes.
 
 from __future__ import annotations
 
+import hermes_cli.kanban_db_connect as _reconciled_hermes_cli_kanban_db_connect
 from pathlib import Path
 
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_dispatch as kbd
 
 
 @pytest.fixture
@@ -28,13 +31,13 @@ def kanban_home(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     db_path = kb.kanban_db_path(board="default")
     kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
-    kb.init_db()
+    _reconciled_hermes_cli_kanban_db_connect.init_db()
     return home
 
 
 @pytest.fixture
 def conn(kanban_home):
-    with kb.connect() as c:
+    with kbc.connect() as c:
         yield c
 
 
@@ -53,9 +56,9 @@ def test_held_lock_skips_the_tick_without_writes(conn):
         return 999999
 
     # Hold the lock, then attempt a contended tick.
-    with kb._dispatch_tick_lock(db_path) as held:
+    with kbc._dispatch_tick_lock(db_path) as held:
         assert held is True  # we genuinely acquired it
-        result = kb.dispatch_once(conn, spawn_fn=spy_spawn)
+        result = kbd.dispatch_once(conn, spawn_fn=spy_spawn)
 
     assert result.skipped_locked is True
     assert result.spawned == []
@@ -71,9 +74,9 @@ def test_lock_is_board_scoped(conn):
     db_other = db_default.with_name("other-board-kanban.db")
 
     # Two different lock files → both acquirable simultaneously.
-    with kb._dispatch_tick_lock(db_default) as held_a:
+    with kbc._dispatch_tick_lock(db_default) as held_a:
         assert held_a is True
-        with kb._dispatch_tick_lock(db_other) as held_b:
+        with kbc._dispatch_tick_lock(db_other) as held_b:
             assert held_b is True, "a lock on a different board must be independent"
 
 

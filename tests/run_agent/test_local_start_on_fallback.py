@@ -40,9 +40,9 @@ REMOTE_ENTRY = {
 
 def _make_agent(fallback_model=None):
     with (
-        patch("run_agent.get_tool_definitions", return_value=[]),
-        patch("run_agent.check_toolset_requirements", return_value={}),
-        patch("run_agent.OpenAI"),
+        patch('model_tools.get_tool_definitions', return_value=[]),
+        patch('model_tools.check_toolset_requirements', return_value={}),
+        patch('agent.process_bootstrap.OpenAI'),
     ):
         agent = AIAgent(
             api_key="test-key",
@@ -153,7 +153,7 @@ class TestStartOnFallback:
         ):
             agent._try_activate_fallback()
 
-        notice = agent._pending_fallback_notice
+        notice = "\n".join(agent._pending_fallback_notice or [])
         assert "http://127.0.0.1:18765/v1" in notice
         assert "/model primary" in notice
         assert "Started the local server." in notice
@@ -166,14 +166,14 @@ class TestStartOnFallback:
         ):
             agent._try_activate_fallback()
 
-        assert "Started the local server." not in agent._pending_fallback_notice
-        assert "/model primary" in agent._pending_fallback_notice
+        assert "Started the local server." not in "\n".join(agent._pending_fallback_notice or [])
+        assert "/model primary" in "\n".join(agent._pending_fallback_notice or [])
 
     def test_remote_fallback_keeps_the_plain_notice(self, resolved_client):
         agent = _make_agent(fallback_model=[dict(REMOTE_ENTRY)])
         agent._try_activate_fallback()
-        assert "Switched to fallback model" in agent._pending_fallback_notice
-        assert "/model primary" not in agent._pending_fallback_notice
+        assert "Model fallback" in "\n".join(agent._pending_fallback_notice or [])
+        assert "/model primary" not in "\n".join(agent._pending_fallback_notice or [])
 
 
 # ── cross-turn hold ──────────────────────────────────────────────────────

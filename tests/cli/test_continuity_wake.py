@@ -1,6 +1,5 @@
 """Dream Cycle v3 wake binding on the classic CLI surface."""
 
-import inspect
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -17,10 +16,16 @@ def _cli(history=None, durable=None):
     return cli, db
 
 
-def test_classic_cli_chat_calls_wake_seam_before_staging():
-    source = inspect.getsource(HermesCLI.chat)
-    assert source.index("_attach_continuity_wake_for_prompt") \
-        < source.index("_stage_user_message")
+def test_classic_cli_chat_binds_before_staging(monkeypatch):
+    cli, _ = _cli()
+    agent = SimpleNamespace()
+    seen = []
+    def attach(current_agent, message):
+        seen.append((current_agent, message, list(cli.conversation_history)))
+    monkeypatch.setattr(cli, "_attach_continuity_wake_for_prompt", attach)
+    cli._chat_stage_user_message(agent, "first question")
+    assert seen == [(agent, "first question", [])]
+    assert cli.conversation_history[-1]["content"] == "first question"
 
 
 def test_classic_cli_binds_first_message_ephemerally(monkeypatch):

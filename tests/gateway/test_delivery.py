@@ -1,5 +1,7 @@
 """Tests for the delivery routing module."""
 
+from pathlib import Path
+
 import pytest
 from typing import Any, cast
 
@@ -308,13 +310,6 @@ class NonChunkingAdapter:
         return {"success": True}
 
 
-def test_telegram_declares_markdown_and_native_chunking_capabilities():
-    from plugins.platforms.telegram.adapter import TelegramAdapter
-
-    assert TelegramAdapter.supports_code_blocks is True
-    assert TelegramAdapter.splits_long_messages is True
-
-
 @pytest.mark.asyncio
 async def test_long_output_truncated_for_non_chunking_adapter(tmp_path, monkeypatch):
     """Non-chunking adapters receive truncated content with a footer + file save."""
@@ -336,40 +331,77 @@ async def test_long_output_truncated_for_non_chunking_adapter(tmp_path, monkeypa
     assert saved_files[0].read_text() == long_content
 
 
+def _simulate_windows_codepage_write(monkeypatch):
+    """Make ``Path.write_text`` behave like a non-UTF-8 Windows console.
+
+    On Windows ``Path.write_text(data)`` with no ``encoding=`` encodes through
+    the platform code page (cp1252), which raises ``UnicodeEncodeError`` for
+    emoji/CJK/accented text. POSIX CI runs default to UTF-8 and would hide the
+    regression, so we reproduce the Windows default deterministically: encode
+    with cp1252 when the caller omits ``encoding=``, otherwise honor it.
+    """
+    import pathlib
+
+    real_write_text = pathlib.Path.write_text
+
+    def fake_write_text(self, data, encoding=None, *args, **kwargs):
+        effective = encoding or "cp1252"
+        data.encode(effective)  # mirrors the encode open() performs on write
+        return real_write_text(self, data, encoding=effective, *args, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, "write_text", fake_write_text)
+
+
+# Non-ASCII content larger than MAX_PLATFORM_OUTPUT (4000) to force the
+# truncate-and-save branch in _deliver_to_platform.
+_NON_ASCII_OVERSIZED = ("数据备份完成 🎉 résumé — " * 250)
+
+
 @pytest.mark.asyncio
-async def test_long_output_preserved_for_chunking_adapter(tmp_path, monkeypatch):
-    """Chunking adapters (splits_long_messages=True) receive the FULL content."""
+async def test_oversized_non_ascii_output_is_delivered_on_windows_codepage(tmp_path, monkeypatch):
+    """Oversized cron output containing emoji/CJK must still be delivered.
+
+    Without an explicit utf-8 encoding the full-output save raises
+    UnicodeEncodeError on a Windows code page, aborting the whole
+    truncate-and-send path so the user receives nothing.
+    """
     monkeypatch.setattr("gateway.delivery.get_hermes_home", lambda: tmp_path)
-    adapter = ChunkingAdapter()
-    router = DeliveryRouter(GatewayConfig(), adapters={Platform.DISCORD: adapter})
-    target = DeliveryTarget.parse("discord:123")
+    _simulate_windows_codepage_write(monkeypatch)
 
-    long_content = "x" * 5000
-    await router._deliver_to_platform(target, long_content, metadata={"job_id": "job2"})
+    adapter = RecordingAdapter()
+    router = DeliveryRouter(GatewayConfig(), adapters={Platform.TELEGRAM: adapter})
+    target = DeliveryTarget.parse("telegram:12345")
 
-    delivered = adapter.calls[0]["content"]
-    assert delivered == long_content  # NOT truncated — adapter handles chunking
-    assert "truncated" not in delivered.lower()
-    # Full output still saved to disk as audit trail
-    saved_files = list(tmp_path.glob("cron/output/job2_*.txt"))
-    assert len(saved_files) == 1
-    assert saved_files[0].read_text() == long_content
+    result = await router._deliver_to_platform(
+        target, _NON_ASCII_OVERSIZED, metadata={"job_id": "nightly"}
+    )
+
+    # The truncated message reached the adapter unharmed.
+    assert len(adapter.calls) == 1
+    assert "🎉" in adapter.calls[0]["content"]
+    assert "truncated, full output saved to" in adapter.calls[0]["content"]
+
+    # The full-output backup was written and round-trips as UTF-8.
+    saved = list((tmp_path / "cron" / "output").glob("nightly_*.txt"))
+    assert len(saved) == 1
+    assert saved[0].read_text(encoding="utf-8") == _NON_ASCII_OVERSIZED
+    assert result["success"] is True
 
 
-@pytest.mark.asyncio
-async def test_short_output_never_truncated(tmp_path, monkeypatch):
-    """Output under the limit passes through untouched for any adapter."""
+def test_local_delivery_writes_non_ascii_on_windows_codepage(tmp_path, monkeypatch):
+    """Local file delivery must persist emoji/CJK content as UTF-8."""
     monkeypatch.setattr("gateway.delivery.get_hermes_home", lambda: tmp_path)
-    adapter = NonChunkingAdapter()
-    router = DeliveryRouter(GatewayConfig(), adapters={Platform.DISCORD: adapter})
-    target = DeliveryTarget.parse("discord:123")
+    _simulate_windows_codepage_write(monkeypatch)
 
-    short_content = "x" * 100
-    await router._deliver_to_platform(target, short_content, metadata={"job_id": "job3"})
+    router = DeliveryRouter(GatewayConfig())
 
-    assert adapter.calls[0]["content"] == short_content
-    # Nothing saved to disk
-    assert not list(tmp_path.glob("cron/output/*.txt"))
+    result = router._deliver_local(
+        "完了 ✅ café", job_id="job1", job_name="日次レポート", metadata=None
+    )
+
+    written = Path(result["path"]).read_text(encoding="utf-8")
+    assert "完了 ✅ café" in written
+    assert "日次レポート" in written
 
 
 @pytest.mark.asyncio
@@ -401,6 +433,28 @@ async def test_audit_save_failure_does_not_break_chunking_delivery(tmp_path, mon
     assert call_count["n"] == 1
 
 
+
+@pytest.mark.asyncio
+async def test_long_output_preserved_for_chunking_adapter(tmp_path, monkeypatch):
+    """Chunking adapters (splits_long_messages=True) receive the FULL content."""
+    monkeypatch.setattr("gateway.delivery.get_hermes_home", lambda: tmp_path)
+    adapter = ChunkingAdapter()
+    router = DeliveryRouter(GatewayConfig(), adapters={Platform.DISCORD: adapter})
+    target = DeliveryTarget.parse("discord:123")
+
+    long_content = "x" * 5000
+    await router._deliver_to_platform(target, long_content, metadata={"job_id": "job2"})
+
+    delivered = adapter.calls[0]["content"]
+    assert delivered == long_content  # NOT truncated — adapter handles chunking
+    assert "truncated" not in delivered.lower()
+    # Full output still saved to disk as audit trail
+    saved_files = list(tmp_path.glob("cron/output/job2_*.txt"))
+    assert len(saved_files) == 1
+    assert saved_files[0].read_text() == long_content
+
+
+
 @pytest.mark.asyncio
 async def test_save_failure_during_truncation_raises_for_non_chunking_adapter(tmp_path, monkeypatch):
     """For a non-chunking adapter, the truncation footer needs a valid saved
@@ -424,4 +478,29 @@ async def test_save_failure_during_truncation_raises_for_non_chunking_adapter(tm
     # retry (footer needs the path) re-raises.
     with pytest.raises(OSError, match="No space left on device"):
         await router._deliver_to_platform(target, long_content, metadata={"job_id": "job7"})
+
+
+
+@pytest.mark.asyncio
+async def test_short_output_never_truncated(tmp_path, monkeypatch):
+    """Output under the limit passes through untouched for any adapter."""
+    monkeypatch.setattr("gateway.delivery.get_hermes_home", lambda: tmp_path)
+    adapter = NonChunkingAdapter()
+    router = DeliveryRouter(GatewayConfig(), adapters={Platform.DISCORD: adapter})
+    target = DeliveryTarget.parse("discord:123")
+
+    short_content = "x" * 100
+    await router._deliver_to_platform(target, short_content, metadata={"job_id": "job3"})
+
+    assert adapter.calls[0]["content"] == short_content
+    # Nothing saved to disk
+    assert not list(tmp_path.glob("cron/output/*.txt"))
+
+
+
+def test_telegram_declares_markdown_and_native_chunking_capabilities():
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+
+    assert TelegramAdapter.supports_code_blocks is True
+    assert TelegramAdapter.splits_long_messages is True
 

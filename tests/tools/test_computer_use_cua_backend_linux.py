@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
+import pytest
+
 # Tied z_index=0 fixture from #58026 (ding ahead of real terminals).
 ISSUE_58026_WINDOWS = [
     {
@@ -71,47 +73,29 @@ LINUX_LIST_WINDOWS = [
 
 
 def _normalized_windows(raw=ISSUE_58026_WINDOWS):
-    from tools.computer_use.cua_backend import _ingest_windows
+    from tools.computer_use.cua_backend_parse import _ingest_windows
 
     return _ingest_windows(raw)
 
 
 def test_parse_xprop_net_active_window_standard_output():
-    from tools.computer_use.cua_backend import _parse_xprop_net_active_window
+    from tools.computer_use.cua_backend_parse import _parse_xprop_net_active_window
 
     raw = "_NET_ACTIVE_WINDOW(WINDOW): window id # 0x503000b\n"
     assert _parse_xprop_net_active_window(raw) == 0x503000b
 
 
-def test_parse_xprop_net_active_window_bare_hex_fallback():
-    from tools.computer_use.cua_backend import _parse_xprop_net_active_window
-
-    assert _parse_xprop_net_active_window("active=0xABcdef01") == 0xABCDEF01
-
-
-def test_parse_xprop_net_active_window_rejects_unparseable():
-    from tools.computer_use.cua_backend import _parse_xprop_net_active_window
-
-    assert _parse_xprop_net_active_window("") is None
-    assert _parse_xprop_net_active_window("_NET_ACTIVE_WINDOW(WINDOW): none") is None
-    assert _parse_xprop_net_active_window("window id # not-a-hex") is None
-
-
-def test_nullable_window_title_is_normalized_and_treated_as_real_candidate():
-    from tools.computer_use.cua_backend import _ingest_windows, _is_real_app_window
-
-    [window] = _ingest_windows([{"pid": 1, "window_id": 2, "title": None}])
-    assert window["title"] == ""
-    assert _is_real_app_window(window) is True
-
-
+@pytest.mark.linux_only
 def test_default_capture_prefers_x11_active_window_when_z_index_tied():
-    from tools.computer_use.cua_backend import _select_capture_target
+    """The ``_NET_ACTIVE_WINDOW`` tie-break is a Linux/X11-only branch of
+    ``_select_capture_target``; run it where ``sys.platform`` really is
+    linux instead of patching the branch selector."""
+    from tools.computer_use.cua_backend_capture import _select_capture_target
 
     windows = _normalized_windows()
 
-    with patch("tools.computer_use.cua_backend.sys.platform", "linux"), patch(
-        "tools.computer_use.cua_backend._linux_x11_active_window_id",
+    with patch(
+        "tools.computer_use.cua_backend_capture._linux_x11_active_window_id",
         return_value=84043449,
     ):
         target = _select_capture_target(windows, app_requested=False)
@@ -120,14 +104,18 @@ def test_default_capture_prefers_x11_active_window_when_z_index_tied():
     assert target["window_id"] == 84043449
 
 
+@pytest.mark.linux_only
 def test_default_capture_skips_desktop_helper_when_active_window_unknown():
-    """Even without _NET_ACTIVE_WINDOW, ding/Desktop helpers must not win (#54173)."""
-    from tools.computer_use.cua_backend import _select_capture_target
+    """Even without _NET_ACTIVE_WINDOW, ding/Desktop helpers must not win (#54173).
+
+    Linux-only: the helper-skipping pool filter is inside the
+    ``sys.platform == "linux"`` branch."""
+    from tools.computer_use.cua_backend_capture import _select_capture_target
 
     windows = _normalized_windows()
 
-    with patch("tools.computer_use.cua_backend.sys.platform", "linux"), patch(
-        "tools.computer_use.cua_backend._linux_x11_active_window_id",
+    with patch(
+        "tools.computer_use.cua_backend_capture._linux_x11_active_window_id",
         return_value=None,
     ):
         target = _select_capture_target(windows, app_requested=False)
@@ -149,8 +137,32 @@ def test_linux_null_is_on_screen_is_treated_as_unknown_not_offscreen():
 
 def test_explicit_app_capture_preserves_filtered_target_order():
     """When the caller filters first, target selection should not skip the match."""
-    from tools.computer_use.cua_backend import _select_capture_target
+    from tools.computer_use.cua_backend_capture import _select_capture_target
 
     chrome = _normalized_windows(LINUX_LIST_WINDOWS)[1]
 
     assert _select_capture_target([chrome], app_requested=True) == chrome
+
+
+def test_nullable_window_title_is_normalized_and_treated_as_real_candidate():
+    from tools.computer_use.cua_backend import _ingest_windows, _is_real_app_window
+
+    [window] = _ingest_windows([{"pid": 1, "window_id": 2, "title": None}])
+    assert window["title"] == ""
+    assert _is_real_app_window(window) is True
+
+
+
+def test_parse_xprop_net_active_window_bare_hex_fallback():
+    from tools.computer_use.cua_backend import _parse_xprop_net_active_window
+
+    assert _parse_xprop_net_active_window("active=0xABcdef01") == 0xABCDEF01
+
+
+
+def test_parse_xprop_net_active_window_rejects_unparseable():
+    from tools.computer_use.cua_backend import _parse_xprop_net_active_window
+
+    assert _parse_xprop_net_active_window("") is None
+    assert _parse_xprop_net_active_window("_NET_ACTIVE_WINDOW(WINDOW): none") is None
+    assert _parse_xprop_net_active_window("window id # not-a-hex") is None

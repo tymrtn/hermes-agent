@@ -7,6 +7,7 @@ shared "default" board — so a secondary profile without kanban config
 dispatches from its own board, matching ``kb.get_current_board()``.
 """
 
+import hermes_cli.kanban_db_dispatch as _reconciled_hermes_cli_kanban_db_dispatch
 from types import SimpleNamespace
 
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
@@ -89,7 +90,7 @@ def test_admission_scope_stays_wider_than_the_dispatch_scope(monkeypatch):
     assert GatewayKanbanWatchersMixin._kanban_scoped_board_slugs(
         cfg, "dispatch_boards", kb
     ) == ["alpha"]
-    assert kanban_db.resolve_admission_boards(cfg, _kb=kb) == [
+    assert _reconciled_hermes_cli_kanban_db_dispatch.resolve_admission_boards(cfg, _kb=kb) == [
         "default", "alpha", "beta",
     ]
 
@@ -99,7 +100,7 @@ def test_admission_scope_keeps_configured_boards_missing_from_disk(monkeypatch):
     monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
     kb = _fake_kb(boards=["default"])
 
-    assert kanban_db.resolve_admission_boards(
+    assert _reconciled_hermes_cli_kanban_db_dispatch.resolve_admission_boards(
         {"dispatch_boards": "alpha,beta"}, _kb=kb
     ) == ["default", "alpha", "beta"]
 
@@ -116,6 +117,6 @@ def test_admission_scope_falls_back_to_dispatch_scope_when_discovery_fails(
 
     kb.list_boards = _boom
 
-    assert kanban_db.resolve_admission_boards({"dispatch_boards": "alpha"}, _kb=kb) == [
+    assert _reconciled_hermes_cli_kanban_db_dispatch.resolve_admission_boards({"dispatch_boards": "alpha"}, _kb=kb) == [
         "alpha"
     ]

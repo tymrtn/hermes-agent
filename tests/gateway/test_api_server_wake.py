@@ -977,3 +977,18 @@ async def test_chat_completions_history_read_failure_never_attests(tmp_path):
     assert captured
     assert "[Continuity wake packet" not in (captured[0] or "")
     assert load_wake_state_for_session(db, session_id) == ("absent", None)
+
+
+@pytest.fixture(autouse=True)
+def stable_wake_clock(monkeypatch):
+    # Project freshness is meaningful; lifecycle fixtures must not age with wall time.
+    from datetime import datetime as real_datetime
+    import gateway.continuity_wake as wake
+
+    class FixtureClock(real_datetime):
+        @classmethod
+        def now(cls, tz=None):
+            fixed = real_datetime.fromisoformat(NOW_ISO)
+            return fixed.astimezone(tz) if tz else fixed.replace(tzinfo=None)
+
+    monkeypatch.setattr(wake, "datetime", FixtureClock)

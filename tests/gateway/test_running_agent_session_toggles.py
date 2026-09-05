@@ -1,19 +1,16 @@
 """Regression tests: /yolo and /verbose dispatch mid-agent-run.
 
-When an agent is running, the gateway's running-agent guard must not execute
-unsafe slash commands mid-turn. Safe control-plane commands dispatch directly;
-unsafe commands are treated like ordinary busy follow-ups so the user gets the
-queue/interrupt/steer controls instead of a dead-end warning.
-
-A small allowlist bypasses that and actually dispatches:
+When an agent is running, the gateway's running-agent guard rejects most
+slash commands with "⏳ Agent is running — /{cmd} can't run mid-turn"
+(PR #12334). A small allowlist bypasses that and actually dispatches:
 
   * /yolo — toggles the session yolo flag; useful to pre-approve a
     pending approval prompt without waiting for the agent to finish.
   * /verbose — cycles the per-platform tool-progress display mode;
     affects the ongoing stream.
 
-Commands whose handlers say "takes effect on next message" go through busy
-follow-up handling by design:
+Commands whose handlers say "takes effect on next message" stay on the
+catch-all by design:
 
   * /fast — writes config.yaml only
   * /reasoning — writes config.yaml only
@@ -57,12 +54,6 @@ def _make_runner():
     )
     adapter = MagicMock()
     adapter.send = AsyncMock()
-    adapter._send_with_retry = AsyncMock(
-        return_value=SimpleNamespace(success=True, message_id="ack-1")
-    )
-    adapter._pending_messages = {}
-    adapter.config = SimpleNamespace(extra={})
-    adapter.platform = Platform.TELEGRAM
     runner.adapters = {Platform.TELEGRAM: adapter}
     runner._voice_mode = {}
     runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
@@ -84,14 +75,6 @@ def _make_runner():
     runner.session_store.update_session = MagicMock()
     runner._running_agents = {}
     runner._running_agents_ts = {}
-    runner._busy_input_mode = "interrupt"
-    runner._busy_text_mode = "queue"
-    runner._busy_ack_ts = {}
-    runner._pending_followups = {}
-    runner._tool_bubble_msg_ids = {}
-    runner._busy_control_bubble_ids = {}
-    runner._busy_ack_tool_bubble_defer_seconds = 0.0
-    runner._draining = False
     runner._pending_messages = {}
     runner._pending_approvals = {}
     runner._session_db = None
@@ -153,64 +136,36 @@ async def test_verbose_dispatches_mid_run(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_fast_routes_to_busy_controls_mid_run():
-    """/fast mid-run must not execute immediately or hard-block.
+async def test_fresh_ancient_turn_remains_controllable(monkeypatch):
+    """Total turn age must not evict an agent with fresh activity.
 
-    It is an intentional follow-up. Route through normal busy handling so
-    Telegram/Discord can show queue/interrupt/stop controls.
+    A long autonomous turn can legitimately run beyond the emergency wall TTL.
+    Evicting it solely by age forgets the control handle while its session-ID
+    lease remains held, so /steer and /stop fall into the lease waiter instead
+    of reaching the live agent.
     """
-    runner = _make_runner()
-    runner._handle_fast_command = AsyncMock(
-        side_effect=AssertionError("/fast should not dispatch mid-run")
-    )
-    sk = build_session_key(_make_source())
+    import time
 
-    result = await runner._handle_message(_make_event("/fast"))
-
-    runner._handle_fast_command.assert_not_awaited()
-    assert result is None
-    assert "fast" in runner.adapters[Platform.TELEGRAM]._pending_messages[sk].text
-    runner.adapters[Platform.TELEGRAM]._send_with_retry.assert_awaited_once()
-    content = runner.adapters[Platform.TELEGRAM]._send_with_retry.call_args.kwargs["content"]
-    assert "Interrupting current task" in content
-    assert "can't run mid-turn" not in content
-
-
-@pytest.mark.asyncio
-async def test_reasoning_routes_to_busy_controls_mid_run():
-    """/reasoning mid-run follows the same busy path as user text."""
-    runner = _make_runner()
-    runner._handle_reasoning_command = AsyncMock(
-        side_effect=AssertionError("/reasoning should not dispatch mid-run")
-    )
-    sk = build_session_key(_make_source())
-
-    result = await runner._handle_message(_make_event("/reasoning high"))
-
-    runner._handle_reasoning_command.assert_not_awaited()
-    assert result is None
-    assert runner.adapters[Platform.TELEGRAM]._pending_messages[sk].text == "/reasoning high"
-    runner.adapters[Platform.TELEGRAM]._send_with_retry.assert_awaited_once()
-    content = runner.adapters[Platform.TELEGRAM]._send_with_retry.call_args.kwargs["content"]
-    assert "Interrupting current task" in content
-    assert "can't run mid-turn" not in content
-
-
-@pytest.mark.parametrize("command_text", ["/model", "/model openai/gpt-5.5", "/undo", "/retry"])
-@pytest.mark.asyncio
-async def test_unsafe_slash_commands_route_to_busy_controls_mid_run(command_text):
-    """Session/config slash commands typed mid-run become busy follow-ups."""
     runner = _make_runner()
     sk = build_session_key(_make_source())
+    agent = runner._running_agents[sk]
+    agent.get_activity_summary.return_value = {
+        "seconds_since_activity": 3.0,
+        "last_activity_desc": "receiving stream response",
+        "api_call_count": 1186,
+        "max_iterations": 2000,
+    }
+    runner._running_agents_ts[sk] = time.time() - 31_471
+    runner._handle_verbose_command = AsyncMock(return_value="tool progress: new")
+    monkeypatch.setenv("HERMES_AGENT_TIMEOUT", "1800")
 
-    result = await runner._handle_message(_make_event(command_text))
+    result = await runner._handle_message(_make_event("/verbose"))
 
-    assert result is None
-    assert runner.adapters[Platform.TELEGRAM]._pending_messages[sk].text == command_text
-    runner.adapters[Platform.TELEGRAM]._send_with_retry.assert_awaited_once()
-    content = runner.adapters[Platform.TELEGRAM]._send_with_retry.call_args.kwargs["content"]
-    assert "Interrupting current task" in content
-    assert "can't run mid-turn" not in content
+    runner._handle_verbose_command.assert_awaited_once()
+    assert runner._running_agents[sk] is agent
+    assert result == "tool progress: new"
+
+
 
 
 @pytest.mark.asyncio
@@ -234,3 +189,67 @@ async def test_btw_dispatches_mid_run():
     runner._handle_background_command.assert_awaited_once()
     assert result is not None
     assert "can't run mid-turn" not in result
+
+
+
+@pytest.mark.asyncio
+async def test_fast_routes_to_busy_controls_mid_run():
+    """/fast mid-run must not execute immediately or hard-block.
+
+    It is an intentional follow-up. Route through normal busy handling so
+    Telegram/Discord can show queue/interrupt/stop controls.
+    """
+    runner = _make_runner()
+    runner._handle_fast_command = AsyncMock(
+        side_effect=AssertionError("/fast should not dispatch mid-run")
+    )
+    sk = build_session_key(_make_source())
+
+    result = await runner._handle_message(_make_event("/fast"))
+
+    runner._handle_fast_command.assert_not_awaited()
+    assert result is None
+    assert "fast" in runner.adapters[Platform.TELEGRAM]._pending_messages[sk].text
+    runner.adapters[Platform.TELEGRAM]._send_with_retry.assert_awaited_once()
+    content = runner.adapters[Platform.TELEGRAM]._send_with_retry.call_args.kwargs["content"]
+    assert "Interrupting current task" in content
+    assert "can't run mid-turn" not in content
+
+
+
+@pytest.mark.asyncio
+async def test_reasoning_routes_to_busy_controls_mid_run():
+    """/reasoning mid-run follows the same busy path as user text."""
+    runner = _make_runner()
+    runner._handle_reasoning_command = AsyncMock(
+        side_effect=AssertionError("/reasoning should not dispatch mid-run")
+    )
+    sk = build_session_key(_make_source())
+
+    result = await runner._handle_message(_make_event("/reasoning high"))
+
+    runner._handle_reasoning_command.assert_not_awaited()
+    assert result is None
+    assert runner.adapters[Platform.TELEGRAM]._pending_messages[sk].text == "/reasoning high"
+    runner.adapters[Platform.TELEGRAM]._send_with_retry.assert_awaited_once()
+    content = runner.adapters[Platform.TELEGRAM]._send_with_retry.call_args.kwargs["content"]
+    assert "Interrupting current task" in content
+    assert "can't run mid-turn" not in content
+
+
+
+@pytest.mark.parametrize("command_text", ["/model", "/model openai/gpt-5.5", "/undo", "/retry"])
+@pytest.mark.asyncio
+async def test_unsafe_slash_commands_route_to_busy_controls_mid_run(command_text):
+    """Session/config slash commands typed mid-run become busy follow-ups."""
+    runner = _make_runner()
+    sk = build_session_key(_make_source())
+
+    result = await runner._handle_message(_make_event(command_text))
+
+    assert result is None
+    assert runner.adapters[Platform.TELEGRAM]._pending_messages[sk].text == command_text
+    runner.adapters[Platform.TELEGRAM]._send_with_retry.assert_awaited_once()
+    content = runner.adapters[Platform.TELEGRAM]._send_with_retry.call_args.kwargs["content"]
+    assert "Interrupting current task" in content
+    assert "can't run mid-turn" not in content

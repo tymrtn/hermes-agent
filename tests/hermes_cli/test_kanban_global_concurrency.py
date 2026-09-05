@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hermes_cli.kanban_db_connect as _reconciled_hermes_cli_kanban_db_connect
+import hermes_cli.kanban_db_dispatch as _reconciled_hermes_cli_kanban_db_dispatch
 import logging
 import os
 import shutil
@@ -31,7 +33,7 @@ def fleet_home(tmp_path, monkeypatch):
 
 
 def _create_tasks(board: str, assignee: str, count: int, *, priority: int = 0) -> list[str]:
-    with kb.connect_closing(board=board) as conn:
+    with _reconciled_hermes_cli_kanban_db_connect.connect_closing(board=board) as conn:
         return [
             kb.create_task(
                 conn,
@@ -53,7 +55,7 @@ def _mark_running(board: str, task_ids: list[str]) -> None:
     running without tripping the crash/stale/pidless reapers.
     """
     expires = int(time.time()) + 3600
-    with kb.connect_closing(board=board) as conn:
+    with _reconciled_hermes_cli_kanban_db_connect.connect_closing(board=board) as conn:
         for task_id in task_ids:
             conn.execute(
                 "UPDATE tasks SET status = 'running', claim_lock = ?, "
@@ -81,7 +83,7 @@ def _corrupt_board_db(board: str) -> Path:
 
 
 def _running(board: str) -> list[tuple[str, str]]:
-    with kb.connect_closing(board=board) as conn:
+    with _reconciled_hermes_cli_kanban_db_connect.connect_closing(board=board) as conn:
         return [
             (row["id"], row["assignee"])
             for row in conn.execute(
@@ -104,8 +106,8 @@ def test_caps_count_running_workers_across_all_dispatched_boards(fleet_home):
     _create_tasks("board-b", "beta", 6, priority=10)
     scope = ["board-a", "board-b"]
 
-    with kb.connect_closing(board="board-a") as conn:
-        first = kb.dispatch_once(
+    with _reconciled_hermes_cli_kanban_db_connect.connect_closing(board="board-a") as conn:
+        first = _reconciled_hermes_cli_kanban_db_dispatch.dispatch_once(
             conn,
             board="board-a",
             admission_boards=scope,
@@ -117,8 +119,8 @@ def test_caps_count_running_workers_across_all_dispatched_boards(fleet_home):
     assert [task_id for task_id, _who, _workspace in first.spawned] == board_a_alpha[:2]
     assert _running("board-a") == [(board_a_alpha[0], "alpha"), (board_a_alpha[1], "alpha")]
 
-    with kb.connect_closing(board="board-b") as conn:
-        second = kb.dispatch_once(
+    with _reconciled_hermes_cli_kanban_db_connect.connect_closing(board="board-b") as conn:
+        second = _reconciled_hermes_cli_kanban_db_dispatch.dispatch_once(
             conn,
             board="board-b",
             admission_boards=scope,
@@ -132,8 +134,8 @@ def test_caps_count_running_workers_across_all_dispatched_boards(fleet_home):
     assert len(_running("board-a")) + len(_running("board-b")) == 4
     assert _running("board-a") == [(board_a_alpha[0], "alpha"), (board_a_alpha[1], "alpha")]
 
-    with kb.connect_closing(board="board-b") as conn:
-        restart_tick = kb.dispatch_once(
+    with _reconciled_hermes_cli_kanban_db_connect.connect_closing(board="board-b") as conn:
+        restart_tick = _reconciled_hermes_cli_kanban_db_dispatch.dispatch_once(
             conn,
             board="board-b",
             admission_boards=scope,
@@ -150,12 +152,12 @@ def test_global_admission_lock_prevents_cross_board_overclaim_race(fleet_home):
     _create_tasks("board-b", "beta", 1)
     scope = ["board-a", "board-b"]
     start = threading.Barrier(2)
-    results: dict[str, kb.DispatchResult] = {}
+    results: dict[str, _reconciled_hermes_cli_kanban_db_dispatch.DispatchResult] = {}
 
     def run(board: str) -> None:
-        with kb.connect_closing(board=board) as conn:
+        with _reconciled_hermes_cli_kanban_db_connect.connect_closing(board=board) as conn:
             start.wait(timeout=2)
-            results[board] = kb.dispatch_once(
+            results[board] = _reconciled_hermes_cli_kanban_db_dispatch.dispatch_once(
                 conn,
                 board=board,
                 admission_boards=scope,
@@ -189,8 +191,8 @@ def test_cap_is_a_ceiling_when_no_cross_board_count_was_supplied(fleet_home):
     ids = _create_tasks("board-a", "alpha", 8, priority=100)
     _mark_running("board-a", ids[:3])
 
-    with kb.connect_closing(board="board-a") as conn:
-        res = kb._dispatch_once_locked(
+    with _reconciled_hermes_cli_kanban_db_connect.connect_closing(board="board-a") as conn:
+        res = _reconciled_hermes_cli_kanban_db_dispatch._dispatch_once_locked(
             conn,
             board="board-a",
             max_in_progress=4,
@@ -221,8 +223,8 @@ def test_corrupt_secondary_board_fails_admission_closed(
     _corrupt_board_db("board-b")
 
     with caplog.at_level(logging.ERROR):
-        with kb.connect_closing(board="board-a") as conn:
-            res = kb.dispatch_once(
+        with _reconciled_hermes_cli_kanban_db_connect.connect_closing(board="board-a") as conn:
+            res = _reconciled_hermes_cli_kanban_db_dispatch.dispatch_once(
                 conn,
                 board="board-a",
                 admission_boards=["board-a", "board-b"],
@@ -234,7 +236,7 @@ def test_corrupt_secondary_board_fails_admission_closed(
     assert res.spawned == []
     assert res.skipped_uncounted_admission is True
     assert res.uncounted_admission_boards == ["board-b"]
-    with kb.connect_closing(board="board-a") as conn:
+    with _reconciled_hermes_cli_kanban_db_connect.connect_closing(board="board-a") as conn:
         rows = conn.execute(
             "SELECT id FROM tasks WHERE status = 'ready' ORDER BY created_at, id"
         ).fetchall()
@@ -264,7 +266,7 @@ def test_unreadable_current_board_still_raises_for_the_caller(fleet_home):
     would count zero running workers on a board it cannot read.
     """
     with pytest.raises(sqlite3.DatabaseError):
-        kb._count_running_across_boards(
+        _reconciled_hermes_cli_kanban_db_dispatch._count_running_across_boards(
             _BrokenConn(),
             current_board="board-a",
             admission_boards=["board-a", "board-b"],
@@ -290,13 +292,13 @@ def test_admission_counting_dedupes_boards_pinned_to_one_db_by_env(
     monkeypatch.setenv("HERMES_KANBAN_DB", str(kb.kanban_db_path(board="board-a")))
     scope = ["board-a", "board-b"]
 
-    with kb.connect_closing(board="board-a") as conn:
-        total, by_profile, uncounted = kb._count_running_across_boards(
+    with _reconciled_hermes_cli_kanban_db_connect.connect_closing(board="board-a") as conn:
+        total, by_profile, uncounted = _reconciled_hermes_cli_kanban_db_dispatch._count_running_across_boards(
             conn, current_board="board-a", admission_boards=scope
         )
         assert (total, by_profile, uncounted) == (2, {"alpha": 2}, [])
 
-        res = kb.dispatch_once(
+        res = _reconciled_hermes_cli_kanban_db_dispatch.dispatch_once(
             conn,
             board="board-a",
             admission_boards=scope,
@@ -318,8 +320,8 @@ def test_admission_counting_dedupes_symlinked_board_directories(fleet_home):
     alias_dir = kb.board_dir("board-a").parent / "board-alias"
     alias_dir.symlink_to(kb.board_dir("board-a"), target_is_directory=True)
 
-    with kb.connect_closing(board="board-a") as conn:
-        total, by_profile, uncounted = kb._count_running_across_boards(
+    with _reconciled_hermes_cli_kanban_db_connect.connect_closing(board="board-a") as conn:
+        total, by_profile, uncounted = _reconciled_hermes_cli_kanban_db_dispatch._count_running_across_boards(
             conn,
             current_board="board-a",
             admission_boards=["board-a", "board-alias", "board-b"],
@@ -340,9 +342,9 @@ _DEAD_PID = 4_000_001
 
 def _plant_worker(board: str, task_id: str, *, pid: int) -> None:
     """Claim ``task_id`` on ``board`` and pin it to ``pid``, as a spawn would."""
-    with kb.connect_closing(board=board) as conn:
+    with _reconciled_hermes_cli_kanban_db_connect.connect_closing(board=board) as conn:
         assert kb.claim_task(conn, task_id) is not None
-        kb._set_worker_pid(conn, task_id, pid)
+        _reconciled_hermes_cli_kanban_db_dispatch._set_worker_pid(conn, task_id, pid)
 
 
 def _plant_pidless_claim(board: str, task_id: str, *, expired: bool) -> None:
@@ -354,7 +356,7 @@ def _plant_pidless_claim(board: str, task_id: str, *, expired: bool) -> None:
     claim past its TTL, which is the only thing separating debris from a
     claim whose worker is a second away from being stamped.
     """
-    with kb.connect_closing(board=board) as conn:
+    with _reconciled_hermes_cli_kanban_db_connect.connect_closing(board=board) as conn:
         assert kb.claim_task(conn, task_id) is not None
         assert kb.get_task(conn, task_id).worker_pid is None
         if expired:
@@ -377,13 +379,13 @@ def test_crashed_worker_on_an_admission_only_board_stops_holding_a_cap_slot(
     of ``max_in_progress``, and at a cap of 1 it stops dispatching entirely.
     """
     monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
-    monkeypatch.setattr(kb, "_pid_alive", lambda pid: int(pid) == os.getpid())
+    monkeypatch.setattr(_reconciled_hermes_cli_kanban_db_dispatch, "_pid_alive", lambda pid: int(pid) == os.getpid())
     stale = _create_tasks("board-b", "alpha", 1)[0]
     _plant_worker("board-b", stale, pid=_DEAD_PID)
     ready = _create_tasks("board-a", "alpha", 1, priority=100)
 
-    with kb.connect_closing(board="board-a") as conn:
-        res = kb.dispatch_once(
+    with _reconciled_hermes_cli_kanban_db_connect.connect_closing(board="board-a") as conn:
+        res = _reconciled_hermes_cli_kanban_db_dispatch.dispatch_once(
             conn,
             board="board-a",
             admission_boards=["board-a", "board-b"],
@@ -392,7 +394,7 @@ def test_crashed_worker_on_an_admission_only_board_stops_holding_a_cap_slot(
         )
 
     assert [task_id for task_id, _who, _ws in res.spawned] == ready
-    with kb.connect_closing(board="board-b") as conn:
+    with _reconciled_hermes_cli_kanban_db_connect.connect_closing(board="board-b") as conn:
         assert kb.get_task(conn, stale).status == "ready"
         # Reclaimed through the ordinary crash path, not a bare status flip:
         # the board keeps its crash event, run outcome and failure accounting.
@@ -410,17 +412,17 @@ def test_counting_an_admission_only_board_leaves_a_live_worker_running(
     worker's row would hand its task to a second worker.
     """
     monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
-    monkeypatch.setattr(kb, "_pid_alive", lambda pid: int(pid) == os.getpid())
+    monkeypatch.setattr(_reconciled_hermes_cli_kanban_db_dispatch, "_pid_alive", lambda pid: int(pid) == os.getpid())
     live = _create_tasks("board-b", "alpha", 1)[0]
     _plant_worker("board-b", live, pid=os.getpid())
 
     def _refuse(*_args, **_kwargs):
         raise AssertionError("counting a healthy board must not write to it")
 
-    monkeypatch.setattr(kb, "detect_crashed_workers", _refuse)
+    monkeypatch.setattr(_reconciled_hermes_cli_kanban_db_dispatch, "detect_crashed_workers", _refuse)
 
-    with kb.connect_closing(board="board-a") as conn:
-        counted = kb._count_running_across_boards(
+    with _reconciled_hermes_cli_kanban_db_connect.connect_closing(board="board-a") as conn:
+        counted = _reconciled_hermes_cli_kanban_db_dispatch._count_running_across_boards(
             conn, current_board="board-a", admission_boards=["board-a", "board-b"]
         )
 
@@ -444,8 +446,8 @@ def test_stale_pidless_claim_on_an_admission_only_board_releases_its_cap_slot(
     _plant_pidless_claim("board-b", abandoned, expired=True)
     ready = _create_tasks("board-a", "alpha", 1, priority=100)
 
-    with kb.connect_closing(board="board-a") as conn:
-        res = kb.dispatch_once(
+    with _reconciled_hermes_cli_kanban_db_connect.connect_closing(board="board-a") as conn:
+        res = _reconciled_hermes_cli_kanban_db_dispatch.dispatch_once(
             conn,
             board="board-a",
             admission_boards=["board-a", "board-b"],
@@ -454,7 +456,7 @@ def test_stale_pidless_claim_on_an_admission_only_board_releases_its_cap_slot(
         )
 
     assert [task_id for task_id, _who, _ws in res.spawned] == ready
-    with kb.connect_closing(board="board-b") as conn:
+    with _reconciled_hermes_cli_kanban_db_connect.connect_closing(board="board-b") as conn:
         released = kb.get_task(conn, abandoned)
         assert released.status == "ready"
         assert (released.claim_lock, released.claim_expires) == (None, None)
@@ -483,15 +485,15 @@ def test_fresh_pidless_claim_on_an_admission_only_board_is_counted_and_kept(
         raise AssertionError("a claim still inside its TTL must not be reaped")
 
     monkeypatch.setattr(kb, "release_stale_claims", _refuse)
-    monkeypatch.setattr(kb, "detect_crashed_workers", _refuse)
+    monkeypatch.setattr(_reconciled_hermes_cli_kanban_db_dispatch, "detect_crashed_workers", _refuse)
 
-    with kb.connect_closing(board="board-a") as conn:
-        counted = kb._count_running_across_boards(
+    with _reconciled_hermes_cli_kanban_db_connect.connect_closing(board="board-a") as conn:
+        counted = _reconciled_hermes_cli_kanban_db_dispatch._count_running_across_boards(
             conn, current_board="board-a", admission_boards=["board-a", "board-b"]
         )
 
     assert counted == (1, {"alpha": 1}, [])
-    with kb.connect_closing(board="board-b") as conn:
+    with _reconciled_hermes_cli_kanban_db_connect.connect_closing(board="board-b") as conn:
         kept = kb.get_task(conn, fresh)
         assert kept.status == "running"
         assert kept.claim_lock and kept.claim_expires
@@ -517,8 +519,8 @@ def test_admission_counting_never_creates_a_board_it_only_counts(fleet_home):
     _mark_running("board-a", ids[:1])
     ghost_db = kb.kanban_db_path(board="board-ghost")
 
-    with kb.connect_closing(board="board-a") as conn:
-        total, by_profile, uncounted = kb._count_running_across_boards(
+    with _reconciled_hermes_cli_kanban_db_connect.connect_closing(board="board-a") as conn:
+        total, by_profile, uncounted = _reconciled_hermes_cli_kanban_db_dispatch._count_running_across_boards(
             conn,
             current_board="board-a",
             admission_boards=["board-a", "board-ghost"],
@@ -545,8 +547,8 @@ def test_dispatch_does_not_resurrect_a_board_deleted_out_from_under_the_scope(
     kb._INITIALIZED_PATHS.discard(str(kb.kanban_db_path(board="board-b").resolve()))
     shutil.rmtree(board_b)
 
-    with kb.connect_closing(board="board-a") as conn:
-        res = kb.dispatch_once(
+    with _reconciled_hermes_cli_kanban_db_connect.connect_closing(board="board-a") as conn:
+        res = _reconciled_hermes_cli_kanban_db_dispatch.dispatch_once(
             conn,
             board="board-a",
             admission_boards=["board-a", "board-b"],

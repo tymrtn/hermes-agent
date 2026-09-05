@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hermes_cli.kanban_db_connect as _reconciled_hermes_cli_kanban_db_connect
 import argparse
 import json
 import os
@@ -12,6 +13,7 @@ import pytest
 
 from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
 
 
 @pytest.fixture
@@ -20,7 +22,7 @@ def kanban_home(tmp_path, monkeypatch):
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    kb.init_db()
+    _reconciled_hermes_cli_kanban_db_connect.init_db()
     return home
 
 
@@ -44,7 +46,8 @@ def test_kanban_list_json_includes_session_id(kanban_home):
     """JSON output exposes `session_id` so external clients (Scarf, web
     dashboards) don't need a side query to filter by chat session."""
     from hermes_cli import kanban_db as kb
-    with kb.connect() as conn:
+    from hermes_cli import kanban_db_connect as kbc
+    with kbc.connect() as conn:
         kb.create_task(
             conn, title="acp task", assignee="alice", session_id="acp-x"
         )
@@ -57,6 +60,19 @@ def test_kanban_list_json_includes_session_id(kanban_home):
     )
 
 
+def test_kanban_show_text_renders_graph_with_open_connection(kanban_home):
+    with kbc.connect_closing() as conn:
+        parent_id = kb.create_task(conn, title="parent task")
+        child_id = kb.create_task(conn, title="child task")
+        kb.link_tasks(conn, parent_id=parent_id, child_id=child_id)
+
+    output = kc.run_slash(f"show {child_id}")
+
+    assert f"Task {child_id}: child task" in output
+    assert f"parents:   {parent_id}" in output
+    assert "Cannot operate on a closed database" not in output
+
+
 def test_board_override_is_isolated_per_concurrent_call(kanban_home, monkeypatch):
     kb.create_board("alpha")
     kb.create_board("beta")
@@ -66,7 +82,7 @@ def test_board_override_is_isolated_per_concurrent_call(kanban_home, monkeypatch
     kc.build_parser(sub)
 
     barrier = threading.Barrier(2)
-    original_init_db = kb.init_db
+    original_init_db = _reconciled_hermes_cli_kanban_db_connect.init_db
 
     def slow_init_db(*args, **kwargs):
         try:
@@ -75,7 +91,7 @@ def test_board_override_is_isolated_per_concurrent_call(kanban_home, monkeypatch
             pass
         return original_init_db(*args, **kwargs)
 
-    monkeypatch.setattr(kb, "init_db", slow_init_db)
+    monkeypatch.setattr(_reconciled_hermes_cli_kanban_db_connect, "init_db", slow_init_db)
 
     failures: list[str] = []
 
@@ -94,9 +110,9 @@ def test_board_override_is_isolated_per_concurrent_call(kanban_home, monkeypatch
 
     assert failures == []
 
-    with kb.connect_closing(board="alpha") as conn:
+    with kbc.connect_closing(board="alpha") as conn:
         alpha_titles = [row.title for row in kb.list_tasks(conn, limit=100)]
-    with kb.connect_closing(board="beta") as conn:
+    with kbc.connect_closing(board="beta") as conn:
         beta_titles = [row.title for row in kb.list_tasks(conn, limit=100)]
 
     assert alpha_titles == ["alpha-task"]
@@ -170,7 +186,7 @@ def test_board_override_restores_env_after_repair(kanban_home, monkeypatch):
 def test_board_override_restores_env_when_init_fails(kanban_home, monkeypatch):
     kb.create_board("alpha")
     monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
-    monkeypatch.setattr(kb, "init_db", lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+    monkeypatch.setattr(_reconciled_hermes_cli_kanban_db_connect, "init_db", lambda: (_ for _ in ()).throw(RuntimeError("boom")))
     parser = argparse.ArgumentParser(prog="hermes", add_help=False)
     sub = parser.add_subparsers(dest="command")
     kc.build_parser(sub)
@@ -198,6 +214,7 @@ def test_run_slash_reclaim_running_task(kanban_home):
     import time
     import secrets
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
 
     out1 = kc.run_slash("create 'stuck worker task' --assignee broken-model")
     m = re.search(r"(t_[a-f0-9]+)", out1)
@@ -205,7 +222,7 @@ def test_run_slash_reclaim_running_task(kanban_home):
     tid = m.group(1)
 
     # Simulate a running claim outside TTL.
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         lock = secrets.token_hex(4)
         conn.execute(

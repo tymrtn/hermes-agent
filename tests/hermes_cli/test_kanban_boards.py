@@ -15,6 +15,7 @@ Covers the pieces added when boards became a first-class concept:
 
 from __future__ import annotations
 
+import hermes_cli.kanban_db_connect as _reconciled_hermes_cli_kanban_db_connect
 import json
 import os
 import subprocess
@@ -29,6 +30,8 @@ if str(_WORKTREE) not in sys.path:
     sys.path.insert(0, str(_WORKTREE))
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_dispatch as kbd
 
 
 # ---------------------------------------------------------------------------
@@ -153,7 +156,7 @@ class TestBoardCRUD:
         # downstream readers hit `no such table: task_events`.
         kb.create_board("recycle")
         # First connect populates _INITIALIZED_PATHS for this DB.
-        with kb.connect(board="recycle") as conn:
+        with kbc.connect(board="recycle") as conn:
             kb.create_task(conn, title="t1", assignee="dev")
         db_path = kb.board_dir("recycle") / "kanban.db"
         assert str(db_path.resolve()) in kb._INITIALIZED_PATHS
@@ -165,7 +168,7 @@ class TestBoardCRUD:
 
         # Simulate the event-stream poll: re-open the same slug. connect()
         # recreates the directory + empty .db; the schema must be re-applied.
-        with kb.connect(board="recycle") as conn:
+        with kbc.connect(board="recycle") as conn:
             tables = {
                 row[0]
                 for row in conn.execute(
@@ -192,18 +195,18 @@ class TestConnectionIsolation:
         kb.create_board("alpha")
         kb.create_board("beta")
 
-        with kb.connect(board="alpha") as conn:
+        with kbc.connect(board="alpha") as conn:
             kb.create_task(conn, title="alpha-task-1", assignee="dev")
             kb.create_task(conn, title="alpha-task-2", assignee="dev")
 
-        with kb.connect(board="beta") as conn:
+        with kbc.connect(board="beta") as conn:
             kb.create_task(conn, title="beta-only", assignee="dev")
 
-        with kb.connect(board="alpha") as conn:
+        with kbc.connect(board="alpha") as conn:
             a = kb.list_tasks(conn)
-        with kb.connect(board="beta") as conn:
+        with kbc.connect(board="beta") as conn:
             b = kb.list_tasks(conn)
-        with kb.connect(board="default") as conn:
+        with kbc.connect(board="default") as conn:
             d = kb.list_tasks(conn)
 
         assert {t.title for t in a} == {"alpha-task-1", "alpha-task-2"}
@@ -213,9 +216,9 @@ class TestConnectionIsolation:
     def test_connect_without_args_uses_current(self, fresh_home):
         kb.create_board("curr")
         kb.set_current_board("curr")
-        with kb.connect() as conn:
+        with kbc.connect() as conn:
             kb.create_task(conn, title="implicit", assignee="x")
-        with kb.connect(board="curr") as conn:
+        with kbc.connect(board="curr") as conn:
             tasks = kb.list_tasks(conn)
         assert [t.title for t in tasks] == ["implicit"]
 
@@ -224,11 +227,11 @@ class TestConnectionIsolation:
         kb.create_board("envwin")
         kb.set_current_board("persist")
         monkeypatch.setenv("HERMES_KANBAN_BOARD", "envwin")
-        with kb.connect() as conn:
+        with kbc.connect() as conn:
             kb.create_task(conn, title="via-env", assignee="x")
-        with kb.connect(board="envwin") as conn:
+        with kbc.connect(board="envwin") as conn:
             assert [t.title for t in kb.list_tasks(conn)] == ["via-env"]
-        with kb.connect(board="persist") as conn:
+        with kbc.connect(board="persist") as conn:
             assert kb.list_tasks(conn) == []
 
 
@@ -275,7 +278,7 @@ class TestWorkerSpawnEnv:
             tenant=None,
         )
 
-        kb._default_spawn(task, str(fresh_home / "ws"), board="spawntest")
+        kbd._default_spawn(task, str(fresh_home / "ws"), board="spawntest")
 
         env = captured["env"]
         assert env["HERMES_KANBAN_BOARD"] == "spawntest"
@@ -396,17 +399,17 @@ class TestProfileScopedDefaults:
         _write_profile_config(beta_home, "beta-board")
 
         assert kb.get_current_board() == "alpha-board"
-        with kb.connect() as conn:
+        with _reconciled_hermes_cli_kanban_db_connect.connect() as conn:
             kb.create_task(conn, title="alpha-only")
 
         monkeypatch.setenv("HERMES_HOME", str(beta_home))
         assert kb.get_current_board() == "beta-board"
-        with kb.connect() as conn:
+        with _reconciled_hermes_cli_kanban_db_connect.connect() as conn:
             kb.create_task(conn, title="beta-only")
 
-        with kb.connect(board="alpha-board") as conn:
+        with _reconciled_hermes_cli_kanban_db_connect.connect(board="alpha-board") as conn:
             assert [t.title for t in kb.list_tasks(conn)] == ["alpha-only"]
-        with kb.connect(board="beta-board") as conn:
+        with _reconciled_hermes_cli_kanban_db_connect.connect(board="beta-board") as conn:
             assert [t.title for t in kb.list_tasks(conn)] == ["beta-only"]
 
     def test_boards_switch_writes_profile_local_pointer(self, tmp_path, monkeypatch):
