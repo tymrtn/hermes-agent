@@ -246,6 +246,10 @@ async def test_recent_telegram_text_followup_is_queued_without_interrupt():
 @pytest.mark.asyncio
 async def test_recent_telegram_followups_append_in_pending_queue():
     runner = _make_runner()
+    # This exercises the interrupt-mode grace-window merge. The fork defaults
+    # busy_input_mode to "queue" (each follow-up gets its own FIFO turn — see the
+    # sibling test below), so pin the mode the merge mechanism belongs to.
+    runner._busy_input_mode = "interrupt"
     first = _make_event(text="part one")
     second = _make_event(text="part two")
     session_key = build_session_key(first.source)
@@ -262,6 +266,31 @@ async def test_recent_telegram_followups_append_in_pending_queue():
     fake_agent.interrupt.assert_not_called()
     adapter = runner.adapters[Platform.TELEGRAM]
     assert adapter._pending_messages[session_key].text == "part one\npart two"
+
+
+@pytest.mark.asyncio
+async def test_queue_mode_followups_keep_head_slot_and_fifo_overflow():
+    """Under the fork's default ``busy_input_mode = "queue"`` each grace-window
+    follow-up is a separate turn: the head slot keeps the first message and the
+    second waits in the session's FIFO overflow instead of merging."""
+    runner = _make_runner()
+    first = _make_event(text="part one")
+    second = _make_event(text="part two")
+    session_key = build_session_key(first.source)
+
+    fake_agent = MagicMock()
+    fake_agent.get_activity_summary.return_value = {"seconds_since_activity": 0}
+    runner._running_agents[session_key] = fake_agent
+    import time as _time
+    runner._running_agents_ts[session_key] = _time.time()
+
+    await runner._handle_message(first)
+    await runner._handle_message(second)
+
+    fake_agent.interrupt.assert_not_called()
+    adapter = runner.adapters[Platform.TELEGRAM]
+    assert adapter._pending_messages[session_key].text == "part one"
+    assert [e.text for e in runner._overflow_queue(session_key)] == ["part two"]
 
 
 # ------------------------------------------------------------------

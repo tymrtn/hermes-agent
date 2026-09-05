@@ -151,7 +151,11 @@ def scan_for_threats(content: str, scope: str = "context") -> List[str]:
         raise ValueError(f"scan_for_threats: unknown scope {scope!r}")
     content = content[:MAX_SCAN_CHARS]
     # Invisible unicode is checked on the RAW content: NFKC below can strip these codepoints.
-    findings: List[str] = [f"invisible_unicode_U+{ord(ch):04X}" for ch in set(content) & INVISIBLE_CHARS]
+    # U+200D is both a promptware hiding primitive in prose and the standard emoji joiner;
+    # report it only when some occurrence is NOT joining two emoji bases (_is_emoji_zwj).
+    findings: List[str] = [
+        f"invisible_unicode_U+{ord(ch):04X}" for ch in set(content) & INVISIBLE_CHARS
+        if ch != "\u200d" or any(c == "\u200d" and not _is_emoji_zwj(content, i) for i, c in enumerate(content))]
     # NFKC folds full-width / compatibility variants (ｃａｔ → cat) against homograph bypass.
     # It does NOT fold cross-script confusables (Cyrillic ``а``) — that needs a TR#39 database.
     normalised = unicodedata.normalize("NFKC", content)

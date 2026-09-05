@@ -804,7 +804,13 @@ class TestMediaGroups:
             await adapter._handle_media_message(_make_update(msg1), MagicMock())
             await adapter._handle_media_message(_make_update(msg2), MagicMock())
             assert adapter.handle_message.await_count == 0
-            await asyncio.sleep(adapter.MEDIA_GROUP_WAIT_SECONDS + 0.05)
+            # The burst flushes after a wall-clock delay; a loaded parallel run can land
+            # the timer late, so poll for the flush instead of sleeping delay + margin.
+            deadline = asyncio.get_running_loop().time() + 5.0
+            while adapter.handle_message.await_count == 0:
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise AssertionError("buffered photo burst never flushed")
+                await asyncio.sleep(0.02)
 
         adapter.handle_message.assert_awaited_once()
         event = adapter.handle_message.await_args.args[0]
