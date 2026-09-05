@@ -275,7 +275,7 @@ class GatewayBusySessionMixin:
         "gateway_session_id", "gateway_session_strict",
     )
 
-    def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> None:
+    def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> bool:
         from gateway.platforms.base import merge_pending_message_event
         adapter = self._adapter_for_source(event.source)
         if not adapter:
@@ -308,7 +308,7 @@ class GatewayBusySessionMixin:
                 adapter._pending_messages, session_key, event,
                 merge_text=event.message_type == MessageType.TEXT,
             )
-            return
+            return True
 
         if self._queue_depth(session_key, adapter=adapter) >= self._BUSY_QUEUE_MAX_PENDING:
             logger.warning('Dropping busy-mode follow-up for session %s — pending queue at cap (%d).', session_key, self._BUSY_QUEUE_MAX_PENDING)
@@ -617,6 +617,72 @@ class GatewayBusySessionMixin:
             logger.debug('Failed to send busy-ack: %s', e)
             ack_result = None
 
+    async def _admit_busy_queue_event(
+        self,
+        session_key: str,
+        event: MessageEvent,
+        *,
+        log_context: str,
+        enqueue: bool = True,
+        merge_text: Optional[bool] = None,
+        adapter=None,
+    ) -> bool:
+        """Park a busy-session follow-up for the next turn and prepare its voice.
+
+        Every busy path that queues a message instead of steering or
+        interrupting goes through here: queue mode, steer-fallback-to-queue,
+        the subagent (#30170) and compression (#56391) interrupt demotions, the
+        agent-setup sentinel, and the PRIORITY fast-path in ``_handle_message``.
+        Steer and interrupt already pre-transcribe because they need the words
+        inside the running turn; the queue paths stored the raw event, so a
+        voice note sent mid-run got "Queued for the next turn" with no 🎙️ echo
+        and no evidence it was heard until the turn finished and the queue
+        drained.
+
+        Callers must have cleared their authorization / halt-phrase / approval
+        gates before reaching here — this issues an STT call and writes to the
+        chat.  Only STT-eligible voice media is transcribed; a
+        ``MessageType.AUDIO`` or ``DOCUMENT`` attachment stays a file.
+
+        ``enqueue=False`` serves a caller that durably queued the event itself
+        (the clarify-supersede path) and needs only the preparation half.
+        ``merge_text`` selects a raw ``merge_pending_message_event`` fold into
+        the head slot instead of the FIFO turn boundary; ``None`` means FIFO.
+
+        Returns whether the event is queued.  A rejected event (queue at cap)
+        is never transcribed.
+        """
+        from gateway.platforms.base import merge_pending_message_event
+        adapter = adapter if adapter is not None else self._adapter_for_source(event.source)
+        if enqueue:
+            if merge_text is None:
+                if not self._queue_or_replace_pending_event(session_key, event):
+                    return False
+            elif adapter is None:
+                return False
+            else:
+                merge_pending_message_event(
+                    adapter._pending_messages,
+                    session_key,
+                    event,
+                    merge_text=merge_text,
+                )
+        # Cache the transcript on whichever event the drain will consume: a
+        # media follow-up is folded into the existing pending head rather than
+        # stored, so caching on the incoming event would strand it and the
+        # drain would pay for STT again.
+        voice_event = self._busy_queued_voice_event(session_key, event, adapter)
+        if voice_event is not None:
+            await self._transcribe_and_echo_pending_voice(
+                voice_event,
+                adapter,
+                event.source,
+                voice_event.text or "",
+                log_context=log_context,
+            )
+        return True
+
+
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str, *, force_busy_ack: bool=False, already_queued: bool=False) -> bool:
         # Same authorization gate as the cold path, else unauthorized users in shared threads
         # inject messages into a session they don't own.
@@ -681,7 +747,16 @@ class GatewayBusySessionMixin:
         effective_mode, redirected = _steer.effective_mode, _steer.redirected
         # Queue as the next turn — skipped after a successful steer/redirect (the text is already in
         # the run and must NOT replay). FIFO gives each text its own turn (raw merge would join them).
-        if not _steer.steered and not redirected and not already_queued and not adapter_text_queue_staged:
+        needs_enqueue = (
+            not _steer.steered and not redirected
+            and not already_queued and not adapter_text_queue_staged
+        )
+        if effective_mode == "queue" and not _steer.steered and not redirected:
+            await self._admit_busy_queue_event(
+                session_key, event, log_context="Busy-queue",
+                enqueue=needs_enqueue, adapter=adapter,
+            )
+        elif needs_enqueue:
             self._queue_or_replace_pending_event(session_key, event)
         # Store the message so it's processed as the next turn after the current run finishes (or is
         # interrupted). Skip this for a successful steer — the text already landed inside the run and must

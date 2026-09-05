@@ -128,7 +128,7 @@ class TestSttGate:
     of the wire contract, and it must not silently change."""
 
     def test_new_connector_voice_event_is_stt_eligible(self):
-        from gateway.run import _event_media_is_stt_input
+        from gateway.platforms.base import _event_media_is_stt_input
 
         ev = _event_from_wire(
             _wire_event(
@@ -143,7 +143,7 @@ class TestSttGate:
         """A new-connector/old-gateway-shaped event — voice type, no
         media[] — still fires STT (the gate's VOICE branch doesn't consult
         media_types). Pins the rollout behaviour, not just the new one."""
-        from gateway.run import _event_media_is_stt_input
+        from gateway.platforms.base import _event_media_is_stt_input
 
         ev = _event_from_wire(
             _wire_event("voice", media_urls=["https://gw/relay/media/x"])
@@ -154,7 +154,7 @@ class TestSttGate:
         assert _event_media_is_stt_input(ev, 0) is True
 
     def test_legacy_audio_typed_voice_note_stays_out_of_stt(self):
-        from gateway.run import _event_media_is_stt_input
+        from gateway.platforms.base import _event_media_is_stt_input
 
         ev = _event_from_wire(
             _wire_event(
@@ -166,7 +166,7 @@ class TestSttGate:
         assert _event_media_is_stt_input(ev, 0) is False
 
     def test_music_upload_is_never_stt_eligible(self):
-        from gateway.run import _event_media_is_stt_input
+        from gateway.platforms.base import _event_media_is_stt_input
 
         ev = _event_from_wire(
             _wire_event(
@@ -195,7 +195,8 @@ class TestUrlMimePairingThroughLocalization:
     def test_dropped_first_attachment_does_not_shift_the_second_mime(self):
         import asyncio
 
-        from gateway.run import _event_media_is_image, _event_media_type_at
+        from gateway.run import _event_media_is_image
+        from gateway.platforms.base import _event_media_type_at
 
         rehost = "https://conn.example/relay/media/dead"
         kept = "https://cdn.discordapp.com/attachments/1/2/kept.png"
@@ -280,7 +281,7 @@ class TestParallelArrayLengthInvariant:
 
     def test_merging_an_untyped_event_with_a_typed_one_keeps_mimes_on_their_urls(self):
         from gateway.platforms.base import merge_pending_message_event
-        from gateway.run import _event_media_type_at
+        from gateway.platforms.base import _event_media_type_at
 
         untyped = _event_from_wire(
             _wire_event("image", media_urls=["https://x/old1.png", "https://x/old2.png"])

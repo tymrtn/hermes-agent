@@ -2128,6 +2128,7 @@ from gateway.run_goals import GatewayGoalsMixin
 from gateway.run_agent_cache import GatewayAgentCacheMixin
 from gateway.platforms.base import (
     BasePlatformAdapter,
+    _event_media_type_at,
     MessageEvent,
     MessageType,
     _reply_anchor_for_event,
@@ -2414,12 +2415,6 @@ def _try_resolve_fallback_provider() -> dict | None:
     return None
 
 
-def _event_media_type_at(event, index: int) -> str:
-    """Per-attachment MIME at *index*; "" when the adapter set only a message-level type."""
-    media_types = getattr(event, "media_types", None) or []
-    return media_types[index] if index < len(media_types) else ""
-
-
 def _event_media_kind_is(event, index: int, mime_prefix: str, fallback_types: frozenset) -> bool:
     """Per-attachment MIME first, message-level type only when unknown (else a document uploaded
     alongside an image is base64'd as vision and the provider 400s)."""
@@ -2435,14 +2430,6 @@ def _event_media_is_image(event, index: int) -> bool:
 
 def _event_media_is_audio(event, index: int) -> bool:
     return _event_media_kind_is(event, index, "audio/", frozenset({MessageType.VOICE, MessageType.AUDIO}))
-
-
-def _event_media_is_stt_input(event, index: int) -> bool:
-    """True when an audio attachment should enter the automatic STT pipeline."""
-    message_type = getattr(event, "message_type", None)
-    if message_type in {MessageType.AUDIO, MessageType.DOCUMENT}:
-        return False
-    return message_type == MessageType.VOICE or _event_media_type_at(event, index).startswith("audio/")
 
 
 def _event_media_is_video(event, index: int) -> bool:

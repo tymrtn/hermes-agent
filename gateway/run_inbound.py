@@ -538,7 +538,9 @@ class GatewayInboundMixin:
         # photo-only follow-up; adapter-level batching absorbs them.
         if event.message_type == MessageType.PHOTO:
             logger.debug("PRIORITY photo follow-up for session %s — queueing without interrupt", _quick_key)
-            self._hm_merge_pending_for_source(source, _quick_key, event)
+            await self._admit_busy_queue_event(
+                _quick_key, event, log_context="Busy-priority-photo", merge_text=False,
+            )
             return True, None
         return False, None
 
@@ -570,7 +572,7 @@ class GatewayInboundMixin:
     def _hm_text_only(event: "MessageEvent") -> bool:
         return event.message_type == MessageType.TEXT and not event.media_urls and not event.media_types
 
-    def _hm_busy_steer(self, event: "MessageEvent", running_agent: Any, _quick_key: str) -> None:
+    async def _hm_busy_steer(self, event: "MessageEvent", running_agent: Any, _quick_key: str) -> None:
         """Steer mode: inject text mid-run via ``agent.steer()``, else fall back to queue semantics."""
         steer_text = (event.text or "").strip()
         steered = False
@@ -583,7 +585,9 @@ class GatewayInboundMixin:
             logger.debug("PRIORITY steer for session %s", _quick_key)
             return
         logger.debug("PRIORITY steer-fallback-to-queue for session %s", _quick_key)
-        self._queue_or_replace_pending_event(_quick_key, event)
+        await self._admit_busy_queue_event(
+            _quick_key, event, log_context="Busy-priority-queue",
+        )
 
     async def _hm_busy_interrupt(
         self, event: "MessageEvent", source: SessionSource, running_agent: Any, _quick_key: str
@@ -625,6 +629,9 @@ class GatewayInboundMixin:
 
         effective_busy_input_mode = self._effective_busy_input_mode(source)
         if self._hm_busy_telegram_grace_queue(event, source, _quick_key, effective_busy_input_mode):
+            await self._admit_busy_queue_event(
+                _quick_key, event, log_context="Busy-priority-grace", enqueue=False,
+            )
             return None
 
         _ra_state = self._peek_session_state(_quick_key)
@@ -634,12 +641,16 @@ class GatewayInboundMixin:
                 self._release_running_agent_state(_quick_key)
                 logger.info("HARD STOP (pending) for session %s — sentinel cleared", _quick_key)
                 return EphemeralReply("⚡ Force-stopped. The agent was still starting — session unlocked.")
-            self._hm_merge_pending_for_source(source, _quick_key, event, merge_text=True)  # picked up after start
+            await self._admit_busy_queue_event(
+                _quick_key, event, log_context="Busy-priority-pending", merge_text=True,
+            )
             return None
         if self._draining:
             queue_during_drain = self._queue_during_drain_enabled(effective_busy_input_mode)
             if queue_during_drain:
-                self._queue_or_replace_pending_event(_quick_key, event)
+                await self._admit_busy_queue_event(
+                    _quick_key, event, log_context="Busy-priority-queue",
+                )
             return (
                 f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
                 if queue_during_drain
@@ -647,10 +658,12 @@ class GatewayInboundMixin:
             )
         if effective_busy_input_mode == "queue":
             logger.debug("PRIORITY queue follow-up for session %s", _quick_key)
-            self._queue_or_replace_pending_event(_quick_key, event)
+            await self._admit_busy_queue_event(
+                _quick_key, event, log_context="Busy-priority-queue",
+            )
             return None
         if effective_busy_input_mode == "steer":
-            self._hm_busy_steer(event, running_agent, _quick_key)
+            await self._hm_busy_steer(event, running_agent, _quick_key)
             return None
         # Subagent protection: an interrupt cascades through ``_active_children`` and aborts
         # in-flight delegate_task work (/stop reached its handler above — still an escape hatch).
@@ -664,7 +677,9 @@ class GatewayInboundMixin:
             await self._hm_busy_interrupt(event, source, running_agent, _quick_key)
             return None
         logger.info("PRIORITY interrupt demoted to queue for session %s %s", _quick_key, _demote)
-        self._queue_or_replace_pending_event(_quick_key, event)
+        await self._admit_busy_queue_event(
+            _quick_key, event, log_context="Busy-priority-queue",
+        )
         return None
 
     def _hm_quick_commands(self) -> dict:
@@ -1352,7 +1367,8 @@ class GatewayInboundMixin:
         """Split ``event.media_urls`` into (image, STT-voice, audio-file, video) paths. Per-attachment
         MIME wins over the message-level type (a document sent alongside an image must not be routed
         as an image). MessageType.AUDIO / mixed DOCUMENT audio is a file attachment, never STT."""
-        from gateway.run import _event_media_is_audio, _event_media_is_image, _event_media_is_stt_input
+        from gateway.run import _event_media_is_audio, _event_media_is_image
+        from gateway.platforms.base import _event_media_is_stt_input
         image_paths, audio_paths, audio_file_paths, video_paths = [], [], [], []
         for i, path in enumerate(event.media_urls or []):
             mtype = event.media_types[i] if i < len(event.media_types) else ""
@@ -1917,6 +1933,8 @@ class GatewayInboundMixin:
     @classmethod
     def _prepend_media_prefix(cls, prefix: str, user_text: str) -> str:
         """``prefix`` + the user's text; the Discord empty-content placeholder is dropped as redundant."""
+        if not prefix:
+            return user_text
         if user_text and user_text.strip() != cls._EMPTY_TEXT_PLACEHOLDER:
             return f"{prefix}\n\n{user_text}"
         return prefix
@@ -2006,27 +2024,165 @@ class GatewayInboundMixin:
 
     def _pending_event_audio_paths(self, event) -> List[str]:
         """Return STT-eligible paths from a pending voice message."""
-        from gateway.run import _event_media_is_stt_input
+        from gateway.platforms.base import _event_media_is_stt_input
         return [
             path for i, path in enumerate(getattr(event, "media_urls", None) or [])
             if _event_media_is_stt_input(event, i)
         ]
 
-    async def _transcribe_pending_audio_event_once(
-        self, event, user_text: Optional[str] = None
-    ) -> tuple[str | None, List[str]]:
-        """Transcribe a pending audio event once and cache the result on the event: the interrupt
-        monitor and the pending-drain path both need it — one STT call and one echo per message."""
-        if hasattr(event, "_gateway_pending_stt_text"):
-            return event._gateway_pending_stt_text, list(getattr(event, "_gateway_pending_stt_transcripts", []) or [])
+    def _busy_queued_voice_event(self, session_key: str, event, adapter):
+        """Return the queued event that owns *event*'s voice media, if any.
+
+        ``_queue_or_replace_pending_event`` folds a media follow-up into the
+        existing pending head (photo-burst / album semantics) rather than
+        storing the incoming event, and that head is what the drain path
+        consumes.  The transcript cache and the echo ledger therefore have to
+        live on the head, not on the orphaned incoming event.  Returns ``None``
+        when there is nothing STT-eligible to prepare.
+        """
         audio_paths = self._pending_event_audio_paths(event)
         if not audio_paths:
-            return user_text if user_text is not None else (getattr(event, "text", None) or None), []
+            return None
+        pending_slot = getattr(adapter, "_pending_messages", None)
+        head = pending_slot.get(session_key) if isinstance(pending_slot, dict) else None
+        if head is not None and head is not event:
+            head_urls = set(getattr(head, "media_urls", None) or [])
+            if all(path in head_urls for path in audio_paths):
+                return head
+        return event
+
+
+    def _cached_pending_stt_result(
+        self,
+        event,
+        user_text: Optional[str],
+    ) -> Optional[tuple[str, List[str]]]:
+        """Return the cached ``(enriched_text, transcripts)`` for *event*, or None.
+
+        Only the caption-independent transcription *prefix* is cached, so a
+        caption that changed after the transcription ran — a text follow-up or
+        a photo caption merged into a queued voice note — is re-joined here
+        instead of triggering a second STT call for audio nobody re-sent.
+
+        The cache is valid only while it describes the event's current
+        STT-eligible attachments.  A merge that lands while a transcription is
+        already in flight can leave the two out of step, so the audio set is
+        re-checked on every read rather than trusted from the merge site alone.
+        """
+        if not hasattr(event, "_gateway_pending_stt_prefix"):
+            return None
+        cached_paths = getattr(event, "_gateway_pending_stt_audio_paths", None) or []
+        if list(cached_paths) != self._pending_event_audio_paths(event):
+            return None
+        prefix = getattr(event, "_gateway_pending_stt_prefix") or ""
+        transcripts = list(getattr(event, "_gateway_pending_stt_transcripts", []) or [])
         text = user_text if user_text is not None else (getattr(event, "text", "") or "")
-        enriched_text, successful_transcripts = await self._enrich_message_with_transcription(text, audio_paths, cleanup_managed_audio=False)
-        event._gateway_pending_stt_text = enriched_text
-        event._gateway_pending_stt_transcripts = list(successful_transcripts)
-        return enriched_text, successful_transcripts
+        if text != getattr(event, "_gateway_pending_stt_input_text", None):
+            enriched = self._prepend_media_prefix(prefix, text)
+            setattr(event, "_gateway_pending_stt_text", enriched)
+            setattr(event, "_gateway_pending_stt_input_text", text)
+            return enriched, transcripts
+        return getattr(event, "_gateway_pending_stt_text"), transcripts
+
+
+    async def _fill_pending_stt_cache(
+        self,
+        event,
+        audio_paths: List[str],
+    ) -> tuple[str, List[str]]:
+        """Transcribe *audio_paths* and store the result on *event*.
+
+        Runs as a single shared task per event (see
+        ``_transcribe_pending_audio_event_once``) and writes the cache itself,
+        so a caller cancelled mid-await still leaves the transcript behind for
+        whoever asks next.
+        """
+        # Pass an empty caption: the cache stores the caption-independent
+        # prefix so it can be recomposed against a later merged caption.
+        #
+        # Skip cleanup here: several call sites (interrupt monitor, pending-
+        # drain, button-tap) can race to peek the same event, so another
+        # coroutine may still be mid-transcription on this path when the first
+        # one finishes. Deleting the file here could yank it out from under a
+        # concurrent in-flight read. The 24h age-based cache sweep
+        # (cleanup_audio_cache) still reclaims it later.
+        prefix, successful_transcripts = await self._enrich_message_with_transcription(
+            "",
+            audio_paths,
+            cleanup_managed_audio=False,
+        )
+        prefix = prefix or ""
+        event_text = getattr(event, "text", "") or ""
+        setattr(event, "_gateway_pending_stt_prefix", prefix)
+        setattr(event, "_gateway_pending_stt_transcripts", list(successful_transcripts))
+        setattr(event, "_gateway_pending_stt_audio_paths", list(audio_paths))
+        setattr(event, "_gateway_pending_stt_input_text", event_text)
+        setattr(event, "_gateway_pending_stt_text", self._prepend_media_prefix(prefix, event_text))
+        return prefix, list(successful_transcripts)
+
+
+    async def _transcribe_pending_audio_event_once(
+        self,
+        event,
+        user_text: Optional[str] = None,
+    ) -> tuple[str | None, List[str]]:
+        """Transcribe a pending audio event once and cache the result on the event.
+
+        Voice follow-ups can be inspected first by the interrupt monitor and
+        later consumed by the pending-drain path.  Both need the same transcript,
+        but only one STT call and one transcript echo should happen for the
+        platform message.
+
+        Arrival-time preparation and the pending drain can also reach the same
+        event *concurrently*, before either has populated the cache.  The
+        in-flight transcription is therefore published on the event and shared:
+        the second caller awaits the first call instead of issuing its own.
+        The shared task is shielded so one caller's cancellation neither kills
+        the transcription nor poisons the event — the handle is dropped once it
+        settles, so a failed attempt can be retried later.
+        """
+        prefix = ""
+        transcripts: List[str] = []
+        # Bounded retry: a merge that lands while STT is in flight leaves the
+        # fresh cache describing stale audio, and the re-check below re-runs
+        # for the merged set.  Cap the attempts so a pathological burst of
+        # merges cannot spin here instead of answering the caller.
+        for _attempt in range(3):
+            cached = self._cached_pending_stt_result(event, user_text)
+            if cached is not None:
+                return cached
+
+            audio_paths = self._pending_event_audio_paths(event)
+            if not audio_paths:
+                return (
+                    user_text if user_text is not None else (getattr(event, "text", None) or None),
+                    [],
+                )
+
+            inflight = getattr(event, "_gateway_pending_stt_inflight", None)
+            if inflight is None or inflight.done():
+                inflight = asyncio.ensure_future(
+                    self._fill_pending_stt_cache(event, audio_paths)
+                )
+                setattr(event, "_gateway_pending_stt_inflight", inflight)
+            try:
+                prefix, transcripts = await asyncio.shield(inflight)
+            finally:
+                if (
+                    inflight.done()
+                    and getattr(event, "_gateway_pending_stt_inflight", None) is inflight
+                ):
+                    try:
+                        delattr(event, "_gateway_pending_stt_inflight")
+                    except AttributeError:
+                        pass
+
+            cached = self._cached_pending_stt_result(event, user_text)
+            if cached is not None:
+                return cached
+
+        text = user_text if user_text is not None else (getattr(event, "text", "") or "")
+        return self._prepend_media_prefix(prefix, text), list(transcripts)
 
     async def _echo_pending_stt_transcripts_once(
         self, event, adapter, source, transcripts: List[str], *, metadata=None,

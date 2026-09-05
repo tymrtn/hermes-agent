@@ -1915,8 +1915,91 @@ class SecureReply(str):
         return str.__str__(self)
 
 
-STAGED_WATERMARK_COMMIT_KEY = 'staged_watermark_commit'
-def _merge_unique_channel_context(existing_ctx: Optional[str], incoming_ctx: Optional[str]) -> Optional[str]:
+def _event_media_type_at(event, index: int) -> str:
+    """Return the per-attachment MIME for the attachment at *index*.
+
+    Empty string when the platform didn't populate a per-file MIME for
+    that slot (some adapters only set a message-level type).
+    """
+    media_types = getattr(event, "media_types", None) or []
+    return media_types[index] if index < len(media_types) else ""
+
+
+def _event_media_is_stt_input(event, index: int) -> bool:
+    """True when an audio attachment should enter the automatic STT pipeline."""
+    message_type = getattr(event, "message_type", None)
+    if message_type in {MessageType.AUDIO, MessageType.DOCUMENT}:
+        return False
+    return (
+        message_type == MessageType.VOICE
+        or _event_media_type_at(event, index).startswith("audio/")
+    )
+
+
+def _stt_eligible_media_urls(event) -> List[str]:
+    """Return the attachment paths on *event* that automatic STT would read."""
+    media_urls = getattr(event, "media_urls", None) or []
+    return [
+        url for index, url in enumerate(media_urls)
+        if _event_media_is_stt_input(event, index)
+    ]
+
+
+# Gateway-owned STT cache attributes, all derived from the same transcription
+# run.  ``_gateway_pending_stt_echoed`` is deliberately absent: it is the echo
+# ledger, not derived state, and must survive invalidation (see below).
+_PENDING_STT_CACHE_ATTRS = (
+    "_gateway_pending_stt_text",
+    "_gateway_pending_stt_input_text",
+    "_gateway_pending_stt_prefix",
+    "_gateway_pending_stt_transcripts",
+    "_gateway_pending_stt_audio_paths",
+)
+
+
+def _invalidate_pending_stt_cache(event: MessageEvent) -> None:
+    """Drop the gateway STT cache when the merged event's audio changed.
+
+    ``merge_pending_message_event`` extends ``media_urls`` in place when two
+    media-bearing messages arrive in quick succession.  The gateway runner
+    caches STT transcripts on the event via ``setattr`` (see
+    ``_transcribe_pending_audio_event_once``); if the cached event gains new
+    voice media, the stale transcript must be discarded so the next
+    transcription call picks up the merged attachments.
+
+    A merge that leaves the STT-eligible audio untouched — a caption, a plain
+    text follow-up, a photo, an ``AUDIO``/``DOCUMENT`` file attachment — keeps
+    the cache.  The words on the wire did not change, so re-running STT would
+    bill for the same audio twice and lose the arrival-time transcript.  Only
+    the transcription *prefix* is cached, not the caption it was joined with,
+    so the new text is folded back in on the next read (see
+    ``GatewayRunner._cached_pending_stt_result``).
+
+    Only the *derived* transcription cache is dropped.  The echo ledger
+    (``_gateway_pending_stt_echoed``) records which transcripts were already
+    delivered to the user and must survive the merge: the re-run transcription
+    returns the earlier notes again, so clearing the ledger would echo them a
+    second time.
+    """
+    cached_paths = getattr(event, "_gateway_pending_stt_audio_paths", None)
+    if cached_paths is not None and list(cached_paths) == _stt_eligible_media_urls(event):
+        return
+    for attr in _PENDING_STT_CACHE_ATTRS:
+        if hasattr(event, attr):
+            delattr(event, attr)
+
+
+# Metadata key under which a platform adapter stages a deferred thread-
+# watermark commit (Slack today). The adapter's on_processing_complete
+# applies it only after the turn is admitted (MessageEvent.turn_admitted)
+# and succeeded. When pending events merge, the surviving event must carry
+# the NEWEST staged commit — see _adopt_newer_staged_watermark.
+STAGED_WATERMARK_COMMIT_KEY = "staged_watermark_commit"
+
+
+def _merge_unique_channel_context(
+    existing_ctx: Optional[str], incoming_ctx: Optional[str]
+) -> Optional[str]:
     """Return ``existing_ctx`` with any unique lines from ``incoming_ctx`` appended.
 
     Channel context is a formatted backfill block (``[Recent channel messages]``
@@ -2007,11 +2090,7 @@ def merge_pending_message_event(pending_messages: Dict[str, MessageEvent], sessi
             elif existing_type == MessageType.TEXT and event.message_type != MessageType.TEXT:
                 existing.message_type = event.message_type
             _adopt_newer_staged_watermark(existing, event)
-            # Drop the *derived* STT cache (event changed); the echo ledger must survive or
-            # notes echo twice.
-            for attr in ("_gateway_pending_stt_text", "_gateway_pending_stt_transcripts"):
-                if hasattr(existing, attr):
-                    delattr(existing, attr)
+            _invalidate_pending_stt_cache(existing)
             return
         both_text = existing_type == MessageType.TEXT and event.message_type == MessageType.TEXT
         if merge_text and both_text:
