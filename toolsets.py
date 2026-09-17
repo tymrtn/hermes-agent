@@ -37,6 +37,8 @@ _HERMES_CORE_TOOLS = [
     "computer_use",
     # Service-gated connector account status and authorization links.
     "manage_connections",
+    # Read-only local macOS Messages search; gated by IMESSAGE_SEARCH_ENABLED + Full Disk Access.
+    "imessage_search",
 ]
 
 # Webhook payloads are untrusted third-party content: no file/system execution.
@@ -145,6 +147,10 @@ TOOLSETS = {
     "code_execution": _ts("Run Python scripts that call tools programmatically (reduces LLM round trips)", ["execute_code"]),
     "delegation": _ts("Spawn subagents with isolated context for complex subtasks", ["delegate_task"]),
     "homeassistant": _ts("Home Assistant smart home control and monitoring", _HA_TOOLS),
+    "imessage": _ts(
+        "Read-only local macOS Messages/iMessage/SMS search. Requires IMESSAGE_SEARCH_ENABLED=true "
+        "and Full Disk Access for the host process.",
+        ["imessage_search"]),
     "kanban": _ts(
         "Kanban multi-agent coordination — only active when the agent is spawned by "
         "the kanban dispatcher (HERMES_KANBAN_TASK env set). The dispatcher runs "
