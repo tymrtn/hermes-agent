@@ -229,6 +229,24 @@ class TestCodexBuildKwargs:
         message_item = next(item for item in kw["input"] if item.get("type") == "message")
         assert message_item["id"] == "msg_short_id"
 
+    def test_codex_backend_carries_the_output_cap_to_the_wire(self, transport):
+        """The #90393 escalation boosts max_output_tokens; withholding it here meant every codex
+        retry re-burned the same budget and the turn could never converge."""
+        kw = transport.build_kwargs(
+            model="gpt-5.5", messages=[{"role": "user", "content": "hi"}], tools=[],
+            is_codex_backend=True, max_tokens=65536,
+        )
+
+        assert kw["max_output_tokens"] == 65536
+
+    def test_a_route_without_a_cap_sends_none(self, transport):
+        kw = transport.build_kwargs(
+            model="gpt-5.5", messages=[{"role": "user", "content": "hi"}], tools=[],
+            is_codex_backend=True,
+        )
+
+        assert "max_output_tokens" not in kw
+
     def test_codex_backend_drops_foreign_message_item_id_end_to_end(self, transport):
         messages = [
             {

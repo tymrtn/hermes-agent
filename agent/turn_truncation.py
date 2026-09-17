@@ -235,7 +235,7 @@ def _content_filter_fallback(st: _Trunc, _retry: TurnRetryState) -> Optional[Tru
     return None
 
 
-def _continue_text(st: _Trunc, _retry: TurnRetryState, assistant_message: Any) -> TruncationVerdict:
+def _continue_text(st: _Trunc, _retry: TurnRetryState, assistant_message: Any, api_kwargs: Any) -> TruncationVerdict:
     """Text truncation (no tool calls): append the fragment + a continuation nudge (up to
     4), then the ceiling exit that drops the fragment trail and keeps the stitched partial.
     Never appends an interim assistant row with NO visible content — strict providers
@@ -272,6 +272,15 @@ def _continue_text(st: _Trunc, _retry: TurnRetryState, assistant_message: Any) -
             "role": "user", "content": _get_continuation_prompt(st.is_stub, _dropped_tools),
             "_length_continuation_nudge": True,
         })
+        # A continuation used to re-issue under the SAME output cap, so a long answer hit the
+        # ceiling again and again and ran out of attempts with nothing but a truncation sentinel to
+        # show. Give each pass more room, exactly as the truncated-tool-call retry above does, and
+        # never below whatever the caller already asked for.
+        _text_boost = (agent.max_tokens if agent.max_tokens else 4096) * (n + 1)
+        _text_requested_cap = agent._requested_output_cap_from_api_kwargs(api_kwargs)
+        if _text_requested_cap is not None:
+            _text_boost = max(_text_boost, _text_requested_cap)
+        agent._ephemeral_max_output_tokens = min(_text_boost, max(32768, _text_requested_cap or 0))
         agent._session_messages = messages
         _retry.restart_with_length_continuation = True
         return st.done("break")
@@ -428,7 +437,7 @@ def recover_from_truncation(
             return cf
         if _trunc_msg is not None:
             if not _trunc_has_tool_calls:
-                return _continue_text(st, _retry, _trunc_msg)
+                return _continue_text(st, _retry, _trunc_msg, api_kwargs)
             return _retry_truncated_tool_call(st, api_kwargs)
 
     if len(messages) > 1:

@@ -176,3 +176,15 @@ class TestNonempty400EnvelopeOverflowReply:
         text = "Context compression timed out without reducing this conversation. No messages were dropped."
         result = {**self._failed(text), "compression_exhausted": True}
         assert _normalize_empty_agent_response(result, text, history_len=138) == text
+
+    def test_a_leaked_truncation_sentinel_becomes_an_actionable_message(self):
+        """Some paths put the internal sentinel IN final_response; the user must not read it."""
+        result = {"final_response": "⚠️ Response truncated due to output length limit",
+                  "api_calls": 4, "partial": True, "interrupted": False}
+
+        response = _normalize_empty_agent_response(result, result["final_response"], history_len=10)
+
+        assert "Response truncated due to output length limit" not in response
+        assert "output limit" in response
+        assert "continue" in response.lower()
+

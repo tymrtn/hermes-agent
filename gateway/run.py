@@ -3038,6 +3038,14 @@ def _normalize_empty_agent_response(
     """
     is_overflow = is_context_overflow_failure_result(agent_result, history_len)
     if response and not (is_overflow and _looks_like_gateway_provider_error(response)):
+        # Some paths surface the internal truncation sentinel AS the final response instead of
+        # returning an empty partial, and the user then reads a developer string as the answer.
+        _lowered = str(response).lower()
+        if "truncat" in _lowered and "length" in _lowered:
+            return (
+                "⚠️ The response hit the model output limit before it finished. "
+                "Send `continue` to resume, or ask for a shorter answer or an attached file."
+            )
         return response
     if agent_result.get("failed"):
         # ``error`` can be an EXPLICIT None (bypasses dict.get default) -> would render "failed: None".

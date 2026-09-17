@@ -657,7 +657,12 @@ class ResponsesApiTransport(ProviderTransport):
             headers = {k: v for k, v in headers.items() if v}
             if headers:
                 _merge_extra_headers(kwargs, **headers)
-        elif params.get("max_tokens") is not None:
+        # Not an elif: the output cap is not a backend-specific header, and the codex backend
+        # honors max_output_tokens like every other Responses route. Withholding it is what kept
+        # the #90393 incomplete-budget escalation from ever converging there — the boosted cap was
+        # computed, consumed, and then dropped before the wire, so each retry re-burned the same
+        # budget and the turn ran out of attempts still truncated.
+        if params.get("max_tokens") is not None:
             kwargs["max_output_tokens"] = params["max_tokens"]
 
         if is_xai_responses and session_id:
