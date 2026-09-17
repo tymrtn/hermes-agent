@@ -416,6 +416,12 @@ display:
   busy_ack_enabled: true   # set to false to suppress the ⚡/⏳/⏩ chat reply entirely
 ```
 
+#### Stop button on `/queue` (Telegram)
+
+With `busy_input_mode: queue` configured, the reply to a mid-run `/queue <prompt>` on Telegram carries a **🛑 Stop current run** button. Tapping it does exactly what typing `/stop` does, down to how it treats pending input: the queued message due to run next is discarded along with the run, and anything queued behind it stays. The default `interrupt` mode renders no button and changes nothing.
+
+The button is a convenience rendering of a command you can already type, and it carries no authority `/stop` does not: Hermes refuses it for anyone outside the bot's allowed list, for anyone other than the person who sent that `/queue`, and wherever `/stop` is admin-only and you are not an admin. Each button works once and belongs to one run, so tapping an old acknowledgement in your scroll history never touches a later turn — it answers that the run has already finished. Restarting the gateway retires every outstanding button.
+
 The first time you message a busy agent on any platform, Hermes appends a one-line reminder to the busy-ack explaining the knob (`"💡 First-time tip — …"`). The reminder fires once per install — a flag under `onboarding.seen.busy_input_prompt` latches it. Delete that key to see the tip again.
 
 If you find the busy acknowledgment noisy, set `display.busy_ack_enabled: false`. Input handling is unchanged; only the confirmation message is hidden.

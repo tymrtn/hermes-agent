@@ -13,11 +13,18 @@ import asyncio
 import contextlib
 import json
 import os
+import secrets
 import time
+from dataclasses import dataclass
 from agent.i18n import t
 from agent.session_activity import format_iteration_progress
 from gateway.config import Platform
-from gateway.platforms.base import EphemeralReply
+from gateway.platforms.base import (
+    BUSY_STOP_CONTROL_SPENT_NOTICE,
+    BUSY_STOP_CONTROL_STALE_NOTICE,
+    EphemeralReply,
+    unauthorized_action_notice,
+)
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionSource
 from gateway.whatsapp_identity import canonical_whatsapp_identifier
@@ -70,6 +77,29 @@ def _same_chat_key_slots(
         if tail is not None:
             return chat_type, tail
     return None
+
+
+@dataclass(frozen=True)
+class _BusyStopControl:
+    """One ``/queue`` acknowledgement's Stop button: a capability over exactly one run.
+
+    Bound to the run generation so a keyboard left tappable in the scrollback can never reach a
+    LATER turn, and to the source that queued so a second member of a shared chat cannot spend it
+    (#17775 in button form). Process-local and ephemeral by design: a restart invalidates every
+    outstanding token, and a stale tap answers "already used" — the same contract ``ea:`` and
+    ``cl:`` already have.
+    """
+
+    session_key: str
+    run_generation: int
+    source: SessionSource
+    chat_id: str
+    user_id: str
+
+
+# Bound so a chat that queues relentlessly cannot grow the table without limit; superseded runs are
+# pruned first, so the live ceiling is the number of concurrent runs, not the tap volume.
+_BUSY_STOP_CONTROL_MAX = 32
 
 
 class GatewayBusySessionMixin:
@@ -993,7 +1023,118 @@ class GatewayBusySessionMixin:
                 internal=event.internal, timestamp=event.timestamp,
             ), adapter)
         depth = self._queue_depth(quick_key, adapter=adapter)
-        return "Queued for the next turn." + (f" ({depth} queued)" if depth > 1 else "")
+        ack = "Queued for the next turn." + (f" ({depth} queued)" if depth > 1 else "")
+        if await self._send_busy_stop_control_ack(event, adapter, quick_key, source, ack):
+            return ""  # the buttoned ack IS the acknowledgement; nothing left to send inline
+        return ack
+
+    # ------------------------------------------------------------------ #
+    # Busy-run Stop control (the ``/queue`` acknowledgement's one button) #
+    # ------------------------------------------------------------------ #
+
+    def _busy_stop_controls(self) -> Dict[str, _BusyStopControl]:
+        """Live Stop-button tokens; lazily created so bare ``object.__new__`` test runners work."""
+        return self.__dict__.setdefault("_busy_stop_control_state", {})
+
+    def _mint_busy_stop_control(self, quick_key: str, source: SessionSource) -> Optional[str]:
+        """Issue an opaque token over the run ``quick_key`` is executing, or None when idle.
+
+        Tokens whose run has been superseded are dropped on the way in: nothing in the tap path
+        needs to expire them, because a stale token is already inert there.
+        """
+        state = self._peek_session_state(quick_key)
+        if state is None or state.turn.agent is None:
+            return None
+        controls = self._busy_stop_controls()
+        for token, control in list(controls.items()):
+            if not self._is_session_run_current(control.session_key, control.run_generation):
+                controls.pop(token, None)
+        while len(controls) >= _BUSY_STOP_CONTROL_MAX:
+            controls.pop(next(iter(controls)))
+        token = secrets.token_hex(6)  # 12 chars: "bs:<token>" is 15 of Telegram's 64 callback bytes
+        controls[token] = _BusyStopControl(
+            session_key=quick_key, run_generation=int(state.persistent.run_generation), source=source,
+            chat_id=str(getattr(source, "chat_id", "") or ""), user_id=str(getattr(source, "user_id", "") or ""))
+        return token
+
+    async def _send_busy_stop_control_ack(
+        self, event: MessageEvent, adapter, quick_key: str, source: SessionSource, ack: str) -> bool:
+        """Send the ``/queue`` acknowledgement with a Stop-current-run button; False means the
+        caller sends the plain text ack instead.
+
+        Gated on the source's own configured ``busy_input_mode``: under the default ``interrupt``
+        (restored by #40590) nothing renders and nothing changes.
+        """
+        # ``getattr(type(adapter), ...)``: the same probe _interrupt_and_clear_session uses for
+        # optional adapter capabilities — an adapter that is not a BasePlatformAdapter subclass
+        # must fall back to the plain ack, never raise out of /queue.
+        supports = getattr(type(adapter), "supports_busy_stop_control", None)
+        if adapter is None or not callable(supports) or not supports():
+            return False
+        if self._effective_busy_input_mode(source) != "queue":
+            return False
+        control_id = self._mint_busy_stop_control(quick_key, source)
+        if control_id is None:
+            return False
+        result = None
+        try:
+            result = await adapter.send_busy_stop_control(
+                str(source.chat_id), ack, control_id,
+                metadata=self._thread_metadata_for_source(source, event.message_id))
+        except Exception:
+            # Loud: the ack still reaches the user as plain text below, but a control that never
+            # renders is otherwise invisible.
+            logger.warning("Busy stop-control ack send failed for %s", quick_key, exc_info=True)
+        if result is None or not getattr(result, "success", False):
+            self._busy_stop_controls().pop(control_id, None)  # never leave a token no one can see
+            return False
+        return True
+
+    async def _resolve_busy_stop_control(
+        self, control_id: str, *, actor_user_id: str, chat_id: Any, adapter) -> Tuple[str, str]:
+        """Resolve a Stop-button tap → ``(status, notice)``, where ``status`` is one of ``stopped``,
+        ``refused``, ``denied``, ``stale`` or ``resolved``; only ``refused`` leaves the button live.
+
+        Every check is synchronous and runs BEFORE the token is claimed, so a refused or denied tap
+        leaves the control live for the source that owns it and two concurrent taps cannot both
+        spend it. A tap carries no authority ``/stop`` does not: it is dispatched as ``/stop`` from
+        the queueing source through the adapter's own active-session command path, so the whole
+        lifecycle — debounce discard, command guard, reply, cancel, drain — and every admission
+        gate behind it run exactly as they do for typed text.
+        """
+        controls = self._busy_stop_controls()
+        control = controls.get(control_id)
+        if control is None:
+            return "resolved", BUSY_STOP_CONTROL_SPENT_NOTICE
+        if str(actor_user_id or "") != control.user_id or str(chat_id or "") != control.chat_id:
+            logger.warning(
+                "Refusing busy stop-control tap: actor %s in chat %s does not own the queued "
+                "message for session %s", actor_user_id, chat_id, control.session_key)
+            return "refused", unauthorized_action_notice(getattr(control.source, "platform", None))
+        denial = self._check_slash_access(control.source, "stop")
+        if denial is not None:
+            return "denied", denial
+        if not (self._is_session_running(control.session_key)
+                and self._is_session_run_current(control.session_key, control.run_generation)):
+            controls.pop(control_id, None)
+            return "stale", BUSY_STOP_CONTROL_STALE_NOTICE
+        stop_event = MessageEvent(
+            text="/stop", message_type=MessageType.TEXT, source=control.source,
+            # ``handle_message`` fails closed when the source no longer derives the session the
+            # token was minted for — it drops the event and says nothing.
+            metadata={"gateway_session_key": control.session_key})
+        # So test the same condition here: a drifted key must answer honestly rather than confirm
+        # a stop that was silently dropped.
+        derive_key = getattr(adapter, "_event_session_key", None)
+        if callable(derive_key) and derive_key(stop_event) != control.session_key:
+            logger.warning(
+                "Busy stop-control tap dropped: %s no longer derives session %s",
+                control.source.platform, control.session_key)
+            controls.pop(control_id, None)
+            return "stale", BUSY_STOP_CONTROL_STALE_NOTICE
+        controls.pop(control_id, None)  # claim-once, before the first await
+        await adapter.handle_message(stop_event)
+        return "stopped", t("gateway.stop.stopped")
 
     async def _busy_steer_command(self, event: MessageEvent, quick_key: str, source):
         # /steer lands BETWEEN tool-call iterations of the same run (appended to the last tool

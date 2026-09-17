@@ -449,6 +449,16 @@ UNAUTHORIZED_ACTION_NOTICE = (
     "`hermes pairing approve {platform} <request-id>` on the host (`hermes pairing list` shows the id).")
 
 
+# Answers for a busy-run Stop button tap that stopped nothing. Each is terminal for the control, so
+# the tap edits the button away. Kept under 200 chars for answerCallbackQuery, like
+# UNAUTHORIZED_ACTION_NOTICE above.
+BUSY_STOP_CONTROL_SPENT_NOTICE = "This Stop button has already been used."
+BUSY_STOP_CONTROL_STALE_NOTICE = "That run has already finished — nothing to stop."
+# The tap reached the gateway and raised. Never claim the run was stopped: say so and point at the
+# command that always works.
+BUSY_STOP_CONTROL_FAILED_NOTICE = "Couldn't stop that run — send /stop instead (the gateway log has why)."
+
+
 def unauthorized_action_notice(platform: Any) -> str:
     """``UNAUTHORIZED_ACTION_NOTICE`` for a ``Platform`` member or its string name."""
     name = getattr(platform, "value", platform)
@@ -2675,6 +2685,22 @@ class BasePlatformAdapter(ABC):
         ``GatewayRunner._resolve_slash_confirm(confirm_id, "once"|"always"|"cancel")``. Default (not
         supported) falls through to the gateway text fallback
         (``/approve``/``/always``/``/cancel``)."""
+        return SendResult(success=False, error="Not supported")
+
+    @classmethod
+    def supports_busy_stop_control(cls) -> bool:
+        """True when the adapter renders the busy-run Stop button; the gateway otherwise sends
+        the plain ``/queue`` acknowledgement."""
+        return cls.send_busy_stop_control is not BasePlatformAdapter.send_busy_stop_control
+
+    async def send_busy_stop_control(
+        self, chat_id: str, text: str, control_id: str,
+        metadata: Optional[Dict[str, Any]] = None) -> SendResult:
+        """``/queue`` acknowledgement carrying one "Stop current run" button. ``control_id`` is an
+        opaque server-issued token over one run, never a session key; button adapters render it and
+        MUST resolve the tap through ``GatewayRunner._resolve_busy_stop_control(control_id, ...)``,
+        which owns the authorization, claim-once and ``/stop`` lifecycle. Default (not supported):
+        the gateway falls back to the plain-text acknowledgement and nothing changes."""
         return SendResult(success=False, error="Not supported")
 
     async def send_clarify(

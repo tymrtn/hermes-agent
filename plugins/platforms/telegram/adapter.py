@@ -135,7 +135,8 @@ from gateway.authz_mixin import _coerce_allow_set
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base_exec_approval import EA_HEADER_TEXT
 from gateway.platforms.base import (
-    BasePlatformAdapter, ExecApprovalPrompt, SendResult, classify_send_error, unauthorized_action_notice,
+    BasePlatformAdapter, BUSY_STOP_CONTROL_FAILED_NOTICE, ExecApprovalPrompt, SendResult,
+    classify_send_error, unauthorized_action_notice,
     cache_image_from_bytes_async, cache_audio_from_bytes_async, cache_video_from_bytes_async, resolve_proxy_url, SUPPORTED_VIDEO_TYPES,
     SUPPORTED_DOCUMENT_TYPES, SUPPORTED_IMAGE_DOCUMENT_TYPES, _TEXT_INJECT_EXTENSIONS, utf16_len,
 )
@@ -3962,6 +3963,21 @@ class TelegramAdapter(BasePlatformAdapter):
         return await self._send_prompt(
             "send_slash_confirm", chat_id, metadata, build, thread_id=self._metadata_thread_id(metadata), reply_to_mode=self._reply_to_mode)
 
+    async def send_busy_stop_control(
+        self, chat_id: str, text: str, control_id: str, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
+        """Render the ``/queue`` acknowledgement with one Stop-current-run button.
+
+        ``bs:<control_id>`` follows every other prefix here: an opaque server-issued id, never the
+        target key, resolved and claimed once by the gateway.
+        """
+        def build():
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("🛑 Stop current run", callback_data=f"bs:{control_id}")]])
+            return self.format_message(text), keyboard, None
+        return await self._send_prompt(
+            "send_busy_stop_control", chat_id, metadata, build,
+            thread_id=self._metadata_thread_id(metadata), reply_to_mode=self._reply_to_mode)
+
     async def send_clarify(
         self, chat_id: str, question: str, choices: Optional[list], clarify_id: str, session_key: str,
         metadata: Optional[Dict[str, Any]] = None) -> SendResult:
@@ -4387,6 +4403,7 @@ class TelegramAdapter(BasePlatformAdapter):
         for prefix, handler in (
             ("gt:", self._handle_gmail_triage_callback), ("ea:", self._handle_exec_approval_callback),
             ("sc:", self._handle_slash_confirm_callback), ("cl:", self._handle_clarify_callback),
+            ("bs:", self._handle_busy_stop_callback),
             ("update_prompt:", self._handle_update_prompt_callback)):
             if data.startswith(prefix):
                 await handler(query, data, cb)
@@ -4400,6 +4417,37 @@ class TelegramAdapter(BasePlatformAdapter):
         if not session_key:
             await query.answer(text=resolved)
         return session_key
+
+    async def _handle_busy_stop_callback(self, query, data: str, cb: Dict[str, Any]) -> None:
+        """``bs:<control_id>`` — stop the run whose ``/queue`` acknowledgement carries this button.
+
+        Same order as ``_claim_callback_state``: the callback allowlist gate first, then the claim.
+        The gateway owns the rest (binding the tapping actor to the source that queued, ``/stop``'s
+        own access policy, claim-once, and the stop itself), so this renders the outcome only.
+        """
+        control_id = data.split(":", 1)[1].strip() if ":" in data else ""
+        if not control_id:
+            return
+        if not await self._callback_authorized(query, cb, _UNAUTHORIZED):
+            return
+        resolve = getattr(self.gateway_runner, "_resolve_busy_stop_control", None)
+        if resolve is None:  # no runner behind this adapter — the button can never work
+            await query.answer(text=BUSY_STOP_CONTROL_FAILED_NOTICE)
+            return
+        try:
+            status, notice = await resolve(
+                control_id, actor_user_id=str(getattr(query.from_user, "id", "") or ""),
+                chat_id=cb["chat_id"], adapter=self)
+        except Exception:
+            logger.error("[%s] Busy stop-control tap failed", self.name, exc_info=True)
+            await query.answer(text=BUSY_STOP_CONTROL_FAILED_NOTICE)
+            return
+        await query.answer(text=notice)
+        # A refusal leaves the control live for the member who queued; every other outcome spent it,
+        # so the button goes away. The acknowledgement text stays: it records what was queued.
+        if status != "refused":
+            acked = (getattr(query.message, "text", "") or "").strip()
+            await self._edit_md_quiet(query, f"{acked}\n\n{notice}" if acked else notice)
 
     async def _handle_exec_approval_callback(self, query, data: str, cb: Dict[str, Any]) -> None:
         """``ea:<choice>:<approval_id>`` — resolve a pending exec approval."""
