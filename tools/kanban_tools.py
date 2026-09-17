@@ -561,6 +561,70 @@ def _handle_list(args: dict, **kw) -> str:
             "promoted": promoted})
 
 
+@_kanban_handler("kanban_search")
+def _handle_search(args: dict, **kw) -> str:
+    """Find board work by text, with the same filters and truncation contract as kanban_list."""
+    _require_orchestrator_tool("kanban_search")
+    query = str(args.get("query") or "").strip()
+    _check(bool(query), "query is required")
+    fields = args.get("fields")
+    if fields is None:
+        fields = ["title", "body", "comments"]
+    elif isinstance(fields, str):
+        fields = [fields]
+    _check(isinstance(fields, (list, tuple)), "fields must be an array of strings")
+    fields = [str(f).strip() for f in fields if str(f).strip()]
+    include_archived = _parse_bool_arg(args, "include_archived")
+    limit = args.get("limit")
+    try:
+        limit = KANBAN_LIST_DEFAULT_LIMIT if limit is None else int(limit)
+    except (TypeError, ValueError):
+        return tool_error("limit must be an integer")
+    _check(limit >= 1, "limit must be >= 1")
+    _check(limit <= KANBAN_LIST_MAX_LIMIT, f"limit must be <= {KANBAN_LIST_MAX_LIMIT}")
+    with _board(args.get("board")) as (kb, conn):
+        promoted = kb.recompute_ready(conn)
+        # One extra row reports truncation without dumping the board, as kanban_list does.
+        rows = kb.search_tasks(
+            conn, query, fields=fields, assignee=args.get("assignee"), status=args.get("status"),
+            tenant=args.get("tenant"), include_archived=include_archived, limit=limit + 1)
+        truncated = len(rows) > limit
+        rows = rows[:limit]
+        return json.dumps({
+            "matches": [{**_task_summary_dict(kb, conn, row["task"]),
+                         "match_field": row["field"], "snippet": row["snippet"]} for row in rows],
+            "count": len(rows), "limit": limit, "truncated": truncated,
+            "next_limit": (min(limit * 2, KANBAN_LIST_MAX_LIMIT)
+                           if truncated and limit < KANBAN_LIST_MAX_LIMIT else None),
+            "promoted": promoted})
+
+
+KANBAN_SEARCH_SCHEMA = {
+    "name": "kanban_search",
+    "description": (
+        "Search Kanban task titles, bodies and comments so an orchestrator can find related board "
+        "work without direct database access. Filters by assignee, status, tenant, archived "
+        "visibility, fields and limit; returns compact task rows plus the matched field and a "
+        "snippet. Orchestrator-only — dispatcher-spawned task workers never see this tool."),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "Search text to find in the selected fields."},
+            "fields": {"type": "array", "items": {"type": "string", "enum": ["title", "body", "comments"]},
+                       "description": "Fields to search. Defaults to title, body and comments."},
+            "assignee": {"type": "string", "description": "Optional assignee/profile filter."},
+            "status": {"type": "string",
+                       "enum": ["triage", "todo", "ready", "running", "blocked", "done", "archived"],
+                       "description": "Optional task status filter."},
+            "tenant": {"type": "string", "description": "Optional tenant/project namespace filter."},
+            "include_archived": {"type": "boolean", "description": "Include archived tasks. Defaults to false."},
+            "limit": {"type": "integer", "description": "Maximum rows to return (default 50, max 200)."},
+        },
+        "required": ["query"],
+    },
+}
+
+
 @_kanban_handler("kanban_complete")
 def _handle_complete(args: dict, **kw) -> str:
     """Mark the current task done with a structured handoff."""
@@ -1015,10 +1079,11 @@ def _handle_link(args: dict, **kw) -> str:
 # --- Registration (order preserved: it is the order tools appear in the schema) ---
 
 # kanban_list / kanban_unblock route the board and are hidden from task workers.
-_ORCHESTRATOR_TOOLS = frozenset({"kanban_list", "kanban_unblock"})
+_ORCHESTRATOR_TOOLS = frozenset({"kanban_list", "kanban_search", "kanban_unblock"})
 _TOOLS = (
     ("kanban_show", KANBAN_SHOW_SCHEMA, _handle_show, "📋"),
     ("kanban_list", KANBAN_LIST_SCHEMA, _handle_list, "📋"),
+    ("kanban_search", KANBAN_SEARCH_SCHEMA, _handle_search, "🔎"),
     ("kanban_complete", KANBAN_COMPLETE_SCHEMA, _handle_complete, "✔"),
     ("kanban_block", KANBAN_BLOCK_SCHEMA, _handle_block, "⏸"),
     ("kanban_request_review", KANBAN_REQUEST_REVIEW_SCHEMA, _handle_request_review, "👀"),

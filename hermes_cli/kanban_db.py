@@ -1762,6 +1762,52 @@ def _task_rows(conn: sqlite3.Connection, table: str, task_id: str, order: str) -
     ).fetchall()
 
 
+def search_tasks(
+    conn: sqlite3.Connection, query: str, *, fields: Optional[Iterable[str]] = None,
+    assignee: Optional[str] = None, status: Optional[str] = None, tenant: Optional[str] = None,
+    include_archived: bool = False, limit: Optional[int] = None,
+) -> list[dict[str, Any]]:
+    """Search task titles, bodies and comments; returns ``{task, field, snippet}`` per match.
+
+    The kernel-backed API behind the agent-facing search tool: callers stay off raw ``kanban.db``
+    SQL and inherit :func:`list_tasks`'s filtering semantics exactly. First matching field per task
+    wins, so one task is one result.
+    """
+    needle = (query or "").strip()
+    if not needle:
+        raise ValueError("query is required")
+    valid_fields = {"title", "body", "comments"}
+    selected = set(fields or valid_fields)
+    if invalid := sorted(selected - valid_fields):
+        raise ValueError(f"fields must be a subset of {sorted(valid_fields)}; got {invalid}")
+
+    needle_l = needle.lower()
+    results: list[dict[str, Any]] = []
+    for task in list_tasks(conn, assignee=assignee, status=status, tenant=tenant,
+                           include_archived=include_archived, limit=None):
+        haystacks: list[tuple[str, str]] = []
+        if "title" in selected:
+            haystacks.append(("title", task.title or ""))
+        if "body" in selected:
+            haystacks.append(("body", task.body or ""))
+        if "comments" in selected:
+            haystacks.append(("comments", "\n".join(c.body for c in list_comments(conn, task.id))))
+        for field, text in haystacks:
+            idx = text.lower().find(needle_l)
+            if idx < 0:
+                continue
+            start, end = max(0, idx - 80), min(len(text), idx + len(needle) + 80)
+            snippet = text[start:end].replace("\n", " ").strip()
+            results.append({
+                "task": task, "field": field,
+                "snippet": ("…" if start > 0 else "") + snippet + ("…" if end < len(text) else ""),
+            })
+            break
+        if limit and len(results) >= int(limit):
+            break
+    return results
+
+
 def list_comments(conn: sqlite3.Connection, task_id: str) -> list[Comment]:
     return [Comment.from_row(r) for r in _task_rows(conn, "task_comments", task_id, "created_at ASC")]
 

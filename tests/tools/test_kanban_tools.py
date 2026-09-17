@@ -113,6 +113,72 @@ def test_list_filters_tasks(monkeypatch, worker_env):
     assert tenant_ids == [c]
 
 
+def test_search_finds_title_body_and_comments(monkeypatch, worker_env):
+    """kanban_search gives orchestrators text discovery with the same filters as kanban_list."""
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    conn = kbc.connect()
+    try:
+        title_hit = kb.create_task(conn, title="alpha launch", assignee="factory")
+        body_hit = kb.create_task(conn, title="body task", assignee="factory",
+                                  body="Needs the special widget path")
+        comment_hit = kb.create_task(conn, title="comment task", assignee="factory")
+        kb.add_comment(conn, comment_hit, "tester", "The widget note lives here")
+        other = kb.create_task(conn, title="unrelated", assignee="reviewer")
+    finally:
+        conn.close()
+
+    from tools import kanban_tools as kt
+    d = json.loads(kt._handle_search({"query": "widget", "assignee": "factory", "limit": 10}))
+
+    assert [m["id"] for m in d["matches"]] == [body_hit, comment_hit]
+    assert d["matches"][0]["match_field"] == "body"
+    assert "widget" in d["matches"][0]["snippet"]
+    assert other not in [m["id"] for m in d["matches"]]
+    assert title_hit not in [m["id"] for m in d["matches"]]
+
+    title_only = json.loads(kt._handle_search({"query": "alpha", "fields": ["title"]}))
+    assert [m["id"] for m in title_only["matches"]] == [title_hit]
+
+
+def test_search_rejects_an_unknown_field(monkeypatch, worker_env):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    from tools import kanban_tools as kt
+    assert "fields must be" in json.loads(kt._handle_search({"query": "x", "fields": ["events"]}))["error"]
+
+
+def test_search_requires_a_query(monkeypatch, worker_env):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    from tools import kanban_tools as kt
+    assert "query is required" in json.loads(kt._handle_search({"query": "  "}))["error"]
+
+
+def test_search_is_refused_for_a_dispatcher_worker(worker_env):
+    """worker_env keeps HERMES_KANBAN_TASK set: a spawned worker must not roam the board."""
+    from tools import kanban_tools as kt
+    assert "orchestrator-only" in json.loads(kt._handle_search({"query": "anything"}))["error"]
+
+
+def test_search_truncates_and_offers_a_larger_limit(monkeypatch, worker_env):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    conn = kbc.connect()
+    try:
+        for n in range(3):
+            kb.create_task(conn, title=f"widget {n}", assignee="factory")
+    finally:
+        conn.close()
+
+    from tools import kanban_tools as kt
+    d = json.loads(kt._handle_search({"query": "widget", "limit": 2}))
+
+    assert d["count"] == 2
+    assert d["truncated"] is True
+    assert d["next_limit"] == 4
+
+
 def test_complete_happy_path(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_complete({

@@ -27,7 +27,7 @@ _HERMES_CORE_TOOLS = [
     "execute_code", "delegate_task",
     "cronjob_manage",
     "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
-    "kanban_show", "kanban_list",
+    "kanban_show", "kanban_list", "kanban_search",
     "kanban_complete", "kanban_block", "kanban_request_review",
     "kanban_request_changes",
     "kanban_heartbeat",
@@ -158,7 +158,7 @@ TOOLSETS = {
         "config.yaml. Lets workers mark tasks done with structured handoffs, enter "
         "first-class review (request_review — not a block), return review changes, "
         "block for human input, heartbeat during long ops, comment on threads, attach "
-        "files, and (for orchestrators) list, unblock, and fan out tasks.",
+        "files, and (for orchestrators) list, search, unblock, and fan out tasks.",
         [t for t in _HERMES_CORE_TOOLS if t.startswith("kanban_")],
     ),
     "discord": _ts("Discord read and participate tools (fetch messages, search members, create threads)", ["discord"]),
