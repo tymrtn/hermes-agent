@@ -163,13 +163,14 @@ def compute_prompt_breakdown(platform: str = "cli") -> Dict[str, Any]:
 
     # Memory + user profile are joined into ``volatile``; re-derive them from the store so the
     # numbers stay attributable.
-    memory_block = user_block = ""
+    memory_block = shared_user_block = user_block = ""
     store = getattr(agent, "_memory_store", None)
     if store is not None:
         try:
             if getattr(agent, "_memory_enabled", True):
                 memory_block = store.format_for_system_prompt("memory") or ""
             if getattr(agent, "_user_profile_enabled", True):
+                shared_user_block = store.format_for_system_prompt("shared_user") or ""
                 user_block = store.format_for_system_prompt("user") or ""
         except Exception:
             pass
@@ -186,6 +187,7 @@ def compute_prompt_breakdown(platform: str = "cli") -> Dict[str, Any]:
         "system_prompt": _size(full),
         "skills_index": _size(skills_index),
         "memory": _size(memory_block),
+        "shared_user_profile": _size(shared_user_block),
         "user_profile": _size(user_block),
         "tools": {"count": len(tools), "json_bytes": _bytes(json.dumps(tools, ensure_ascii=False))},
         "sections": sections,
@@ -203,7 +205,8 @@ def render_breakdown(data: Dict[str, Any]) -> str:
         f"  System prompt total : {sp['bytes']:>8,} B  ({_fmt_kb(sp['bytes'])}, {sp['chars']:,} chars)", "",
         "  Major blocks:",
     ]
-    for label, key in (("skills index", "skills_index"), ("memory", "memory"), ("user profile", "user_profile")):
+    for label, key in (("skills index", "skills_index"), ("memory", "memory"),
+                       ("shared user profile", "shared_user_profile"), ("user profile", "user_profile")):
         byts = data[key]["bytes"]
         lines.append(f"    {label:<19}: {byts:>8,} B  ({_fmt_kb(byts)})")
     lines += ["", "  Prompt tiers:"] + [f"    {label:<36}: {byts:>8,} B  ({_fmt_kb(byts)})" for label, _chars, byts in data["sections"]]

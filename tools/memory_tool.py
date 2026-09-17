@@ -41,7 +41,47 @@ def get_memory_dir() -> Path:
 
 
 from tools.memory_tool_store import (  # noqa: E402,F401  (re-exports)
-    ENTRY_DELIMITER, MEMORY_BLOCK_HEADERS, MemoryStore, _scan_memory_content)
+    DEFAULT_SHARED_USER_CHAR_LIMIT, ENTRY_DELIMITER, MEMORY_BLOCK_HEADERS, MemoryStore,
+    _scan_memory_content)
+
+
+def _int_setting(cfg: Dict[str, Any], key: str, default: int) -> int:
+    """Read an int from a config mapping, falling back on junk values."""
+    try:
+        return int(cfg.get(key, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _bool_setting(cfg: Dict[str, Any], key: str, default: bool) -> bool:
+    """Read a boolean config value without treating ``"false"`` as truthy."""
+    value = cfg.get(key, default)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "off", ""}:
+            return False
+        return default
+    return value if isinstance(value, bool) else default
+
+
+def build_memory_store(mem_config: Optional[Dict[str, Any]] = None, *, memory_enabled: bool = True,
+                       user_profile_enabled: bool = True) -> "MemoryStore":
+    """Construct a :class:`MemoryStore` from a ``memory:`` config mapping.
+
+    The single construction point shared by the live agent (``agent/agent_init.py``) and every
+    agentless surface (:func:`load_on_disk_store`), so both enforce the same char caps and resolve
+    the same read-only shared user profile. Returned unloaded — callers decide when to hit disk.
+    """
+    cfg = mem_config if isinstance(mem_config, dict) else {}
+    return MemoryStore(
+        memory_char_limit=_int_setting(cfg, "memory_char_limit", 2200),
+        user_char_limit=_int_setting(cfg, "user_char_limit", 1375),
+        memory_enabled=memory_enabled, user_profile_enabled=user_profile_enabled,
+        shared_user_profile_path=cfg.get("shared_user_profile_path", ""),
+        shared_user_char_limit=_int_setting(
+            cfg, "shared_user_char_limit", DEFAULT_SHARED_USER_CHAR_LIMIT))
 
 
 def load_on_disk_store() -> "MemoryStore":
@@ -53,8 +93,8 @@ def load_on_disk_store() -> "MemoryStore":
         config = load_config() or {}
         mem_cfg = get_builtin_memory_config(config)
         memory_enabled, user_profile_enabled = get_builtin_memory_store_flags(config)
-        store = MemoryStore(int(mem_cfg.get("memory_char_limit", 2200)), int(mem_cfg.get("user_char_limit", 1375)),
-                            memory_enabled=memory_enabled, user_profile_enabled=user_profile_enabled)
+        store = build_memory_store(mem_cfg, memory_enabled=memory_enabled,
+                                   user_profile_enabled=user_profile_enabled)
     except Exception:
         store = MemoryStore()  # config optional — fall back to defaults rather than break /memory
     store.load_from_disk()

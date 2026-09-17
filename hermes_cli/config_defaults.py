@@ -1239,6 +1239,14 @@ DEFAULT_CONFIG = {
         "write_approval": False,
         "memory_char_limit": 2200,   # ~800 tokens at 2.75 chars/token
         "user_char_limit": 1375,     # ~500 tokens at 2.75 chars/token
+        # Optional shared user profile: an ABSOLUTE path to a Markdown/text file every profile reads
+        # for identity and preferences that are the same everywhere. Read-only — the memory tool
+        # never writes it, so a profile-local USER.md write cannot contaminate the shared source.
+        # Empty (default) disables it. A path that is relative, missing, a directory, unreadable or
+        # over the limit drops the shared block with a logged warning; the agent and USER.md are
+        # unaffected.
+        "shared_user_profile_path": "",
+        "shared_user_char_limit": 1200,  # ~450 tokens at 2.75 chars/token
         # Periodic built-in memory review; 0 when an external provider auto-extracts.
         "nudge_interval": 10,
         # External memory provider plugin (empty = built-in only); only ONE at a time: "openviking",

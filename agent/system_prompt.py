@@ -517,7 +517,11 @@ def _memory_parts(agent: Any) -> List[str]:
     tools the toolset config gated off)."""
     parts: List[str] = []
     if agent._memory_store:
-        for enabled, kind in ((agent._memory_enabled, "memory"), (agent._user_profile_enabled, "user")):
+        # The optional shared profile (memory.shared_user_profile_path) is read-only and comes
+        # BEFORE the profile-local USER.md, so USER.md reads as the delta on top of it.
+        for enabled, kind in ((agent._memory_enabled, "memory"),
+                              (agent._user_profile_enabled, "shared_user"),
+                              (agent._user_profile_enabled, "user")):
             block = agent._memory_store.format_for_system_prompt(kind) if enabled else None
             if block:
                 parts.append(block)
