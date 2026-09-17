@@ -1108,9 +1108,30 @@ def _rebind_primary_credential_pool(agent, primary_provider, primary_model, matc
         )
 
 
-def restore_primary_runtime(agent) -> bool:
+def release_local_fallback_hold(agent) -> bool:
+    """Clear the local-fallback hold so the primary can be restored again.
+
+    Returns whether a hold was actually in place. The hold is deliberately sticky — only an
+    explicit ``/model primary`` releases it.
+    """
+    held = bool(getattr(agent, "_hold_local_fallback", False))
+    agent._hold_local_fallback = False
+    return held
+
+
+def restore_primary_runtime(agent, force: bool = False) -> bool:
     """Restore the primary runtime at the start of a new turn so fallback stays turn-scoped
-    (long-lived CLI agents and the gateway's cached agents)."""
+    (long-lived CLI agents and the gateway's cached agents).
+
+    ``force=True`` is the explicit ``/model primary`` path. It bypasses the cooldown gates below,
+    which exist to stop an AUTOMATIC restore from thrashing a provider that is still limited. A
+    user who asks for the primary back gets it, and finds out immediately if it is still broken.
+    """
+    if getattr(agent, "_hold_local_fallback", False) and not force:
+        # A started local endpoint is held for this session. Returning here also leaves
+        # _fallback_index where it is, so releasing the hold resumes the chain walk rather than
+        # replaying it from the top.
+        return False
     if not agent._fallback_activated:
         # Reset the index even without activation: a failed _try_activate_fallback() can strand
         # _fallback_index past the chain end and silently block future fallbacks.
@@ -1121,7 +1142,7 @@ def restore_primary_runtime(agent) -> bool:
     # leaves _fallback_index >= len(_fallback_chain) while _fallback_activated stays False. The next turn
     # skips this block entirely, stranding the index and silently blocking all future fallback attempts for
     # the session. Fixes #20465.
-    if getattr(agent, "_rate_limited_until", 0) > time.monotonic():
+    if not force and getattr(agent, "_rate_limited_until", 0) > time.monotonic():
         return False  # primary still in rate-limit cooldown, stay on fallback
     rt = agent._primary_runtime
     primary_provider = str((rt or {}).get("provider") or "").strip().lower()
@@ -1146,7 +1167,7 @@ def restore_primary_runtime(agent) -> bool:
     blocked, prefetched_pool, prefetched = _primary_reset_gate_blocks(
         agent, rt, primary_provider, primary_runtime_base_url, _matches_primary, _load_primary_pool
     )
-    if blocked:
+    if blocked and not force:
         return False
     agent._restore_wait_logged = False
     fallback_route = getattr(agent, "_provider_fallback_route", None)
@@ -3279,7 +3300,8 @@ def force_close_tcp_sockets(client: Any) -> int:
 __all__ = [
     "convert_to_trajectory_format", "sanitize_tool_call_arguments", "repair_message_sequence",
     "strip_think_blocks", "recover_with_credential_pool", "try_recover_primary_transport",
-    "drop_thinking_only_and_merge_users", "restore_primary_runtime", "extract_reasoning",
+    "drop_thinking_only_and_merge_users", "restore_primary_runtime", "release_local_fallback_hold",
+    "extract_reasoning",
     "dump_api_request_debug", "prompt_caching_disabled_from_config", "blank_cache_policy_stub",
     "plan_cache_sections_for_destination", "anthropic_prompt_cache_policy", "create_openai_client",
     "switch_model", "invoke_tool", "repair_tool_call", "sanitize_api_messages",

@@ -1243,6 +1243,8 @@ class AIAgent(
     _restore_primary_runtime = _forward("agent.agent_runtime_helpers", "restore_primary_runtime")
     _try_recover_primary_transport = _forward("agent.agent_runtime_helpers", "try_recover_primary_transport")
     _build_api_kwargs = _forward("agent.chat_completion_helpers", "build_api_kwargs")
+    _release_local_fallback_hold = _forward("agent.agent_runtime_helpers", "release_local_fallback_hold")
+    _activate_local_fallback = _forward("agent.chat_completion_helpers", "activate_local_fallback")
 
     def _set_tool_guardrail_halt(self, decision: ToolGuardrailDecision) -> None:
         """Record the first guardrail decision that should stop this turn."""

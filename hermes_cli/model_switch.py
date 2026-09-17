@@ -548,6 +548,41 @@ MODEL_SWITCH_ERROR_TEXT = {
     MODEL_SWITCH_ERR_ONCE_REQUIRES_TARGET: "/model --once requires a model or provider.",
     MODEL_SWITCH_ERR_BAD_REASONING: "/model --reasoning takes none, minimal, low, medium, high, xhigh, max or ultra."}
 
+# Runtime aliases: targets that name a *runtime* rather than a model.  They
+# never reach the resolution pipeline — surfaces route them to the local
+# endpoint / primary runtime handlers instead.  ``--provider`` suppresses the
+# alias so a provider genuinely serving a model called "local" stays reachable.
+RUNTIME_ALIAS_LOCAL = "local"
+RUNTIME_ALIAS_PRIMARY = "primary"
+_RUNTIME_ALIASES: dict[str, str] = {
+    "local": RUNTIME_ALIAS_LOCAL,
+    "primary": RUNTIME_ALIAS_PRIMARY,
+    "cloud": RUNTIME_ALIAS_PRIMARY,
+}
+
+
+def resolve_runtime_alias(target: Any, explicit_provider: Any = "") -> str:
+    """Return the runtime alias *target* names, or "" when it names a model."""
+    if str(explicit_provider or "").strip():
+        return ""
+    return _RUNTIME_ALIASES.get(str(target or "").strip().lower(), "")
+
+
+def resolve_local_fallback_entry(config: Any = None) -> Optional[dict]:
+    """The fallback entry ``/model local`` targets, read from config.
+
+    For surfaces without a live agent (the gateway builds agents per turn).
+    Agent-side callers use ``agent._fallback_chain`` directly.
+    """
+    from agent.local_endpoint import select_local_fallback_entry
+    from hermes_cli.fallback_config import get_fallback_chain
+
+    if config is None:
+        from hermes_cli.config import load_config
+
+        config = load_config() or {}
+    return select_local_fallback_entry(get_fallback_chain(config))
+
 
 @dataclass(frozen=True)
 class ModelSwitchRequest:
@@ -568,6 +603,7 @@ class ModelSwitchRequest:
     force_refresh: bool = False
     scope: str = "default"
     errors: tuple = ()
+    runtime_alias: str = ""
 
     @property
     def model_input(self) -> str:
@@ -584,7 +620,11 @@ def parse_model_switch_args(raw: str) -> ModelSwitchRequest:
     ``--once`` + ``--global`` -> ``MODEL_SWITCH_ERR_ONCE_WITH_GLOBAL``; ``--once`` with neither
     a model nor ``--provider`` -> ``MODEL_SWITCH_ERR_ONCE_REQUIRES_TARGET``; an unknown
     ``--reasoning`` level -> ``MODEL_SWITCH_ERR_BAD_REASONING``. Targets pass through
-    untouched (bare names, ``vendor/model``, ``vendor:model``) for :func:`switch_model`."""
+    untouched (bare names, ``vendor/model``, ``vendor:model``) for :func:`switch_model`.
+
+    The two runtime aliases — ``local`` and ``primary``/``cloud`` — are flagged in
+    ``runtime_alias`` (see :func:`resolve_runtime_alias`): they select a runtime rather than a
+    model, so surfaces handle them before the resolution pipeline."""
     raw = str(raw or "")
     parsed = parse_model_flags_detailed(raw)
 
@@ -602,6 +642,7 @@ def parse_model_switch_args(raw: str) -> ModelSwitchRequest:
                                         ("global", parsed.is_global)) if on), "default")
     return ModelSwitchRequest(
         raw=raw, target=parsed.model_input, scope=scope, errors=tuple(errors),
+        runtime_alias=resolve_runtime_alias(parsed.model_input, parsed.explicit_provider),
         **{f: getattr(parsed, f)
            for f in ("explicit_provider", "reasoning_effort", "is_global", "is_session", "is_once", "force_refresh")})
 

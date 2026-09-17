@@ -1038,6 +1038,9 @@ def _init_fallback_chain(agent, fallback_model):
     agent._fallback_chain = _fallback_entries(fallback_model)
     agent._fallback_index = 0
     agent._fallback_activated = getattr(agent, "_fallback_activated", False)
+    # Set when a startable local endpoint is serving this session; blocks the
+    # per-turn primary restore until /model primary releases it.
+    agent._hold_local_fallback = getattr(agent, "_hold_local_fallback", False)
     # Legacy attribute kept for backward compat (tests, external callers)
     agent._fallback_model = agent._fallback_chain[0] if agent._fallback_chain else None
     chain = agent._fallback_chain

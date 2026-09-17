@@ -436,6 +436,64 @@ class GatewayModelCommandsMixin:
             event=event, command="model", title=warning.title, message=message, handler=_on_cost_confirm,
         )
 
+    async def _handle_runtime_model_alias(self, alias: str, session_key: str) -> str:
+        """``/model local`` and ``/model primary``.
+
+        ``local`` starts the configured loopback endpoint when it is down and pins the session
+        override to it. ``primary`` drops that override and releases the hold on a cached agent
+        that failed over to a local endpoint on its own, so the next turn goes back to the primary.
+        """
+        from gateway.run import _load_gateway_config
+        from hermes_cli.model_switch import RUNTIME_ALIAS_LOCAL, resolve_local_fallback_entry
+
+        if alias != RUNTIME_ALIAS_LOCAL:
+            released = False
+            cached_agent = self._cached_agent_for(session_key)
+            if cached_agent is not None:
+                from agent.agent_runtime_helpers import release_local_fallback_hold
+                released = release_local_fallback_hold(cached_agent)
+            had_override = bool(self._session_model_overrides.pop(session_key, None))
+            try:
+                await self.async_session_store.set_model_override(session_key, None)
+            except Exception:
+                logger.debug("Failed to clear session model override", exc_info=True)
+            self._evict_cached_agent(session_key)
+            if not (released or had_override):
+                return "✅ Already on the primary model."
+            return "✅ Switched back to the primary model."
+
+        from agent.local_endpoint import ensure_local_endpoint
+        from hermes_cli.fallback_config import resolve_entry_api_key
+        from hermes_cli.providers import determine_api_mode
+
+        entry = await asyncio.to_thread(resolve_local_fallback_entry, _load_gateway_config() or {})
+        if entry is None:
+            return ("❌ No local endpoint is configured. Add a fallback_providers entry with a "
+                    "loopback base_url (and a start_command to launch it).")
+        # Blocking: probes the endpoint and can wait out a server start.
+        status = await asyncio.to_thread(ensure_local_endpoint, entry)
+        if not status.get("ready"):
+            return f"❌ {status.get('error') or 'Local endpoint is not reachable.'}"
+
+        model = str(entry.get("model") or "")
+        provider = str(entry.get("provider") or "")
+        base_url = str(entry.get("base_url") or "")
+        api_mode = (str(entry.get("api_mode") or "").strip()
+                    or determine_api_mode(provider, base_url, model=model))
+        self._session_model_overrides[session_key] = {
+            "model": model, "provider": provider, "api_key": resolve_entry_api_key(entry) or "",
+            "base_url": base_url, "api_mode": api_mode}
+        try:
+            await self.async_session_store.set_model_override(
+                session_key, self._session_model_overrides[session_key])
+        except Exception:
+            logger.debug("Failed to persist local session model override", exc_info=True)
+        self._evict_cached_agent(session_key)
+
+        started = " Started the local server." if status.get("started") else ""
+        return (f"✅ Local endpoint active: {model} on {base_url}.{started} "
+                f"Use /model primary to switch back.")
+
     async def _handle_model_command(
         self, event: MessageEvent, *, allow_picker: bool = True) -> Optional[str]:
         """Handle /model command — switch model. ``allow_picker=False`` keeps the no-args reply a
@@ -458,6 +516,10 @@ class GatewayModelCommandsMixin:
         # Check for session override. See #30479.
         source = await asyncio.to_thread(self._normalize_source_for_session_key, event.source)
         session_key = self._session_key_for_source(source)
+        # /model local and /model primary select a runtime, not a model: they never enter the
+        # resolution pipeline below.
+        if request.runtime_alias:
+            return await self._handle_runtime_model_alias(request.runtime_alias, session_key)
         ctx = _ModelSwitchContext(
             # Gateway routing columns — forward ALL of them at CREATE time, same fix as the
             # compression-rotation bug in agent/conversation_compression.py. Without these, the branched
