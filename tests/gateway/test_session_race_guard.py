@@ -15,7 +15,7 @@ import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import merge_pending_message_event
-from gateway.platforms.event import MessageEvent, MessageType
+from gateway.platforms.event import MessageContextRef, MessageEvent, MessageType
 from gateway.run import GatewayRunner, _AGENT_PENDING_SENTINEL
 from gateway.session import SessionSource, build_session_key
 
@@ -288,3 +288,28 @@ async def test_stop_during_sentinel_force_cleans_session():
 # Test 7: Shutdown skips sentinel entries
 # ------------------------------------------------------------------
     # Should not have raised on the sentinel
+
+
+def test_merge_pending_message_event_preserves_context_refs_across_merge_modes():
+    """A forward's provenance survives every absorbing merge — text-append and media alike."""
+    pending = {}
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="12345", chat_type="dm", user_id="u1")
+    session_key = build_session_key(source)
+
+    def _event(text, kind, **kw):
+        return MessageEvent(
+            text=text, source=source,
+            context_refs=[MessageContextRef(kind="forward", platform="telegram", origin_name=kind)],
+            **kw)
+
+    merge_pending_message_event(
+        pending, session_key, _event("first", "First", message_type=MessageType.TEXT), merge_text=True)
+    merge_pending_message_event(
+        pending, session_key, _event("second", "Second", message_type=MessageType.TEXT), merge_text=True)
+    merge_pending_message_event(
+        pending, session_key,
+        _event("photo", "Photo", message_type=MessageType.PHOTO,
+               media_urls=["/tmp/test.png"], media_types=["image/png"]),
+        merge_text=True)
+
+    assert [ref.origin_name for ref in pending[session_key].context_refs] == ["First", "Second", "Photo"]

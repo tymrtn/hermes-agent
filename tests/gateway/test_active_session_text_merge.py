@@ -34,7 +34,7 @@ from gateway.platforms.base import (
     BasePlatformAdapter,
     SendResult,
 )
-from gateway.platforms.event import MessageEvent, MessageType
+from gateway.platforms.event import MessageContextRef, MessageEvent, MessageType
 from gateway.session import SessionSource, build_session_key
 
 
@@ -186,6 +186,29 @@ async def test_rapid_text_followups_accumulate_instead_of_replacing():
     pending = adapter._pending_messages[session_key]
     assert pending.text == "part two\npart three"
     assert not adapter._active_sessions[session_key].is_set()
+
+
+@pytest.mark.asyncio
+async def test_debounce_preserves_context_refs_from_later_chunks():
+    """A forward split across chunks keeps every chunk's provenance through the debounce."""
+    adapter = _make_adapter()
+    adapter._busy_text_debounce_seconds = 0.05
+
+    first = _make_event("part one")
+    session_key = build_session_key(first.source)
+    adapter._active_sessions[session_key] = asyncio.Event()
+    second, third = _make_event("part two"), _make_event("part three")
+    second.context_refs.append(
+        MessageContextRef(kind="forward", platform="telegram", origin_name="Second Sender"))
+    third.context_refs.append(
+        MessageContextRef(kind="forward", platform="telegram", origin_name="Third Sender"))
+
+    await adapter.handle_message(second)
+    await adapter.handle_message(third)
+    await asyncio.sleep(0.15)
+
+    pending = adapter._pending_messages[session_key]
+    assert [ref.origin_name for ref in pending.context_refs] == ["Second Sender", "Third Sender"]
 
 
 @pytest.mark.asyncio

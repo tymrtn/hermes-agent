@@ -1698,8 +1698,22 @@ class GatewayInboundMixin:
             if message_text is None:
                 return None
         # After expansion: the quoted reply is someone else's text and stays literal — an
-        # ``@file:`` inside it must never read a local file on the replier's behalf.
-        return self._prepend_inbound_reply_context(event, source, message_text)
+        # ``@file:`` inside it must never read a local file on the replier's behalf. A forward's
+        # provenance is someone else's metadata and lands after expansion for the same reason:
+        # a display name or channel title carrying "@file:" is not a context request.
+        message_text = self._prepend_inbound_reply_context(event, source, message_text)
+        # Provenance outermost: a forward's origin frames everything below it, the reply pointer
+        # included, and the body stays last.
+        return self._prepend_inbound_context_refs(event, message_text)
+
+    @staticmethod
+    def _prepend_inbound_context_refs(event: MessageEvent, message_text: str) -> str:
+        """Render normalized context refs (forwarded-message provenance) as a compact block above
+        the body, so a forward reads as a forward rather than as text the user typed."""
+        rendered = [text for text in
+                    (ref.render() for ref in (getattr(event, "context_refs", None) or ()) if ref is not None)
+                    if text]
+        return "\n\n".join(rendered + [message_text]) if rendered else message_text
 
     async def _prepare_profile_scoped_inbound_message_text(
         self, *, event: MessageEvent, source: SessionSource, history: List[Dict[str, Any]],

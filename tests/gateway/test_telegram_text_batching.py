@@ -13,7 +13,7 @@ import pytest
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import SessionSource
-from gateway.platforms.event import MessageEvent, MessageType
+from gateway.platforms.event import MessageContextRef, MessageEvent, MessageType
 from gateway.session import build_session_key
 
 
@@ -100,6 +100,45 @@ class TestTextBatching:
         dispatched = adapter.handle_message.call_args[0][0]
         assert "part one" in dispatched.text
         assert "split by Telegram" in dispatched.text
+
+    @pytest.mark.asyncio
+    async def test_split_messages_preserve_context_refs(self):
+        """Forwarded-message provenance survives Telegram's text batching."""
+        adapter = _make_adapter()
+        first, second = _make_event("first forwarded chunk"), _make_event("second forwarded chunk")
+        first.context_refs.append(
+            MessageContextRef(kind="forward", platform="telegram", origin_name="First Sender"))
+        second.context_refs.append(
+            MessageContextRef(kind="forward", platform="telegram", origin_name="Second Sender"))
+
+        adapter._enqueue_text_event(first)
+        await asyncio.sleep(0.02)
+        adapter._enqueue_text_event(second)
+        await asyncio.sleep(0.2)
+
+        adapter.handle_message.assert_called_once()
+        dispatched = adapter.handle_message.call_args[0][0]
+        assert [ref.origin_name for ref in dispatched.context_refs] == ["First Sender", "Second Sender"]
+
+    @pytest.mark.asyncio
+    async def test_photo_batch_preserves_context_refs(self):
+        """Photo-burst batching keeps the provenance of later items in the burst."""
+        adapter = _make_adapter()
+        first, second = _make_event("first"), _make_event("second")
+        for event, path, name in ((first, "/tmp/first.jpg", "First Sender"),
+                                  (second, "/tmp/second.jpg", "Second Sender")):
+            event.media_urls = [path]
+            event.media_types = ["image/jpeg"]
+            event.context_refs.append(
+                MessageContextRef(kind="forward", platform="telegram", origin_name=name))
+
+        adapter._enqueue_photo_event("photo-burst", first)
+        adapter._enqueue_photo_event("photo-burst", second)
+
+        batched = adapter._pending_photo_batches["photo-burst"]
+        assert [ref.origin_name for ref in batched.context_refs] == ["First Sender", "Second Sender"]
+        for task in adapter._pending_photo_batch_tasks.values():
+            task.cancel()
 
     @pytest.mark.asyncio
     async def test_three_way_split_aggregated(self):

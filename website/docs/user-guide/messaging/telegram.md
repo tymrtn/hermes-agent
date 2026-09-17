@@ -1360,6 +1360,21 @@ Unknown values log a warning and fall back to `important`.
 
 The Telegram adapter routes recurring agent status callbacks (e.g. "Compressing context…", "Calling tool…") through `send_or_update_status()`, which keeps a `{(chat_id, status_key) → message_id}` cache and **edits the existing bubble** on subsequent emits instead of appending a new one each time. Distinct `status_key` values get their own messages; distinct chats never collide. If the edit fails (e.g. the user deleted the message, or it's older than Telegram allows for edits), the cache entry is dropped and the next emit posts a fresh message and re-caches its ID. No config required — this is the default Telegram behavior. Other adapters that don't implement `send_or_update_status` fall through to plain `send()` unchanged.
 
+## Forwarded messages keep their origin
+
+Forward something into the chat and the agent sees where it came from. Hermes reads the origin off Telegram's own forward metadata and puts a short block above the body:
+
+```
+[Forwarded message]
+From: Bob Jones (username bobj, id 99)
+
+the forwarded text
+```
+
+Channels render as `From channel: <title> (id …, message …)` with the author signature when Telegram supplies one, groups as `From chat: <title>`, and a sender who has hidden their forward attribution as `From: <name> (sender identity hidden)` plus a line saying the attribution is limited. A channel-to-discussion auto-forward with no resolvable origin still gets a `[Forwarded message (automatic)]` marker, so a forward never reads as text the user typed. A forward that Telegram splits across several messages, or one that arrives as a photo burst, keeps every part's origin.
+
+The block is metadata written by other people, so it is built after `@` context references are expanded: a display name or channel title containing `@file:` is rendered as text, never read as a file request. Handles render as `username bobj` rather than `@bobj` for the same reason. Fields are collapsed to one line and truncated, so a long name cannot push the body out of view. No config required.
+
 ## Pin incoming user message during agent turn
 
 When a user sends a message that triggers an agent turn, the Telegram adapter pins that incoming message for the duration of the turn and unpins it when the response is finished — a lightweight visual indicator that the bot is actively working on the message rather than ignoring it. The pin uses `disable_notification=true` to avoid extra pings. No config required.

@@ -145,7 +145,7 @@ from gateway.platforms.base import (
 # Every refused button tap answers with the same sentence.
 _UNAUTHORIZED = unauthorized_action_notice(Platform.TELEGRAM)
 
-from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
+from gateway.platforms.event import MessageContextRef, MessageEvent, MessageType, ProcessingOutcome
 from plugins.platforms.telegram.telegram_entities import expand_link_entities
 from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id
 from plugins.platforms.telegram.telegram_network import (
@@ -6311,6 +6311,7 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         existing.media_urls.extend(event.media_urls)
         existing.media_types.extend(event.media_types)
+        existing.context_refs.extend(getattr(event, "context_refs", None) or ())
         if event.text:
             existing.text = self._merge_caption(existing.text, event.text)
 
@@ -6749,6 +6750,61 @@ class TelegramAdapter(BasePlatformAdapter):
                 reply_to_text = None
         return reply_to_id, reply_to_text
 
+    @staticmethod
+    def _forward_context_ref(message) -> Optional[MessageContextRef]:
+        """Normalize Telegram forward metadata into a ``MessageContextRef``.
+
+        Reads ``message.forward_origin`` (PTB ``MessageOrigin*``) through plain attribute access, so
+        a ``SimpleNamespace`` stand-in behaves the same in tests. An ``is_automatic_forward`` with no
+        resolvable origin (Telegram channel→discussion) still yields a marker, so the agent learns
+        the message was forwarded even when nobody can be named. ``None`` for ordinary messages.
+        """
+        origin = getattr(message, "forward_origin", None)
+        if origin is None:
+            if bool(getattr(message, "is_automatic_forward", False)):
+                return MessageContextRef(kind="automatic_forward", platform="telegram")
+            return None
+
+        origin_type = str(getattr(origin, "type", "") or "").split(".")[-1].lower()
+        ref = MessageContextRef(kind="forward", platform="telegram", date=getattr(origin, "date", None))
+        sender_user = getattr(origin, "sender_user", None)
+        sender_chat = getattr(origin, "sender_chat", None)
+        channel_chat = getattr(origin, "chat", None)
+        sender_user_name = getattr(origin, "sender_user_name", None)
+
+        if origin_type == "user" or sender_user is not None:
+            ref.origin_type = "user"
+            ref.origin_name = (getattr(sender_user, "full_name", None)
+                               or getattr(sender_user, "username", None))
+            uid = getattr(sender_user, "id", None)
+            ref.origin_id = str(uid) if uid is not None else None
+            ref.origin_username = getattr(sender_user, "username", None)
+        elif origin_type == "hidden_user" or sender_user_name:
+            ref.origin_type = "hidden_user"
+            ref.origin_name = sender_user_name
+            ref.is_confidence_limited = True
+        elif origin_type == "chat" or sender_chat is not None:
+            ref.origin_type = "chat"
+            ref.origin_chat = (getattr(sender_chat, "title", None)
+                               or getattr(sender_chat, "full_name", None))
+            cid = getattr(sender_chat, "id", None)
+            ref.origin_id = str(cid) if cid is not None else None
+            ref.origin_name = getattr(origin, "author_signature", None)
+        elif origin_type == "channel" or channel_chat is not None:
+            ref.origin_type = "channel"
+            ref.origin_chat = (getattr(channel_chat, "title", None)
+                               or getattr(channel_chat, "full_name", None))
+            cid = getattr(channel_chat, "id", None)
+            ref.origin_id = str(cid) if cid is not None else None
+            mid = getattr(origin, "message_id", None)
+            ref.origin_message_id = str(mid) if mid is not None else None
+            ref.origin_name = getattr(origin, "author_signature", None)
+        else:
+            # An origin type this build does not know: keep the forward marker, flag the limit.
+            ref.origin_type = origin_type or None
+            ref.is_confidence_limited = True
+        return ref
+
     def _build_message_event(self, message: Message, msg_type: MessageType, update_id: Optional[int] = None) -> MessageEvent:
         """Build a MessageEvent from a Telegram message. ``update_id`` lets ``/restart`` record the
         triggering offset so the new gateway process advances past it."""
@@ -6782,11 +6838,14 @@ class TelegramAdapter(BasePlatformAdapter):
         from plugins.platforms.telegram.telegram_context import group_identity_prompt
         _chat_id_str = str(chat.id)
         channel_prompt = resolve_channel_prompt(self.config.extra, thread_id_str or _chat_id_str, _chat_id_str if thread_id_str else None)
+        # Normalized forwarded-message provenance (platform-neutral context ref).
+        forward_ref = self._forward_context_ref(message)
         return MessageEvent(
             text=expand_link_entities(message), message_type=msg_type, source=source, raw_message=message,
             message_id=str(message.message_id), platform_update_id=update_id,
             reply_to_message_id=reply_to_id, reply_to_text=reply_to_text, auto_skill=topic_skill,
             channel_prompt=group_identity_prompt(self, message, channel_prompt),
+            context_refs=[forward_ref] if forward_ref is not None else [],
             timestamp=message.date)
 
     # -- Message reactions (processing lifecycle) --

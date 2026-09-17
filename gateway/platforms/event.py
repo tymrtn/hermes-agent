@@ -4,6 +4,7 @@ A leaf module: adapters, helpers and the runner import it, so it must not import
 gateway.platforms.*.
 """
 
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -30,6 +31,99 @@ class ProcessingOutcome(Enum):
     SUCCESS = "success"
     FAILURE = "failure"
     CANCELLED = "cancelled"
+
+
+@dataclass
+class MessageContextRef:
+    """Platform-neutral reference to context attached to an inbound message.
+
+    Normalizes a forwarded-message origin (and, later, quotes) so the runner can render a compact
+    provenance block before the body. Each adapter fills the fields it can resolve and leaves the
+    rest ``None``; :meth:`render` tolerates any subset.
+
+    ``kind``: ``"forward"``, or ``"automatic_forward"`` for a Telegram channel→discussion
+    auto-forward with no resolvable origin. ``"quote"``/``"reply"`` are reserved.
+
+    Fields by ``origin_type``:
+      * ``"user"`` — ``origin_name`` display name, ``origin_id`` user id, ``origin_username`` handle.
+      * ``"hidden_user"`` — ``origin_name`` is all that is available (``is_confidence_limited``).
+      * ``"chat"`` — ``origin_chat`` group title, ``origin_id`` its id, ``origin_name`` the author
+        signature when present.
+      * ``"channel"`` — ``origin_chat`` channel title, ``origin_id`` its id, ``origin_message_id``
+        the original message id, ``origin_name`` the author signature when present.
+    """
+
+    kind: str
+    platform: Optional[str] = None
+    origin_type: Optional[str] = None
+    origin_name: Optional[str] = None
+    origin_id: Optional[str] = None
+    origin_username: Optional[str] = None
+    origin_chat: Optional[str] = None
+    origin_message_id: Optional[str] = None
+    date: Optional[datetime] = None
+    text: Optional[str] = None
+    is_confidence_limited: bool = False
+
+    @staticmethod
+    def _render_field(value: object, *, max_len: int = 200) -> str:
+        """Render untrusted platform metadata as one safe prompt-line fragment."""
+        text = re.sub(r"\s+", " ", re.sub(r"[\r\n\t]+", " ", str(value or ""))).strip()
+        return text[: max_len - 1].rstrip() + "…" if len(text) > max_len else text
+
+    def render(self) -> str:
+        """A compact, deterministic provenance block, or ``""`` when there is nothing to show.
+
+        A ``[Forwarded message]`` header, one origin line shaped by ``origin_type``, and optional
+        date / quote / limited-attribution notes. No raw payloads, no secrets.
+        """
+        lines = ["[Forwarded message (automatic)]" if self.kind == "automatic_forward"
+                 else "[Forwarded message]"]
+
+        if self.origin_type == "user":
+            extras = []
+            if self.origin_username:
+                # "username <handle>", never "@<handle>": a literal '@' here would be picked up by
+                # the runner's @ context-reference preprocessing on this synthetic block.
+                extras.append(f"username {self._render_field(self.origin_username)}")
+            if self.origin_id:
+                extras.append(f"id {self._render_field(self.origin_id)}")
+            who = self._render_field(self.origin_name) or "Unknown user"
+            suffix = f" ({', '.join(extras)})" if extras else ""
+            lines.append(f"From: {who}{suffix}")
+        elif self.origin_type == "hidden_user":
+            lines.append(f"From: {self._render_field(self.origin_name) or 'Hidden user'} (sender identity hidden)")
+        elif self.origin_type == "chat":
+            chat = self._render_field(self.origin_chat or self.origin_name) or "Unknown chat"
+            suffix = f" (id {self._render_field(self.origin_id)})" if self.origin_id else ""
+            lines.append(f"From chat: {chat}{suffix}")
+            if self.origin_name:
+                lines.append(f"Author: {self._render_field(self.origin_name)}")
+        elif self.origin_type == "channel":
+            extras = []
+            if self.origin_id:
+                extras.append(f"id {self._render_field(self.origin_id)}")
+            if self.origin_message_id:
+                extras.append(f"message {self._render_field(self.origin_message_id)}")
+            chan = self._render_field(self.origin_chat) or "Unknown channel"
+            suffix = f" ({', '.join(extras)})" if extras else ""
+            lines.append(f"From channel: {chan}{suffix}")
+            if self.origin_name:
+                lines.append(f"Author: {self._render_field(self.origin_name)}")
+        elif self.origin_name or self.origin_chat:
+            lines.append(f"From: {self._render_field(self.origin_name or self.origin_chat)}")
+
+        if self.date is not None:
+            try:
+                lines.append(f"Date: {self.date.isoformat()}")
+            except Exception:
+                pass
+        if self.text:
+            lines.append(f'Quoted: "{self._render_field(self.text, max_len=500)}"')
+        if self.is_confidence_limited:
+            lines.append("(Origin attribution is limited — the sender restricts forward "
+                         "attribution, so identity cannot be fully verified.)")
+        return "\n".join(lines)
 
 
 @dataclass
@@ -83,6 +177,10 @@ class MessageEvent:
     # May this event resolve gateway commands / control prompts? Proactive plugin events set False
     # so untrusted payload text stays conversational. Kept last for positional compat.
     allow_gateway_control: bool = True
+    # Normalized, platform-neutral context annotations (forwarded-message provenance today,
+    # quotes later), rendered into a block before the body by the inbound text preparation.
+    # Sits after allow_gateway_control so that field keeps the positional index it promises.
+    context_refs: List["MessageContextRef"] = field(default_factory=list)
 
     # Process-local admission receipt, never routing metadata or execution acknowledgement.
     _gateway_accepted: bool = field(default=False, init=False, repr=False, compare=False)
