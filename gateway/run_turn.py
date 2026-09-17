@@ -1324,6 +1324,59 @@ class GatewayTurnMixin:
             )
         return bounded
 
+    async def _hmwa_dormant_turn_note(self, event, source, turn_sidecar_notes) -> None:
+        """Append the dormant-turn time/location note when this turn warrants one.
+
+        Opt-in, verified 1:1 DM only, default off. The anchor read is an atomic read-and-replace
+        through the async SessionStore facade, so it runs off the event loop. Fully guarded: any
+        failure leaves the turn to proceed with clean content. ``resolve_config`` is the cheap gate
+        and returns None for the common disabled case before any DB work.
+        """
+        try:
+            from gateway.dormant_turn_context import (
+                compute_dormant_turn_note, resolve_clock_tz, resolve_config,
+            )
+            from gateway.run import _load_gateway_config, _profile_runtime_scope
+
+            # Resolve under the source's EFFECTIVE profile so the allow-list, location and
+            # ``timezone`` clock authority come from THAT profile — never the default profile's
+            # (what a default-owned adapter routed to ``source.profile`` would otherwise borrow),
+            # and never whichever profile warmed a process cache first. Single-profile gateways
+            # take the unscoped load, byte-identical to every other config read here.
+            if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+                try:
+                    with _profile_runtime_scope(self._resolve_profile_home_for_source(source)):
+                        user_config = _load_gateway_config()
+                except Exception:
+                    # Privacy-sensitive profile data fails closed: falling back to the process
+                    # profile here would borrow its allow-list, location or timezone.
+                    logger.debug(
+                        "dormant-turn profile-scoped config load failed; disabled for this turn",
+                        exc_info=True)
+                    return
+            else:
+                user_config = _load_gateway_config()
+
+            config = resolve_config(user_config)
+            if config is None:
+                return
+            note = await compute_dormant_turn_note(
+                self.async_session_store,
+                source=source,
+                is_internal=bool(getattr(event, "internal", False)),
+                profile=getattr(source, "profile", None),
+                event_ts=getattr(event, "timestamp", None),
+                now_epoch=time.time(),
+                # Clock authority from the SAME profile-local config, never the process-cached
+                # get_timezone() (which returns whichever profile warmed the cache first).
+                tz=resolve_clock_tz(config),
+                config=config,
+            )
+            if note:
+                turn_sidecar_notes.append(note)
+        except Exception:
+            logger.debug("dormant-turn context note skipped (non-fatal)", exc_info=True)
+
     async def _hmwa_first_contact_notes(self, source, history, turn_sidecar_notes):
         """First-ever-message onboarding note + one-time 'no home channel' prompt (both only when
         the session has no history). Delivered on the user message (sidecar), NOT the ephemeral
@@ -2033,6 +2086,11 @@ class GatewayTurnMixin:
         message_text, persist_user_message, persist_user_timestamp = (
             self._hmwa_apply_message_timestamp(event, message_text)
         )
+
+        # A quiet conversation that resumes after a long gap reads, in the replayed transcript, as
+        # if the prior turn were seconds ago. Orient this one turn on the wall clock. Opt-in,
+        # verified 1:1 DM only; ineligible, first or malformed turns add nothing.
+        await self._hmwa_dormant_turn_note(event, source, turn_sidecar_notes)
 
         # Stage the notes (one-shot; consumed in run_sync) AFTER the early-out so an aborted turn
         # cannot leak them into the next turn.

@@ -2043,6 +2043,20 @@ DEFAULT_CONFIG = {
         # 13:40:53 CEST]") for temporal awareness. Persisted transcripts stay clean (timestamp is
         # message metadata regardless), so enabling later surfaces past send-times too.
         "message_timestamps": {"enabled": False},
+        # Orient the agent when a quiet DM resumes after a long gap: a short note on the current
+        # user message ("it's been ~3 days; it is now Tuesday…"). Verified 1:1 DMs only — native
+        # adapters require the sender in the per-platform verified_user_ids map, relay DMs are
+        # authorized upstream. Identity is the platform sender (never a chat id) and profile-local.
+        # Location is MANUAL only and never inferred: a city renders only when its timezone equals
+        # the top-level ``timezone`` clock authority and updated_at parses.
+        "dormant_turn_context": {
+            "enabled": False,
+            "idle_after_seconds": 3600,
+            "reorient_after_seconds": 86400,
+            "scope": "verified_dm",
+            "verified_user_ids": {},  # {telegram: ["123"], signal: ["uuid"]}; an id is honored on its own platform only
+            "location": {"city": "", "timezone": "", "updated_at": "", "fresh_for_seconds": 86400},
+        },
         # Max bytes of inbound image/audio/video the gateway buffers into RAM and caches to disk.
         # Media is read fully into memory first, so unbounded uploads (Discord Nitro: 500 MB) or
         # huge remote URLs can OOM-kill constrained deployments. Enforced in
