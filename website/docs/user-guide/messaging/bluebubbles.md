@@ -63,6 +63,28 @@ platforms:
         - '(?<![\w@])@?amos\b[,:\-]?'
 ```
 
+#### Optional: Require a wake word in one-to-one DMs
+
+DM gating is separate from group gating and is disabled by default. Enable it when the iMessage account also receives ordinary human conversation:
+
+```yaml
+platforms:
+  bluebubbles:
+    extra:
+      require_mention_in_dms: true
+      mention_patterns:
+        - '(?i)^@rocinante\b[,:\-]?'
+```
+
+With `require_mention_in_dms: true`, one-to-one messages that do not match `mention_patterns` are acknowledged but ignored. A leading wake word is removed before the message reaches the agent. Unknown users can still pair by including the wake word in their first message. `require_mention` remains group-only; either option can be enabled independently.
+
+The equivalent environment configuration is:
+
+```bash
+BLUEBUBBLES_REQUIRE_MENTION_IN_DMS=true
+BLUEBUBBLES_MENTION_PATTERNS='["(?i)^@rocinante\\b[,:\\-]?"]'
+```
+
 ### 4. Authorize Users
 
 Choose one approach:
@@ -116,7 +138,8 @@ Hermes → BlueBubbles REST API → Messages.app → iMessage
 | `BLUEBUBBLES_ALLOWED_USERS` | No | — | Comma-separated authorized users |
 | `BLUEBUBBLES_ALLOW_ALL_USERS` | No | `false` | Allow all users |
 | `BLUEBUBBLES_REQUIRE_MENTION` | No | `false` | Require a mention pattern before responding in group chats |
-| `BLUEBUBBLES_MENTION_PATTERNS` | No | Hermes wake words | JSON array, newline-separated, or comma-separated regex patterns for group mention matching |
+| `BLUEBUBBLES_REQUIRE_MENTION_IN_DMS` | No | `false` | Require a wake-word mention pattern before dispatching one-to-one DMs |
+| `BLUEBUBBLES_MENTION_PATTERNS` | No | Hermes wake words | JSON array, newline-separated, or comma-separated regex patterns shared by group and DM mention gating |
 
 Auto-marking messages as read is controlled by the `send_read_receipts` key under `platforms.bluebubbles.extra` in `~/.hermes/config.yaml` (default: `true`). There is no corresponding environment variable.
 

@@ -612,6 +612,7 @@ _ENV_STEPS: tuple = (
             ("webhook_path", "BLUEBUBBLES_WEBHOOK_PATH", "/bluebubbles-webhook"),
             ("send_read_receipts", "BLUEBUBBLES_SEND_READ_RECEIPTS", "true", is_truthy_value),
             ("require_mention", "BLUEBUBBLES_REQUIRE_MENTION", "", _truthy_token),
+            ("require_mention_in_dms", "BLUEBUBBLES_REQUIRE_MENTION_IN_DMS", "", _truthy_token),
         ),
         optional=(("mention_patterns", "BLUEBUBBLES_MENTION_PATTERNS", _mention_patterns),),
     ),

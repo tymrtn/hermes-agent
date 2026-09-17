@@ -124,6 +124,10 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         if _require_mention is None:
             _require_mention = _get_scoped_secret("BLUEBUBBLES_REQUIRE_MENTION")
         self.require_mention = str(_require_mention).strip().lower() in TRUTHY_STRINGS
+        _require_mention_in_dms = extra.get("require_mention_in_dms")
+        if _require_mention_in_dms is None:
+            _require_mention_in_dms = _get_scoped_secret("BLUEBUBBLES_REQUIRE_MENTION_IN_DMS")
+        self.require_mention_in_dms = str(_require_mention_in_dms).strip().lower() in TRUTHY_STRINGS
         self._mention_patterns = self._compile_mention_patterns(
             extra["mention_patterns"] if "mention_patterns" in extra else _get_scoped_secret("BLUEBUBBLES_MENTION_PATTERNS"))
         self.client: Optional[httpx.AsyncClient] = None
@@ -587,9 +591,11 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             return web.json_response({"error": "missing message fields"}, status=400)
         session_chat_id = chat_guid or chat_identifier
         is_group = bool(record.get("isGroup")) or (";+;" in (chat_guid or ""))
-        if is_group and self.require_mention:
+        if (self.require_mention if is_group else self.require_mention_in_dms):
             if not self._message_matches_mention_patterns(text):
-                logger.debug("[bluebubbles] ignoring group message (require_mention=true, no mention pattern matched)")
+                logger.debug(
+                    "[bluebubbles] ignoring %s message (mention required, no mention pattern matched)",
+                    "group" if is_group else "DM")
                 return _ok()
             text = self._clean_mention_text(text)
         source = self.build_source(chat_id=session_chat_id, chat_name=chat_identifier or sender,
