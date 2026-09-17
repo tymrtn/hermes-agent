@@ -308,6 +308,10 @@ Inside any `hermes chat` session:
 A one-turn switch breaks the provider's prompt-cache prefix twice (switching out and back). In a long session on a cached-prefix provider (Anthropic, OpenAI), the next turn re-pays full input cost — `--once` wins for short sessions or cheap→expensive escalation, but a quick side question inside a long expensive session can cost more than it saves.
 :::
 
+#### Checking the model mid-turn
+
+While the agent is running, a bare `/model` answers with the current model and what else is available. A `/model` that names a target, a provider, or a `--reasoning` level waits until the turn finishes: a switch swaps the model, client and API mode on the running agent in place, so applying one mid-request would move the turn onto a different model, and sometimes onto a different transport. On platforms with the interactive picker, the mid-turn reply is the text listing, because tapping a picker entry commits that same switch.
+
 ### Custom aliases
 
 Define your own short names for models you reach for often, then use `/model <alias>` in a running session or `hermes chat --model <alias>` at startup. There are two equivalent formats — pick whichever fits your workflow.

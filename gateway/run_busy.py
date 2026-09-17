@@ -910,7 +910,8 @@ class GatewayBusySessionMixin:
 
     # busy_handler key (hermes_cli/commands.py CommandDef) → mid-run variant ``_busy_<key>_command``.
     _BUSY_SPECIAL_HANDLERS: Dict[str, str] = {
-        k: f"_busy_{k}_command" for k in ("start", "stop", "new", "queue", "steer", "egress", "goal", "loop")
+        k: f"_busy_{k}_command"
+        for k in ("start", "stop", "new", "queue", "steer", "egress", "goal", "loop", "model")
     }
 
     async def _dispatch_busy_slash_command(self, event: MessageEvent, cmd_def, quick_key: str, source):
@@ -979,6 +980,23 @@ class GatewayBusySessionMixin:
     async def _busy_egress_command(self, event: MessageEvent, quick_key: str, source):
         from hermes_cli.proxy_cli import format_status_text
         return format_status_text()
+
+    async def _busy_model_command(self, event: MessageEvent, quick_key: str, source):
+        """Mid-run ``/model``: answer which model is running and what else is available; refuse to
+        switch.
+
+        A switch is not a control-plane no-op here. ``_switch_cached_agent_model`` swaps model,
+        client and ``api_mode`` on the cached agent IN PLACE, so committing one mid-turn moves the
+        running request onto another model — and, when ``api_mode`` changes, onto another transport.
+        That is the hazard ``/codex-runtime`` is already refused for. The listing reads state and
+        touches none of it, so it answers; the picker stays suppressed because a tap on it commits
+        exactly the switch this refuses.
+        """
+        from hermes_cli.model_switch import parse_model_switch_args
+        request = parse_model_switch_args(event.get_command_args().strip())
+        if request.target or request.explicit_provider or request.reasoning_effort:
+            return self._BUSY_REJECT_TEXT["model"]
+        return await self._handle_model_command(event, allow_picker=False)
 
     async def _busy_stop_command(self, event: MessageEvent, quick_key: str, source):
         # Hard-kill: a soft interrupt can't reach a truly hung executor thread.

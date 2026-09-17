@@ -1,4 +1,4 @@
-"""Regression tests: /yolo and /verbose dispatch mid-agent-run.
+"""Regression tests: safe slash commands dispatch mid-agent-run.
 
 When an agent is running, the gateway's running-agent guard rejects most
 slash commands with "⏳ Agent is running — /{cmd} can't run mid-turn"
@@ -8,6 +8,9 @@ slash commands with "⏳ Agent is running — /{cmd} can't run mid-turn"
     pending approval prompt without waiting for the agent to finish.
   * /verbose — cycles the per-platform tool-progress display mode;
     affects the ongoing stream.
+  * /model with no target — answers which model is running and what else is
+    available. A /model that would SWITCH stays refused: the switch swaps
+    model, client and api_mode on the cached agent in place.
 
 Commands whose handlers say "takes effect on next message" stay on the
 catch-all by design:
@@ -107,6 +110,68 @@ def _make_runner():
     runner._running_agents[sk] = agent_mock
     runner._running_agents_ts[sk] = time.time()
     return runner
+
+
+@pytest.mark.asyncio
+async def test_model_listing_dispatches_mid_run():
+    """Bare /model mid-run answers which model is running, rather than "wait or /stop first"."""
+    runner = _make_runner()
+    seen = {}
+
+    async def _listing(event, *, allow_picker=True):
+        seen["allow_picker"] = allow_picker
+        return "Current model: opus"
+
+    runner._handle_model_command = _listing
+
+    result = await runner._handle_message(_make_event("/model"))
+
+    assert result == "Current model: opus"
+    # The picker is suppressed mid-run: a tap on it commits the switch this path refuses.
+    assert seen["allow_picker"] is False
+
+
+@pytest.mark.parametrize("args", ["gpt-5.5", "--provider openai", "--reasoning high"])
+@pytest.mark.asyncio
+async def test_model_switch_stays_refused_mid_run(args):
+    """_switch_cached_agent_model swaps model, client and api_mode on the cached agent IN PLACE, so
+    committing a switch mid-turn moves the running request onto another model — and, when api_mode
+    changes, another transport. Same hazard /codex-runtime is refused for."""
+    runner = _make_runner()
+    runner._handle_model_command = AsyncMock()
+
+    result = await runner._handle_message(_make_event(f"/model {args}"))
+
+    runner._handle_model_command.assert_not_awaited()
+    assert "wait or /stop first" in str(result)
+
+
+@pytest.mark.asyncio
+async def test_listing_without_the_picker_sends_no_picker(monkeypatch):
+    """The suppression is real, not just a flag: allow_picker=False must not reach the adapter."""
+    from gateway.slash_commands_model import _ModelSwitchContext
+    from hermes_cli import model_switch as model_switch_mod
+
+    class _PickerAdapter:
+        def __init__(self):
+            self.picker_calls = 0
+
+        async def send_model_picker(self, **kwargs):
+            self.picker_calls += 1
+            return SimpleNamespace(success=True)
+
+    monkeypatch.setattr(model_switch_mod, "list_authenticated_providers", lambda **kw: [])
+    runner = _make_runner()
+    adapter = _PickerAdapter()
+    runner._adapter_for_source = lambda _source: adapter
+    ctx = _ModelSwitchContext(
+        session_key="sk", source=_make_source(), config_path=None, persist_global=False,
+        current_model="claude-opus-5", current_provider="anthropic")
+
+    reply = await runner._model_listing_reply(_make_event("/model"), ctx, None, allow_picker=False)
+
+    assert adapter.picker_calls == 0
+    assert "claude-opus-5" in str(reply)
 
 
 @pytest.mark.asyncio

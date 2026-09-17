@@ -357,7 +357,7 @@ class GatewayModelCommandsMixin:
         return bool(result.success)
 
     async def _model_listing_reply(
-        self, event: MessageEvent, ctx: _ModelSwitchContext, profile_home
+        self, event: MessageEvent, ctx: _ModelSwitchContext, profile_home, *, allow_picker: bool = True
     ) -> Optional[str]:
         """``/model`` with no args: interactive picker where supported, else the text list."""
         from hermes_cli.model_switch import list_authenticated_providers
@@ -369,7 +369,7 @@ class GatewayModelCommandsMixin:
             custom_providers=ctx.custom_provs, excluded_providers=ctx.excluded_provs,
         )
         adapter = self._adapter_for_source(ctx.source)
-        if adapter is not None and getattr(type(adapter), "send_model_picker", None) is not None:
+        if allow_picker and adapter is not None and getattr(type(adapter), "send_model_picker", None) is not None:
             async def _picker_switch(model_id: str, provider_slug: str) -> str:
                 # The picker callback binds the raw event source (pre-normalization).
                 result, error = await self._perform_model_switch(ctx, model_id, provider_slug, event.source)
@@ -436,8 +436,10 @@ class GatewayModelCommandsMixin:
             event=event, command="model", title=warning.title, message=message, handler=_on_cost_confirm,
         )
 
-    async def _handle_model_command(self, event: MessageEvent) -> Optional[str]:
-        """Handle /model command — switch model."""
+    async def _handle_model_command(
+        self, event: MessageEvent, *, allow_picker: bool = True) -> Optional[str]:
+        """Handle /model command — switch model. ``allow_picker=False`` keeps the no-args reply a
+        text listing: the mid-run caller must not offer a button whose tap commits a switch."""
         from gateway.run import _hermes_home
         from hermes_cli.model_switch import parse_model_switch_args, resolve_persist_behavior
 
@@ -483,7 +485,7 @@ class GatewayModelCommandsMixin:
         ctx.read_config()
         ctx.apply_override(self._session_model_overrides.get(session_key, {}))
         if not request.target and not request.explicit_provider:
-            return await self._model_listing_reply(event, ctx, profile_home)
+            return await self._model_listing_reply(event, ctx, profile_home, allow_picker=allow_picker)
         result, error = await self._perform_model_switch(ctx, request.target, request.explicit_provider, source)
         if error is not None:
             return error
