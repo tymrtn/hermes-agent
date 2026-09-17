@@ -724,3 +724,52 @@ async def test_thread_fallback_only_fires_once():
     # The key point: the message was delivered despite the invalid thread
 
 
+@pytest.mark.asyncio
+async def test_send_ignores_synthetic_afk_reply_id():
+    """A synthetic AFK id is an internal label, not a Telegram reply anchor."""
+    adapter = _make_adapter()
+    call_log = []
+
+    async def mock_send_message(**kwargs):
+        call_log.append(dict(kwargs))
+        return SimpleNamespace(message_id=782)
+
+    adapter._bot = SimpleNamespace(send_message=mock_send_message)
+
+    result = await adapter.send(chat_id="123", content="AFK follow-up", reply_to="afk:15:1779126479")
+
+    assert result.success is True
+    assert call_log[0]["reply_to_message_id"] is None
+    assert call_log[0].get("message_thread_id") is None
+
+
+@pytest.mark.asyncio
+async def test_send_dm_topic_fallback_refuses_a_synthetic_metadata_anchor():
+    """A synthetic metadata anchor reads as no anchor, and a DM-topic send refuses without one.
+
+    The coercion's job is to stop a ``ValueError`` mid-send; it does not manufacture an anchor.
+    A DM-topic lane with nothing to reply to still fails loud rather than delivering outside the
+    topic it was asked for.
+    """
+    adapter = _make_adapter()
+    call_log = []
+
+    async def mock_send_message(**kwargs):
+        call_log.append(dict(kwargs))
+        return SimpleNamespace(message_id=783)
+
+    adapter._bot = SimpleNamespace(send_message=mock_send_message)
+
+    result = await adapter.send(
+        chat_id="123", content="AFK follow-up",
+        metadata={
+            "thread_id": "20197",
+            "telegram_dm_topic_reply_fallback": True,
+            "telegram_reply_to_message_id": "afk:15:1779126479",
+        },
+    )
+
+    assert result.success is False
+    assert "requires a reply anchor" in (result.error or "")
+    assert call_log == []  # refused before the wire, never sent to the wrong lane
+

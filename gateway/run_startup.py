@@ -1381,6 +1381,12 @@ class GatewayStartupMixin:
                 self._log_scale_to_zero_not_armed_reason()
         except Exception:  # noqa: BLE001 - arming must never block startup
             logger.debug("scale-to-zero: arm check failed at startup", exc_info=True)
+        # AFK follow-up watcher ONLY when opted in: it injects synthetic turns, so a gateway that
+        # never configured it must never grow one. Post-reconnect, since it dispatches through adapters.
+        if getattr(self, "_afk_followup_config", None) is not None and self._afk_followup_config.enabled:
+            logger.info("AFK follow-up: armed (thresholds %s minutes)",
+                        ", ".join(str(m) for m in self._afk_followup_config.thresholds_minutes))
+            self._spawn_supervised(self._afk_followup_watcher, "afk_followup_watcher")
         # Drain-control watcher: reconciles new-turn acceptance with the dashboard's ``.drain_request.json``
         # marker (prior-instantiation markers are ignored via epoch).
         self._spawn_supervised(self._drain_control_watcher, "drain_control_watcher")

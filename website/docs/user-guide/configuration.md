@@ -1120,6 +1120,24 @@ agent:
   reconnect_attention_after: 7200   # seconds; 0 disables the escalation flag
 ```
 
+## AFK Follow-up Turns
+
+Off by default. When it is on, a session that has been idle past a threshold gets a synthetic turn asking the agent to pick up a safe loose end and finish it, so a long stretch away comes back to finished work rather than a cold thread.
+
+```yaml
+gateway:
+  afk_followup:
+    enabled: false                  # opt in; nothing is injected while this is false
+    thresholds_minutes: [5, 15, 60] # idle marks that fire a turn
+    interval_seconds: 60            # how often the watcher checks
+```
+
+Idle is measured from the session's own last update, and a threshold fires once per idle cycle: passing 60 minutes with the default thresholds fires the 5-minute mark, then 15, then 60, and the cycle repeats from there rather than replaying every mark it missed. Real activity moves the clock forward and clears the marks.
+
+A session is skipped while it holds a running turn, a queued event, or an adapter's pending message, so an injected turn never lands behind work you just sent. Sessions with no routable origin and platforms with no connected adapter are skipped too. The watcher waits for the adapters to connect before its first pass, so a restart does not greet you with a burst.
+
+The injected prompt is bounded: the agent is told to avoid destructive, financially risky, credential-changing, publishing, email-sending and irreversible actions unless you already approved that exact action, and to stop at the approval boundary for a deploy or restart and ask. It replies with a short summary of what it did, so an AFK turn always leaves a record.
+
 ## Gateway Agent Cache
 
 The gateway keeps one agent per session so a conversation reuses its cached prompt prefix instead of rebuilding the system prompt every turn. That cached agent also holds the session's full transcript — tool output included, which is tens of megabytes on a session with a hundred tool calls. On a busy multi-platform gateway the cache is therefore the largest single consumer of memory in the process.

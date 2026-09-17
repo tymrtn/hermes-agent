@@ -11,8 +11,15 @@ import contextlib
 import logging
 import time
 from collections import Counter
+from datetime import datetime
 from typing import Any, Dict, Optional
 
+from gateway.afk_followup import (
+    AfkFollowupConfig, build_afk_followup_prompt, next_afk_followup, parse_afk_followup_config,
+)
+from gateway.config import Platform
+from gateway.platforms.event import MessageEvent, MessageType
+from gateway.session import SessionSource
 from gateway.session_stall import (
     format_session_stall_notification,
     resolve_session_idle_seconds_from_activity,
@@ -73,6 +80,111 @@ class GatewaySessionWatchersMixin:
             except Exception as e:
                 logger.debug("SessionStore prune failed: %s", e)
             self._last_session_store_prune_ts = time.time()
+
+    # ── AFK follow-up (opt-in) ──
+
+    @staticmethod
+    def _load_afk_followup_config() -> AfkFollowupConfig:
+        """Read ``gateway.afk_followup`` from config.yaml; any problem leaves it disabled."""
+        from hermes_cli.config import cfg_get
+        from gateway.run import _load_gateway_config
+        try:
+            return parse_afk_followup_config(cfg_get(_load_gateway_config(), "gateway", "afk_followup", default={}))
+        except Exception as exc:
+            logger.warning("Invalid gateway.afk_followup config; AFK follow-up disabled: %s", exc)
+            return AfkFollowupConfig(enabled=False)
+
+    async def _afk_followup_watcher(self) -> None:
+        """Inject bounded synthetic follow-up turns into idle sessions while the user is away."""
+        config = getattr(self, "_afk_followup_config", AfkFollowupConfig())
+        # Let the adapters finish connecting first: a burst of AFK turns during startup or a
+        # gateway replacement would greet the user with work they never saw begin.
+        await asyncio.sleep(min(max(config.interval_seconds, 1.0), 60.0))
+        while self._running:
+            try:
+                await self._afk_followup_tick()
+            except Exception as exc:
+                logger.debug("AFK follow-up watcher tick failed: %s", exc)
+            await _interruptible_sleep(self, max(1, int(config.interval_seconds)))
+
+    async def _afk_followup_tick(self) -> None:
+        """One AFK scheduling pass. A method of its own so tests and diagnostics can drive it."""
+        config = getattr(self, "_afk_followup_config", AfkFollowupConfig())
+        if not config.enabled:
+            return
+        session_store = getattr(self, "session_store", None)
+        if session_store is None:
+            return
+        try:
+            entries = await self.async_session_store.list_sessions()
+        except Exception as exc:
+            logger.debug("AFK follow-up: session store unavailable: %s", exc)
+            return
+
+        # A session is "busy" if it holds a run, a gateway queue entry, or an adapter's pending
+        # slot. Injecting behind any of those would queue work the user is already replacing.
+        running_session_keys = set(getattr(self, "_running_agents", {}) or {})
+        queued_session_keys = set(getattr(self, "_queued_events", {}) or {})
+        adapters = getattr(self, "adapters", {}) or {}
+        for adapter in adapters.values():
+            pending = getattr(adapter, "_pending_messages", None)
+            if isinstance(pending, dict):
+                queued_session_keys.update(pending.keys())
+        now = datetime.now()
+
+        fired_map = getattr(self, "_afk_fired_thresholds", None)
+        if fired_map is None:
+            fired_map = self._afk_fired_thresholds = {}
+        for entry in entries:
+            fired = fired_map.setdefault(entry.session_key, set())
+            decision = next_afk_followup(
+                entry, now=now, thresholds_minutes=config.thresholds_minutes,
+                fired_thresholds=fired, running_session_keys=running_session_keys,
+                queued_session_keys=queued_session_keys,
+            )
+            if decision is None:
+                continue
+            source = self._source_from_afk_origin(getattr(entry, "origin", None))
+            if source is None:
+                logger.debug("AFK follow-up: no routable source for %s", entry.session_key)
+                continue
+            adapter = adapters.get(source.platform)
+            if adapter is None:
+                logger.debug("AFK follow-up: no adapter for %s (%s)", entry.session_key, source.platform)
+                continue
+            cycle_index = sorted(config.thresholds_minutes).index(decision.threshold_minutes) + 1
+            logger.info("AFK follow-up: injecting %s virtual turn for %s",
+                        decision.idle_label, entry.session_key)
+            await adapter.handle_message(MessageEvent(
+                text=build_afk_followup_prompt(decision.idle_label, cycle_index=cycle_index),
+                message_type=MessageType.TEXT, source=source,
+                message_id=f"afk:{decision.threshold_minutes}:{int(time.time())}",
+                internal=True))
+            fired.add(decision.due_minutes)
+
+    @staticmethod
+    def _source_from_afk_origin(origin) -> Optional[SessionSource]:
+        """The routable source a stored entry's ``origin`` names, or None when it cannot route."""
+        if isinstance(origin, SessionSource):
+            return origin
+        if origin is None:
+            return None
+        platform = getattr(origin, "platform", None)
+        if platform is None:
+            return None
+        if not isinstance(platform, Platform):
+            try:
+                platform = Platform(str(platform))
+            except ValueError:
+                return None
+        chat_id = getattr(origin, "chat_id", None)
+        if not chat_id:
+            return None
+        return SessionSource(
+            platform=platform, chat_id=str(chat_id), chat_name=getattr(origin, "chat_name", None),
+            chat_type=getattr(origin, "chat_type", "dm") or "dm",
+            user_id=getattr(origin, "user_id", None), user_name=getattr(origin, "user_name", None),
+            thread_id=getattr(origin, "thread_id", None), chat_topic=getattr(origin, "chat_topic", None))
 
     def _session_stall_timeout_seconds(self) -> float:
         """Return configured stall timeout (seconds); 0 disables the watchdog."""

@@ -956,10 +956,24 @@ class TelegramAdapter(BasePlatformAdapter):
         topic_id = (metadata or {}).get("direct_messages_topic_id") or (metadata or {}).get("telegram_direct_messages_topic_id")
         return str(topic_id) if topic_id is not None else None
 
+    @staticmethod
+    def _telegram_message_id(value: object) -> Optional[int]:
+        """A Telegram message id, or None for anything that is not one.
+
+        Gateway-internal events carry synthetic labels in ``reply_to`` (an AFK follow-up uses
+        ``afk:<threshold>:<ts>``). Telegram accepts integer message ids only, so a synthetic label
+        is no reply anchor rather than a ``ValueError`` raised mid-send.
+        """
+        if value is None:
+            return None
+        try:
+            return int(str(value))
+        except (TypeError, ValueError):
+            return None
+
     @classmethod
     def _metadata_reply_to_message_id(cls, metadata: Optional[Dict[str, Any]]) -> Optional[int]:
-        reply_to = (metadata or {}).get("telegram_reply_to_message_id")
-        return int(reply_to) if reply_to is not None else None
+        return cls._telegram_message_id((metadata or {}).get("telegram_reply_to_message_id"))
 
     @staticmethod
     def _dm_topic_fallback(metadata: Optional[Dict[str, Any]]) -> bool:
@@ -981,8 +995,9 @@ class TelegramAdapter(BasePlatformAdapter):
     @classmethod
     def _reply_to_message_id_for_send(
         cls, reply_to: Optional[str], metadata: Optional[Dict[str, Any]] = None, reply_to_mode: Optional[str] = None) -> Optional[int]:
-        if reply_to:
-            return int(reply_to)
+        explicit = cls._telegram_message_id(reply_to)
+        if explicit is not None:
+            return explicit
         if cls._dm_topic_fallback(metadata) and reply_to_mode != "off":
             return cls._metadata_reply_to_message_id(metadata)
         return None
@@ -1391,7 +1406,12 @@ class TelegramAdapter(BasePlatformAdapter):
         metadata_reply_to = self._metadata_reply_to_message_id(metadata)
         private_dm_topic_send = self._is_private_dm_topic_send(chat_id, thread_id, metadata)
         dm_topic_reply_to_off = private_dm_topic_send and self._reply_to_mode == "off" and self._dm_topic_fallback(metadata)
-        reply_to_source = reply_to or (str(metadata_reply_to) if private_dm_topic_send and metadata_reply_to is not None else None)
+        # A synthetic anchor is dropped here, so a DM-topic send falls through to its metadata
+        # anchor instead of failing loud on an id Telegram would never have accepted.
+        explicit_reply_to = self._telegram_message_id(reply_to)
+        reply_to_source = (
+            str(explicit_reply_to) if explicit_reply_to is not None
+            else (str(metadata_reply_to) if private_dm_topic_send and metadata_reply_to is not None else None))
         if private_dm_topic_send:
             should_thread = reply_to_source is not None and self._reply_to_mode != "off"
         else:

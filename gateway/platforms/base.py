@@ -4274,8 +4274,11 @@ class BasePlatformAdapter(ABC):
             is_ephemeral_response = isinstance(response, EphemeralReply)
             # Unwrap EphemeralReply for downstream text processing; TTL applies after send.
             response, _ephemeral_ttl = self._unwrap_ephemeral(response)
-            # None/empty is normal (streamed/queued). Suppress a stale response after an interrupt.
-            if response and interrupt_event.is_set() and session_key in self._pending_messages:
+            # None/empty is normal (streamed/queued). Suppress a stale response after an interrupt —
+            # except for a synthetic internal turn, whose reply is the only record that the work
+            # happened at all. Suppress that and the user sees nothing.
+            if (response and not event.internal
+                    and interrupt_event.is_set() and session_key in self._pending_messages):
                 logger.info("[%s] Suppressing stale response for interrupted session %s", self.name,
                             session_key)
                 response = None

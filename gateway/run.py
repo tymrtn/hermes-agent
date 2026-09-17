@@ -3457,6 +3457,10 @@ class GatewayRunner(
     def _init_lifecycle_state(self) -> None:
         """Initialise run/exit/restart flags, per-session state, and completion-delivery bookkeeping."""
         self._running = self._exit_cleanly = self._exit_with_failure = self._draining = False
+        # AFK follow-up (opt-in): resolved config, plus the per-session set of idle-cycle marks
+        # already injected, so a threshold fires once per cycle rather than on every tick.
+        self._afk_followup_config = self._load_afk_followup_config()
+        self._afk_fired_thresholds: Dict[str, set[int]] = {}
         self._gateway_loop: Optional[asyncio.AbstractEventLoop] = None
         self._shutdown_event = asyncio.Event()
         self._exit_reason: Optional[str] = None
