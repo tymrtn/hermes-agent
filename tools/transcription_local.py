@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import os
 import platform
+import re
 import shlex
 import subprocess
 import tempfile
@@ -20,9 +21,9 @@ from typing import Any, Dict, Optional
 
 from tools.transcription_audio import _find_whisper_binary, _prepare_local_audio, _run_quiet
 from tools.transcription_common import (
-    DEFAULT_LOCAL_MODEL, DEFAULT_LOCAL_STT_LANGUAGE, GROQ_MODELS, LOCAL_STT_COMMAND_ENV,
-    OPENAI_MODELS, _config_number, _error_result, _log_prompt_unsupported, _ok_result,
-    _process_error_detail)
+    COMMON_LOCAL_BIN_DIRS, DEFAULT_LOCAL_MODEL, DEFAULT_LOCAL_STT_LANGUAGE, GROQ_MODELS,
+    LOCAL_STT_COMMAND_ENV, OPENAI_MODELS, _config_number, _error_result,
+    _log_prompt_unsupported, _ok_result, _process_error_detail)
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("tools.transcription_tools")
@@ -258,6 +259,33 @@ def _join_confident_segments(segments: Any, local_cfg: Dict[str, Any]) -> str:
     return " ".join(kept).strip()
 
 
+_WHISPER_STDOUT_SEGMENT_RE = re.compile(
+    r"^\s*\[(?:\d{2}:)?\d{2}:\d{2}\.\d{3}\s*-->\s*"
+    r"(?:\d{2}:)?\d{2}:\d{2}\.\d{3}\]\s*(?P<text>.*)\s*$")
+
+
+def _extract_whisper_stdout_transcript(stdout: str) -> str:
+    """Recover a transcript from Whisper's timestamped stdout, or "" when that is not what it is.
+
+    The local-command contract reads a ``.txt`` artifact, but some successful Whisper CLI
+    invocations print the whole timestamped transcript and leave no file behind. Every non-blank
+    line must be a timestamped segment: one line that is not turns the whole thing down, so a
+    warning, a progress bar or any other diagnostic can never be handed back as user speech.
+    """
+    segments: list[str] = []
+    saw_nonempty = False
+    for line in (stdout or "").splitlines():
+        if not line.strip():
+            continue
+        saw_nonempty = True
+        match = _WHISPER_STDOUT_SEGMENT_RE.match(line)
+        if not match:
+            return ""
+        if text := match.group("text").strip():
+            segments.append(text)
+    return "\n".join(segments).strip() if saw_nonempty else ""
+
+
 def _transcribe_local_command(
     file_path: str, model_name: str, *, language: Optional[str] = None, prompt: Optional[str] = None
 ) -> Dict[str, Any]:
@@ -283,11 +311,23 @@ def _transcribe_local_command(
             # Scrub Hermes secrets from the child env (sibling path to #56332 / _run_command_stt — this
             # local-whisper path previously inherited the full process environment).
             from tools.environments.local import hermes_subprocess_env
-            _run_quiet(shlex.split(command), timeout=300, env=hermes_subprocess_env(inherit_credentials=False))
+            child_env = hermes_subprocess_env(inherit_credentials=False)
+            # A launchd/systemd gateway inherits a minimal PATH. Whisper itself resolves by absolute
+            # path and then shells out to a bare ``ffmpeg``, which is not there — so it skips the
+            # input and exits 0, leaving no transcript and no error. Make the same common local bin
+            # roots visible to the child and its descendants; no scrubbed secret comes back.
+            existing = [p for p in child_env.get("PATH", "").split(os.pathsep) if p]
+            child_env["PATH"] = os.pathsep.join(
+                [p for p in COMMON_LOCAL_BIN_DIRS if p not in existing] + existing)
+            completed = _run_quiet(shlex.split(command), timeout=300, env=child_env)
             txt_files = sorted(Path(output_dir).glob("*.txt"))
-            if not txt_files:
-                return _error_result("Local STT command completed but did not produce a .txt transcript")
-            transcript_text = txt_files[0].read_text(encoding="utf-8").strip()
+            if txt_files:
+                transcript_text = txt_files[0].read_text(encoding="utf-8").strip()
+            else:
+                # No artifact: accept the run only if stdout is a clean timestamped transcript.
+                transcript_text = _extract_whisper_stdout_transcript(getattr(completed, "stdout", "") or "")
+                if not transcript_text:
+                    return _error_result("Local STT command completed but did not produce a .txt transcript")
             logger.info("Transcribed %s via local STT command (%s, %d chars)",
                         Path(file_path).name, normalized_model, len(transcript_text))
             return _ok_result(transcript_text, "local_command")
