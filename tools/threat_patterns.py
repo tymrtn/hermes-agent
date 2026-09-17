@@ -102,6 +102,48 @@ INVISIBLE_CHARS = frozenset(
     "\u200b\u200c\u200d\u2060\u2062\u2063\u2064\ufeff"
     "\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069")
 
+_EMOJI_VARIATION_SELECTOR = "\ufe0f"
+_EMOJI_MODIFIER_RANGE = range(0x1F3FB, 0x1F400)  # Fitzpatrick skin tones
+
+
+def _is_emoji_codepoint(ch: str) -> bool:
+    """Best-effort Extended_Pictographic check for emoji ZWJ validation.
+
+    The stdlib exposes no Unicode emoji property. These ranges cover the codepoints standard emoji
+    ZWJ sequences actually use: SMP pictographs plus the BMP symbol blocks holding gender signs,
+    hearts and tools.
+    """
+    cp = ord(ch)
+    return (0x1F000 <= cp <= 0x1FAFF  # SMP emoji / symbols / pictographs
+            or 0x2600 <= cp <= 0x27BF  # BMP misc symbols + dingbats
+            or cp in {0x2640, 0x2642})  # gender signs, explicit for clarity
+
+
+def _previous_emoji_base(content: str, index: int) -> str | None:
+    i = index - 1
+    while i >= 0 and (content[i] == _EMOJI_VARIATION_SELECTOR or ord(content[i]) in _EMOJI_MODIFIER_RANGE):
+        i -= 1
+    return content[i] if i >= 0 and _is_emoji_codepoint(content[i]) else None
+
+
+def _next_emoji_base(content: str, index: int) -> str | None:
+    i = index + 1
+    while i < len(content) and content[i] == _EMOJI_VARIATION_SELECTOR:
+        i += 1
+    return content[i] if i < len(content) and _is_emoji_codepoint(content[i]) else None
+
+
+def _is_emoji_zwj(content: str, index: int) -> bool:
+    """True when U+200D is joining two emoji bases.
+
+    U+200D hides promptware in prose (i\u200dg\u200dn\u200do\u200dr\u200de) and is also required by
+    ordinary emoji sequences like 🤸‍♀️, 👩🏽‍💻 and family emoji. Only the latter is harmless; every
+    other zero-width joiner stays a finding.
+    """
+    return (content[index] == "\u200d"
+            and _previous_emoji_base(content, index) is not None
+            and _next_emoji_base(content, index) is not None)
+
 # Compiled per scope at import; inclusion is cumulative (all ⊂ context ⊂ strict).
 _SCOPE_SETS = {"all": ("all", "context", "strict"), "context": ("context", "strict"), "strict": ("strict",)}
 
@@ -128,7 +170,17 @@ def scan_for_threats(content: str, scope: str = "context") -> List[str]:
         raise ValueError(f"scan_for_threats: unknown scope {scope!r}")
     content = content[:MAX_SCAN_CHARS]
     # Invisible unicode is checked on the RAW content: NFKC below can strip these codepoints.
-    findings: List[str] = [f"invisible_unicode_U+{ord(ch):04X}" for ch in set(content) & INVISIBLE_CHARS]
+    # Index-aware rather than a set intersection, because U+200D is both a promptware hiding
+    # primitive in prose and the standard joiner inside an emoji sequence; only the latter passes.
+    findings: List[str] = []
+    seen_invisible: set[str] = set()
+    for index, ch in enumerate(content):
+        if ch not in INVISIBLE_CHARS or ch in seen_invisible:
+            continue
+        if ch == "\u200d" and _is_emoji_zwj(content, index):
+            continue
+        seen_invisible.add(ch)
+        findings.append(f"invisible_unicode_U+{ord(ch):04X}")
     # NFKC folds full-width / compatibility variants (ｃａｔ → cat) against homograph bypass.
     # It does NOT fold cross-script confusables (Cyrillic ``а``) — that needs a TR#39 database.
     normalised = unicodedata.normalize("NFKC", content)
