@@ -10,6 +10,7 @@ import os
 import html as _html
 import re
 import time
+from collections import deque
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, Iterator, List, Optional, Set
@@ -550,6 +551,11 @@ class TelegramAdapter(BasePlatformAdapter):
         self._approval_state: Dict[int, str] = {}  # message_id → session_key
         self._slash_confirm_state: Dict[str, str] = {}  # confirm_id → session_key
         self._clarify_state: Dict[str, str] = {}  # clarify_id → session_key
+        # Clarify ids whose answer already reached the agent. A resolved prompt's state is popped
+        # before the edit strips its keyboard, so a second tap in that window arrives indistinguishable
+        # from a tap on a prompt the gateway restarted out from under — and only the latter still has
+        # an unheard answer. Bounded: a ring, not a ledger.
+        self._recently_resolved_clarifies: "deque[str]" = deque(maxlen=64)
         # "important" (default): only final responses, approvals and slash confirmations notify;
         # "all": every message notifies (display.platforms.telegram.notifications).
         self._notifications_mode: str = "important"
@@ -4312,6 +4318,98 @@ class TelegramAdapter(BasePlatformAdapter):
         await self._edit_html_quiet(
             query, f"❓ {_html.escape(query.message.text or '')}\n\n<i>⚠️ This question expired or the session reset — please /retry.</i>")
 
+    def _recover_clarify_choice_text(self, query) -> Optional[str]:
+        """The tapped button's own label, read back off the message's keyboard.
+
+        The keyboard outlives the process. It is still attached to the Telegram message long after
+        ``_clarify_state`` and the clarify registry are gone, so it is the one place a late tap's
+        meaning survives ``clarify_timeout`` eviction or a gateway restart.
+        """
+        tapped = str(getattr(query, "data", "") or "")
+        markup = getattr(getattr(query, "message", None), "reply_markup", None)
+        rows = getattr(markup, "inline_keyboard", None)
+        if not tapped or not rows:
+            return None
+        try:
+            for row in rows:
+                for button in row:
+                    if str(getattr(button, "callback_data", "") or "") == tapped:
+                        return str(getattr(button, "text", "") or "").strip() or None
+        except TypeError:  # markup that isn't a real keyboard — fall back to the expiry notice
+            logger.debug("[%s] clarify keyboard was not iterable; cannot recover the tapped label", self.name)
+        return None
+
+    async def _deliver_late_clarify_reply(self, query, label: str) -> bool:
+        """Re-deliver a too-late clarify tap as a fresh inbound message from whoever tapped it.
+
+        The agent that asked is gone — evicted by ``clarify_timeout``, or lost to a restart — so the
+        tap cannot resolve the prompt it belongs to. The choice is still the user's answer, so it
+        enters the gateway the way a typed message does, carrying the question for context.
+        Building off ``query.message`` keeps thread, topic and channel-prompt routing identical to a
+        real message in that chat; only the author, the text and the clock belong to the tap.
+        """
+        message = getattr(query, "message", None)
+        tapper = getattr(query, "from_user", None)
+        if message is None or tapper is None:
+            return False
+        try:
+            event = self._build_message_event(message, MessageType.TEXT)
+        except Exception:
+            logger.warning("[%s] late clarify reply could not be built", self.name, exc_info=True)
+            return False
+        question = str(getattr(message, "text", "") or "").lstrip("❓").strip()
+        if len(question) > 400:
+            question = question[:400] + "…"
+        event.text = (
+            f'[Late reply to an expired choice prompt] The question was: "{question}"'
+            f" — my answer: {label}")
+        # ``message`` is the bot's own prompt, so the built event is authored by the bot and keys a
+        # session that is not the tapper's. Re-author it: ``user_id`` feeds the session key, and
+        # ``is_bot`` True would have the gateway drop it outright.
+        event.source = dataclasses.replace(
+            event.source,
+            user_id=str(getattr(tapper, "id", "") or "") or None,
+            user_name=getattr(tapper, "full_name", None) or getattr(tapper, "first_name", None),
+            is_bot=False)
+        event.raw_message = None  # not the tapper's message; nothing downstream may treat it as one
+        event.timestamp = datetime.now(timezone.utc)  # the tap is now; the prompt is as old as it is
+        self._enqueue_text_event(event)
+        return True
+
+    async def _confirm_late_clarify_delivery(self, query, user_display: str, label: str) -> None:
+        """Answer a re-delivered tap honestly: the choice landed, as a new message rather than as an
+        answer to this prompt."""
+        with contextlib.suppress(Exception):
+            await query.answer(text=f"✓ {label[:48]} — delivered as a new message")
+        await self._edit_html_quiet(
+            query,
+            f"❓ {_html.escape(str(getattr(query.message, 'text', '') or ''))}\n\n"
+            f"<b>{_html.escape(user_display)}:</b> {_html.escape(label)}"
+            " <i>(this prompt had expired — your answer was delivered as a new message)</i>")
+
+    async def _answer_expired_clarify_tap(
+        self, query, clarify_id: str, user_display: str, choice_token: str) -> None:
+        """Handle a tap whose prompt is gone: deliver the answer when the keyboard still carries it,
+        otherwise say what does work instead of dead-ending on ``/retry``."""
+        if choice_token == "other":
+            # "Other" never had a label to recover, and with no clarify pending a typed message is
+            # simply the next turn — which is exactly where the answer needs to go.
+            with contextlib.suppress(Exception):
+                await query.answer(text="✏️ This prompt expired — just type your answer.")
+            await self._edit_html_quiet(
+                query, f"❓ {_html.escape(str(getattr(query.message, 'text', '') or ''))}\n\n"
+                       "<i>⚠️ This prompt expired — type your answer as a normal message.</i>")
+            return
+        label = self._recover_clarify_choice_text(query)
+        if label and await self._deliver_late_clarify_reply(query, label):
+            self._recently_resolved_clarifies.append(clarify_id)
+            await self._confirm_late_clarify_delivery(query, user_display, label)
+            logger.info(
+                "Telegram clarify button: late tap delivered as a new message (id=%s, choice=%r)",
+                clarify_id, label)
+            return
+        await self._notify_clarify_expired(query, user_display)
+
     @staticmethod
     async def _edit_html_quiet(query, text: str) -> None:
         """HTML edit with the keyboard removed; failures ignored (non-fatal)."""
@@ -4547,12 +4645,19 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         clarify_id = parts[1]
         choice_token = parts[2]
-        session_key = await self._claim_callback_state(
-            query, cb, self._clarify_state, clarify_id, _UNAUTHORIZED,
-            "This prompt has already been resolved.", pop=False)
-        if not session_key:
+        # Not _claim_callback_state: a missing entry here is not always "already resolved" — a
+        # restart loses _clarify_state while the buttons stay live in chat — so the two cases get
+        # different answers. Same order it uses: the callback allowlist gate first, then the claim.
+        if not await self._callback_authorized(query, cb, _UNAUTHORIZED):
             return
         user_display = getattr(query.from_user, "first_name", "User")
+        session_key = self._clarify_state.get(clarify_id)
+        if not session_key:
+            if clarify_id in self._recently_resolved_clarifies:
+                await query.answer(text="This prompt has already been resolved.")
+                return
+            await self._answer_expired_clarify_tap(query, clarify_id, user_display, choice_token)
+            return
         if choice_token == "other":
             # Flip to text-capture: the gateway's text-intercept resolves the clarify with the next message.
             # Do NOT pop _clarify_state yet — still needed if the entry gets cleared by something else.
@@ -4563,9 +4668,10 @@ class TelegramAdapter(BasePlatformAdapter):
             except Exception as exc:
                 logger.warning("[%s] mark_awaiting_text failed: %s", self.name, exc)
             if not flipped:
-                # Entry evicted / gateway restarted — a typed answer would go nowhere.
+                # Entry evicted / gateway restarted. The text-intercept is gone, but a typed answer
+                # still reaches the agent as an ordinary turn — point at that, not at /retry.
                 self._clarify_state.pop(clarify_id, None)
-                await self._notify_clarify_expired(query, user_display)
+                await self._answer_expired_clarify_tap(query, clarify_id, user_display, choice_token)
                 return
             await query.answer(text="✏️ Type your answer in the chat.")
             await self._edit_html_quiet(
@@ -4596,14 +4702,16 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.error("[%s] resolve_gateway_clarify failed: %s", self.name, exc)
             resolved = False
         if resolved:
+            self._recently_resolved_clarifies.append(clarify_id)
             await query.answer(text=f"✓ {resolved_text[:60]}")
             await self._edit_html_quiet(
                 query, f"❓ {_html.escape(query.message.text or '')}\n\n<b>{_html.escape(user_display)}:</b> {_html.escape(resolved_text)}")
             logger.info("Telegram clarify button resolved (id=%s, choice=%r, user=%s)", clarify_id, resolved_text, user_display)
         else:
-            # Entry evicted / gateway restarted between ask and tap.
-            await self._notify_clarify_expired(query, user_display)
+            # Entry evicted / gateway restarted between ask and tap. The waiting agent is gone, but
+            # the keyboard still names the choice, so the decision reaches it as a new turn.
             logger.warning("Telegram clarify button: resolve_gateway_clarify returned False (id=%s)", clarify_id)
+            await self._answer_expired_clarify_tap(query, clarify_id, user_display, choice_token)
 
     async def _handle_update_prompt_callback(self, query, data: str, cb: Dict[str, Any]) -> None:
         """``update_prompt:<y|n>`` — forward the answer to the update process."""

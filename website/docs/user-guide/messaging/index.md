@@ -435,6 +435,10 @@ When the agent uses the `clarify` tool to ask you a question, the gateway render
 
 Single-select prompts behave as before: pick one option by number, button, or text, or type your own answer via the "Other" path.
 
+### Answering after the question expires (Telegram)
+
+A clarify prompt stops waiting once `clarify_timeout` elapses, and a gateway restart retires every prompt still open. The buttons stay in your chat either way. Tapping one still gets your answer through: Hermes reads the choice off the button itself and sends it as a new message quoting the question, so the agent picks it up as its next turn. The tap answers with "delivered as a new message". Each expired prompt delivers once, and a second tap answers that it has already been resolved. An expired **Other** button has no choice to read back, so Hermes tells you to type the answer, which reaches the agent the same way.
+
 ## Tool Progress Notifications
 
 Control how much tool activity is displayed in `~/.hermes/config.yaml`:
