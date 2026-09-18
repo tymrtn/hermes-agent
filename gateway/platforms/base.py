@@ -9,6 +9,7 @@ import os
 import random
 import re
 import socket as _socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -671,6 +672,29 @@ def cache_audio_from_bytes(data: bytes, ext: str = ".ogg") -> str:
 async def cache_audio_from_bytes_async(data: bytes, ext: str = ".ogg") -> str:
     """Cache audio bytes without blocking the caller's event loop."""
     return await asyncio.to_thread(cache_audio_from_bytes, data, ext)
+
+
+def remove_managed_cached_audio(path: str) -> bool:
+    """Delete one direct child of the audio cache; True when it went. Never raises.
+
+    Inbound voice clips are staging artifacts, so once their transcript exists the file is dead
+    weight. This is the ONLY deletion path for them, and it is deliberately narrow: arbitrary audio
+    attachments and user- or tool-supplied paths must survive it. Resolving the parent rejects
+    traversal, and ``lstat`` rejects a symlink before the unlink — and because the unlink targets
+    the directory entry, a swap racing that check still removes the alias, never its target.
+    """
+    try:
+        cache_dir = get_audio_cache_dir().resolve()
+        candidate = Path(path)
+        if not candidate.name or candidate.parent.resolve(strict=True) != cache_dir:
+            return False
+        candidate = cache_dir / candidate.name
+        if not stat.S_ISREG(candidate.lstat().st_mode):
+            return False
+        candidate.unlink()
+        return True
+    except (OSError, RuntimeError, ValueError):
+        return False
 
 
 async def cache_audio_from_url(url: str, ext: str = ".ogg", retries: int = 2) -> str:
@@ -1743,7 +1767,8 @@ def merge_pending_message_event(pending_messages: Dict[str, MessageEvent], sessi
                 existing.message_type = event.message_type
             # Drop the *derived* STT cache (event changed); the echo ledger must survive or
             # notes echo twice.
-            for attr in ("_gateway_pending_stt_text", "_gateway_pending_stt_transcripts"):
+            for attr in ("_gateway_pending_stt_text", "_gateway_pending_stt_transcripts",
+                         "_gateway_pending_stt_consumed"):
                 if hasattr(existing, attr):
                     delattr(existing, attr)
             return

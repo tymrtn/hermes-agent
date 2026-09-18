@@ -1687,6 +1687,13 @@ class GatewayInboundMixin:
 
         message_text = self._prefix_inbound_sender_context(event, source, message_text)
         image_paths, audio_paths, audio_file_paths, video_paths = self._classify_inbound_media(event, _pending_stt_prepared)
+        if _pending_stt_prepared:
+            # Terminal read of a pre-transcribed event: it has left the pending slot, so no merge can
+            # send the peek back over these clips, and the cached transcript is now their only
+            # reader. Clips STT could NOT read are absent from this list — their note offers the
+            # model the audio by path, so they stay.
+            for _stt_path in getattr(event, "_gateway_pending_stt_consumed", None) or ():
+                self._release_managed_staging_audio(_stt_path)
         if image_paths:
             message_text = await self._enrich_inbound_images(source, session_key, message_text, image_paths)
         if audio_paths:
@@ -2003,7 +2010,20 @@ class GatewayInboundMixin:
         agent_path = to_agent_visible_cache_path(os.path.abspath(path))
         return f"[voice message could not be transcribed automatically; the audio is available at: {agent_path}]"
 
-    async def _transcribe_one_clip(self, path: str, transcribe_audio, transcribe_audio_local_fallback) -> Tuple[Optional[str], str]:
+    @staticmethod
+    def _release_managed_staging_audio(path: str) -> None:
+        """Retire a transcribed voice clip from the managed audio cache (best-effort, cache-only)."""
+        try:
+            from gateway.platforms.base import remove_managed_cached_audio
+            if remove_managed_cached_audio(path):
+                logger.debug("Removed transcribed voice cache file: %s", path)
+        except Exception:
+            logger.debug("Could not remove transcribed voice cache file: %s", path, exc_info=True)
+
+    async def _transcribe_one_clip(
+        self, path: str, transcribe_audio, transcribe_audio_local_fallback,
+        *, defer_cleanup_to: Optional[List[str]] = None,
+    ) -> Tuple[Optional[str], str]:
         """``(transcript_or_None, note)`` for one clip via configured STT with local fallback."""
         result = await asyncio.to_thread(transcribe_audio, path, None, "gateway")
         if not result.get("success"):
@@ -2012,8 +2032,15 @@ class GatewayInboundMixin:
                 logger.info("Configured STT failed for %s; recovered with local STT", path)
                 result = fallback
         if not result["success"]:
+            # Keep the clip: the note hands the model its path so the audio is still reachable.
             logger.info("Voice transcription failed for %s: %s", path, result.get("error", "unknown error"))
             return None, self._untranscribed_audio_note(path)
+        # STT consumed the clip and the transcript below is now the record of it, so the staging
+        # copy has no reader left. Only the managed cache is touched (see remove_managed_cached_audio).
+        if defer_cleanup_to is None:
+            self._release_managed_staging_audio(path)
+        else:
+            defer_cleanup_to.append(path)
         transcript = result["transcript"]
         # STT may return success=True with an empty/whitespace transcript (silence, cut-off);
         # empty quotes make the agent reply to nothing and can loop, so emit a sentinel note.
@@ -2030,11 +2057,15 @@ class GatewayInboundMixin:
         return transcript, f'"{transcript}"'
 
     async def _enrich_message_with_transcription(
-        self, user_text: str, audio_paths: List[str]
+        self, user_text: str, audio_paths: List[str], *, defer_cleanup_to: Optional[List[str]] = None,
     ) -> tuple[str, List[str]]:
         """Transcribe voice clips with the configured STT provider and prepend the transcripts →
         ``(enriched_text, successful_transcripts)``; the transcripts (input order; empty if every clip
-        failed or STT is disabled) let callers echo them back before the agent loop."""
+        failed or STT is disabled) let callers echo them back before the agent loop.
+
+        Managed staging clips are retired as they are consumed. A caller that may be re-run over the
+        same clips passes ``defer_cleanup_to``: consumed paths are collected there instead, for it to
+        retire once it knows nothing will read them again."""
         from gateway.run import _probe_audio_duration
         audio_paths = list(dict.fromkeys(audio_paths))
         if not getattr(self.config, "stt_enabled", True):
@@ -2061,6 +2092,7 @@ class GatewayInboundMixin:
                 logger.debug("Transcribing user voice: %s", path)
                 transcript, note = await self._transcribe_one_clip(
                     path, transcribe_audio, transcribe_audio_local_fallback,
+                    defer_cleanup_to=defer_cleanup_to,
                 )
                 if transcript is not None:
                     successful_transcripts.append(transcript)
@@ -2092,9 +2124,18 @@ class GatewayInboundMixin:
         if not audio_paths:
             return user_text if user_text is not None else (getattr(event, "text", None) or None), []
         text = user_text if user_text is not None else (getattr(event, "text", "") or "")
-        enriched_text, successful_transcripts = await self._enrich_message_with_transcription(text, audio_paths)
+        # Keep the clips: this is a peek, not the end of their life. The interrupt monitor, the
+        # pending drain and a button tap can all reach the same event before the cache below is
+        # set, so a second coroutine may still be mid-read — and ``merge_pending_message_event``
+        # can drop the cache entirely, sending this whole path back over the same clips. Record what
+        # STT consumed so ``_prepare_inbound_message_text`` can retire it once the text is final.
+        consumed: List[str] = []
+        enriched_text, successful_transcripts = await self._enrich_message_with_transcription(
+            text, audio_paths, defer_cleanup_to=consumed,
+        )
         event._gateway_pending_stt_text = enriched_text
         event._gateway_pending_stt_transcripts = list(successful_transcripts)
+        event._gateway_pending_stt_consumed = consumed
         return enriched_text, successful_transcripts
 
     async def _echo_pending_stt_transcripts_once(

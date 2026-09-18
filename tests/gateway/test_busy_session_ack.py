@@ -255,8 +255,10 @@ class TestBusySessionAck:
 
         await runner._handle_active_session_busy_message(event, sk)
 
+        # The busy follow-up rides the pending-peek path, so its clips are collected for later
+        # retirement rather than deleted under a read that may still re-run (defer_cleanup_to).
         runner._enrich_message_with_transcription.assert_awaited_once_with(
-            "", ["/tmp/follow-up.ogg"]
+            "", ["/tmp/follow-up.ogg"], defer_cleanup_to=[]
         )
         agent.steer.assert_called_once()
         injected = agent.steer.call_args.args[0]
