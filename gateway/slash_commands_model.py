@@ -21,6 +21,13 @@ from utils import base_url_host_matches
 
 logger = logging.getLogger("gateway.run")  # log-record parity with gateway/run.py
 
+# Appended when the session store rejected an override write: the change holds for this gateway
+# process but is not durable, and the next turn may read the old value back.
+_OVERRIDE_WRITE_FAILED_NOTE = (
+    "\n\n⚠️ The change could not be saved to the session store, so it may not survive a "
+    "gateway restart (details in `hermes logs`)."
+)
+
 # /fast argument -> (service tier, persisted value, i18n label key; None = value.upper()).
 _FAST_SELECTIONS = {
     "fast": ("priority", "fast", "gateway.fast.label_fast"),
@@ -453,14 +460,18 @@ class GatewayModelCommandsMixin:
                 from agent.agent_runtime_helpers import release_local_fallback_hold
                 released = release_local_fallback_hold(cached_agent)
             had_override = bool(self._session_model_overrides.pop(session_key, None))
+            unsaved = ""
             try:
                 await self.async_session_store.set_model_override(session_key, None)
-            except Exception:
-                logger.debug("Failed to clear session model override", exc_info=True)
+            except Exception as exc:
+                # The next turn rehydrates the persisted override, so a dropped write silently
+                # undoes this command. Say so instead of reporting a clean switch.
+                logger.warning("Failed to clear session model override: %s", exc, exc_info=True)
+                unsaved = _OVERRIDE_WRITE_FAILED_NOTE
             self._evict_cached_agent(session_key)
             if not (released or had_override):
                 return "✅ Already on the primary model."
-            return "✅ Switched back to the primary model."
+            return f"✅ Switched back to the primary model.{unsaved}"
 
         from agent.local_endpoint import ensure_local_endpoint
         from hermes_cli.fallback_config import resolve_entry_api_key
@@ -495,16 +506,19 @@ class GatewayModelCommandsMixin:
         self._session_model_overrides[session_key] = {
             "model": model, "provider": provider, "api_key": resolve_entry_api_key(entry) or "",
             "base_url": base_url, "api_mode": api_mode}
+        unsaved = ""
         try:
             await self.async_session_store.set_model_override(
                 session_key, self._session_model_overrides[session_key])
-        except Exception:
-            logger.debug("Failed to persist local session model override", exc_info=True)
+        except Exception as exc:
+            # The pin still applies to this process, but it will not survive a restart.
+            logger.warning("Failed to persist local session model override: %s", exc, exc_info=True)
+            unsaved = _OVERRIDE_WRITE_FAILED_NOTE
         self._evict_cached_agent(session_key)
 
         started = " Started the local server." if status.get("started") else ""
         return (f"✅ Local endpoint active: {model} on {base_url}.{started} "
-                f"Use /model primary to switch back.")
+                f"Use /model primary to switch back.{unsaved}")
 
     async def _handle_model_command(
         self, event: MessageEvent, *, allow_picker: bool = True) -> Optional[str]:

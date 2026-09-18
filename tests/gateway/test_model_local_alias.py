@@ -250,3 +250,37 @@ async def test_local_alias_consumes_a_pending_auto_reset(monkeypatch, config_wit
 
     assert "Local endpoint active" in reply
     assert runner.async_session_store.entry.was_auto_reset is False
+
+
+class _FailingStore(_StubStore):
+    """A store whose override write always fails."""
+
+    async def set_model_override(self, session_key, override):
+        raise RuntimeError("database is locked")
+
+
+@pytest.mark.asyncio
+async def test_local_alias_reports_a_pin_it_could_not_persist(monkeypatch, config_with_local):
+    """A dropped write means the pin dies at the next restart; the user must hear about it."""
+    _patch_ensure(monkeypatch, {"started": False, "ready": True, "error": ""})
+    runner = _StubRunner()
+    runner.async_session_store = _FailingStore()
+
+    reply = await runner._handle_runtime_model_alias("local", SESSION_KEY)
+
+    assert "Local endpoint active" in reply
+    assert "could not be saved" in reply
+    # The in-memory pin still applies to this gateway's next turn.
+    assert runner._session_model_overrides[SESSION_KEY]["model"] == "/models/local-model"
+
+
+@pytest.mark.asyncio
+async def test_primary_alias_reports_an_override_it_could_not_clear(monkeypatch, config_with_local):
+    """A dropped clear is rehydrated on the next turn, undoing the command silently."""
+    runner = _StubRunner()
+    runner._session_model_overrides[SESSION_KEY] = {"model": "/models/local-model"}
+    runner.async_session_store = _FailingStore()
+
+    reply = await runner._handle_runtime_model_alias("primary", SESSION_KEY)
+
+    assert "could not be saved" in reply
