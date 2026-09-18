@@ -235,8 +235,14 @@ class GatewayAgentCacheMixin:
 
     def _is_intentional_model_switch(self, session_key: str, agent: Any, config_model: str) -> bool:
         """True when *agent* running a model other than *config_model* is deliberate: a /model session
-        override names that model, or the Nous gateway moved the session off the ``nous/welcome``
-        alias that *config_model* still carries (``anon_auth.apply_model_switch``)."""
+        override names that model, a started local endpoint is held for the session, or the Nous
+        gateway moved the session off the ``nous/welcome`` alias that *config_model* still carries
+        (``anon_auth.apply_model_switch``)."""
+        # The hold lives on the agent instance and says "stay local until /model primary"
+        # (agent/chat_completion_helpers). Evicting would throw it away with the agent, and the
+        # next message would build a fresh primary agent and fail over again, every turn.
+        if getattr(agent, "_hold_local_fallback", False):
+            return True
         override = self._session_model_override(session_key)
         if override is not None and override.get("model") == agent.model:
             return True

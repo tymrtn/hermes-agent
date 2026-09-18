@@ -164,6 +164,17 @@ class TestIsIntentionalModelSwitch:
         agent = SimpleNamespace(model="fallback/model")
         assert runner._is_intentional_model_switch(sk, agent, "primary/model") is False
 
+    def test_a_held_local_fallback_is_intentional(self):
+        """Failover onto a started local endpoint promises to hold until /model primary. Evicting
+        would discard the hold with the agent and fail the session over again every turn."""
+        runner = _make_runner()
+        sk = build_session_key(_make_source())
+        agent = SimpleNamespace(model="/models/local-model", _hold_local_fallback=True)
+        assert runner._is_intentional_model_switch(sk, agent, "primary/model") is True
+        # A released hold is ordinary drift again.
+        agent._hold_local_fallback = False
+        assert runner._is_intentional_model_switch(sk, agent, "primary/model") is False
+
 
 class TestOneTurnModelOverrideRestore:
     """Verify gateway one-turn overrides restore previous session state."""
