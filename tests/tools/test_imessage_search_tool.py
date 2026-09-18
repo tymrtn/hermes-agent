@@ -142,3 +142,34 @@ class TestWalVisibility:
 
         assert result["total_matches"] == 1, result
         assert result["results"][0]["text"] == "brunch tomorrow?"
+
+
+class TestProfileScope:
+    """Under multiplex the process env belongs to the LAUNCH profile, so an ``os.getenv`` gate
+    would hand one profile's Messages database to every other profile the gateway serves."""
+
+    def test_the_opt_in_reads_the_profile_scope_not_the_process_env(self, monkeypatch):
+        from agent import secret_scope
+
+        monkeypatch.setenv("IMESSAGE_SEARCH_ENABLED", "true")  # the launch profile enabled it
+        monkeypatch.setattr(secret_scope, "_MULTIPLEX_ACTIVE", True)
+        token = secret_scope._SECRET_SCOPE.set({})  # a served profile that did not
+        try:
+            assert check_imessage_search_requirements() is False
+        finally:
+            secret_scope._SECRET_SCOPE.reset(token)
+
+    def test_an_unscoped_multiplex_read_fails_closed(self, monkeypatch):
+        from agent import secret_scope
+
+        monkeypatch.setenv("IMESSAGE_SEARCH_ENABLED", "true")
+        monkeypatch.setattr(secret_scope, "_MULTIPLEX_ACTIVE", True)
+        token = secret_scope._SECRET_SCOPE.set(None)
+        try:
+            assert check_imessage_search_requirements() is False
+        finally:
+            secret_scope._SECRET_SCOPE.reset(token)
+
+    def test_a_single_profile_deployment_still_reads_the_process_env(self, monkeypatch):
+        monkeypatch.setenv("IMESSAGE_SEARCH_ENABLED", "true")
+        assert check_imessage_search_requirements() is True

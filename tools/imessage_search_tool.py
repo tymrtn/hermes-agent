@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import sqlite3
 from datetime import datetime, timezone
@@ -11,14 +10,28 @@ from pathlib import Path
 from typing import Any, Optional
 
 from tools.registry import registry, tool_error
-from utils import env_var_enabled
+from utils import is_truthy_value
 
 APPLE_EPOCH_OFFSET = 978307200
 DEFAULT_DB = Path.home() / "Library" / "Messages" / "chat.db"  # IMESSAGE_CHAT_DB overrides
 
 
+def _scoped_env(name: str) -> str:
+    """``name`` from the active PROFILE scope, not the process env.
+
+    Under multiplex the process env is the LAUNCH profile's, so an ``os.getenv`` read would let
+    one profile's Messages settings reach every profile the gateway serves. An unscoped read
+    under multiplex fails closed (empty), matching ``get_secret``'s contract.
+    """
+    from agent.secret_scope import UnscopedSecretError, get_secret
+    try:
+        return str(get_secret(name, "") or "")
+    except UnscopedSecretError:
+        return ""
+
+
 def _db_path() -> Path:
-    return Path(os.getenv("IMESSAGE_CHAT_DB", str(DEFAULT_DB))).expanduser()
+    return Path(_scoped_env("IMESSAGE_CHAT_DB") or str(DEFAULT_DB)).expanduser()
 
 
 def _parse_date(value: Optional[str], *, end: bool = False) -> Optional[int]:
@@ -61,8 +74,12 @@ def _open_db(path: Path) -> sqlite3.Connection:
 
 
 def check_imessage_search_requirements() -> bool:
-    """Opt-in only; reading Messages requires macOS Full Disk Access."""
-    return env_var_enabled("IMESSAGE_SEARCH_ENABLED")
+    """Opt-in only; reading Messages requires macOS Full Disk Access.
+
+    Profile-scoped (see :func:`_scoped_env`): the profile that enabled this is the only one the
+    tool is offered to, even when several share one gateway process.
+    """
+    return is_truthy_value(_scoped_env("IMESSAGE_SEARCH_ENABLED"), default=False)
 
 
 def imessage_search(
