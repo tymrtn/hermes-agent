@@ -112,10 +112,14 @@ class GatewaySessionWatchersMixin:
             cache = self._afk_profile_configs = {}
         if name not in cache:
             from hermes_cli.config import cfg_get
-            from gateway.run import _load_gateway_config
+            from hermes_cli.config_effective import load_user_config_effective
             try:
                 home = self._resolve_profile_home_for_source(source)
-                raw = cfg_get(_load_gateway_config(home / "config.yaml"),
+                # ``fail_closed``: the shared loader otherwise serves the last successfully parsed
+                # copy of a torn config, which could still say ``enabled: true`` and keep spending
+                # this profile's tokens off a file nobody can read. Raising pauses AFK for that
+                # profile until the file parses again.
+                raw = cfg_get(load_user_config_effective(home / "config.yaml", fail_closed=True),
                               "gateway", "afk_followup", default={})
                 cache[name] = parse_afk_followup_config(raw)
             except Exception as exc:

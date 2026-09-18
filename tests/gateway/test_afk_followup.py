@@ -371,3 +371,41 @@ async def test_afk_followup_respects_a_satellite_profiles_own_opt_in(monkeypatch
     await runner._afk_followup_tick()
 
     assert adapter.handle_message.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_afk_followup_stays_off_when_a_profile_config_cannot_be_parsed(monkeypatch, tmp_path):
+    """A torn or broken config must not arm autonomous turns off a stale last-known-good copy."""
+    from gateway.afk_followup import AfkFollowupConfig
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    runner._afk_followup_config = AfkFollowupConfig(enabled=True, thresholds_minutes=(5,), interval_seconds=1)
+    runner._afk_fired_thresholds = {}
+    runner._running_agents = {}
+    runner._queued_events = {}
+
+    entry, now = _entry(minutes_idle=10, session_key="agent:satellite:telegram:dm:123")
+    entry.origin = SimpleNamespace(
+        platform=Platform.TELEGRAM, chat_id="123", thread_id=None, profile="satellite")
+    runner.session_store = SimpleNamespace(list_sessions=lambda: [entry])
+
+    adapter = SimpleNamespace(_pending_messages={}, handle_message=AsyncMock())
+    runner.adapters = {}
+    runner._profile_adapters = {"satellite": {Platform.TELEGRAM: adapter}}
+
+    # Models the shared loader's contract: without ``fail_closed`` a torn file is served from the
+    # last successfully parsed copy, which here still says the profile opted in.
+    def _torn_config(path, *, fail_closed=False):
+        if fail_closed:
+            raise ValueError("while parsing a block mapping")
+        return {"gateway": {"afk_followup": {"enabled": True, "thresholds_minutes": [5]}}}
+
+    monkeypatch.setattr(
+        GatewayRunner, "_resolve_profile_home_for_source", lambda self, source: tmp_path)
+    monkeypatch.setattr("hermes_cli.config_effective.load_user_config_effective", _torn_config)
+    monkeypatch.setattr("gateway.run_watchers.datetime", SimpleNamespace(now=lambda tz=None: now))
+
+    await runner._afk_followup_tick()
+
+    assert adapter.handle_message.call_count == 0
