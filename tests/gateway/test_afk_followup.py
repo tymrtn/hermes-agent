@@ -326,3 +326,13 @@ async def test_afk_followup_tick_reaches_a_secondary_profile_adapter(monkeypatch
     assert adapter.handle_message.call_count == 1
     event = adapter.handle_message.call_args.args[0]
     assert event.source.profile == "satellite"
+
+
+def test_afk_followup_config_does_not_arm_on_a_string_false():
+    """AFK turns spend tokens and run tools; a non-truthy opt-in must stay off."""
+    from gateway.afk_followup import parse_afk_followup_config
+
+    for raw_enabled in ("false", "no", "off", "0", ""):
+        assert parse_afk_followup_config({"enabled": raw_enabled}).enabled is False, raw_enabled
+    for raw_enabled in (True, "true", "yes", "1", "on"):
+        assert parse_afk_followup_config({"enabled": raw_enabled}).enabled is True, raw_enabled

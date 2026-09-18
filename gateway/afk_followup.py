@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Iterable, Optional, Set
 
+from utils import is_truthy_value
+
 
 DEFAULT_AFK_THRESHOLDS_MINUTES: tuple[int, ...] = (5, 15, 60)
 
@@ -60,7 +62,9 @@ def parse_afk_followup_config(raw) -> AfkFollowupConfig:
     """
     if not isinstance(raw, dict):
         return AfkFollowupConfig(enabled=False)
-    enabled = bool(raw.get("enabled", False))
+    # ``is_truthy_value``, not ``bool``: a YAML-quoted ``enabled: "false"`` is a non-empty string,
+    # and arming autonomous model/tool turns off a disabled opt-in is the wrong failure direction.
+    enabled = is_truthy_value(raw.get("enabled", False), default=False)
     thresholds = normalize_thresholds(raw.get("thresholds_minutes"))
     try:
         interval = float(raw.get("interval_seconds", 60.0))
