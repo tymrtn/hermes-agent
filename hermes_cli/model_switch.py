@@ -540,13 +540,17 @@ def resolve_persist_behavior(
 MODEL_SWITCH_ERR_ONCE_WITH_GLOBAL = "once_with_global"
 MODEL_SWITCH_ERR_ONCE_REQUIRES_TARGET = "once_requires_target"
 MODEL_SWITCH_ERR_BAD_REASONING = "bad_reasoning"
+MODEL_SWITCH_ERR_ALIAS_WITH_FLAGS = "alias_with_flags"
 
 # Canonical (surface-neutral) error copy. Surfaces prepend their own decoration ("  ✗ " in the
 # CLI, "❌ " in the gateway) but MUST NOT change the core sentence — it is shared user-visible copy.
 MODEL_SWITCH_ERROR_TEXT = {
     MODEL_SWITCH_ERR_ONCE_WITH_GLOBAL: "/model --once cannot be combined with --global",
     MODEL_SWITCH_ERR_ONCE_REQUIRES_TARGET: "/model --once requires a model or provider.",
-    MODEL_SWITCH_ERR_BAD_REASONING: "/model --reasoning takes none, minimal, low, medium, high, xhigh, max or ultra."}
+    MODEL_SWITCH_ERR_BAD_REASONING: "/model --reasoning takes none, minimal, low, medium, high, xhigh, max or ultra.",
+    MODEL_SWITCH_ERR_ALIAS_WITH_FLAGS: (
+        "/model local and /model primary select a runtime, not a model: the switch is always "
+        "session-scoped, so --once, --global and --reasoning do not apply.")}
 
 # Runtime aliases: targets that name a *runtime* rather than a model.  They
 # never reach the resolution pipeline — surfaces route them to the local
@@ -637,6 +641,12 @@ def parse_model_switch_args(raw: str) -> ModelSwitchRequest:
         from hermes_constants import parse_reasoning_effort
         if parse_reasoning_effort(parsed.reasoning_effort) is None:
             errors.append(MODEL_SWITCH_ERR_BAD_REASONING)
+    # A runtime alias bypasses the resolution pipeline, and with it every consumer of these
+    # flags: accepting them let ``/model local --once`` report a one-turn switch while
+    # installing a persistent session pin the gateway then persisted across restarts.
+    if (resolve_runtime_alias(parsed.model_input, parsed.explicit_provider)
+            and (parsed.is_once or parsed.is_global or parsed.reasoning_effort)):
+        errors.append(MODEL_SWITCH_ERR_ALIAS_WITH_FLAGS)
     # First matching flag wins: once > session > global > default.
     scope = next((name for name, on in (("once", parsed.is_once), ("session", parsed.is_session),
                                         ("global", parsed.is_global)) if on), "default")

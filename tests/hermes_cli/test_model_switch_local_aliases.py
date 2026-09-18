@@ -54,6 +54,7 @@ class TestRuntimeAliasParsing:
         assert request.explicit_provider == "lmstudio"
 
     def test_alias_keeps_the_parsed_target_and_flags(self):
+        """``--session`` is what the alias already does, so it stays a no-op rather than an error."""
         request = parse_model_switch_args("local --session")
         assert request.runtime_alias == RUNTIME_ALIAS_LOCAL
         assert request.target == "local"
@@ -119,3 +120,22 @@ class TestResolveLocalFallbackEntry:
         assert resolve_local_fallback_entry(
             {"fallback_providers": [remote_with_command]}
         ) is None
+
+
+def test_a_runtime_alias_rejects_scope_and_reasoning_flags():
+    """``/model local --once`` used to install a persistent pin; the flag has no meaning here."""
+    from hermes_cli.model_switch import MODEL_SWITCH_ERR_ALIAS_WITH_FLAGS, parse_model_switch_args
+
+    for raw in ("local --once", "local --global", "primary --once", "local --reasoning high"):
+        request = parse_model_switch_args(raw)
+        assert MODEL_SWITCH_ERR_ALIAS_WITH_FLAGS in request.errors, raw
+        assert "local" in request.error_messages()[0] or "primary" in request.error_messages()[0]
+
+
+def test_a_bare_runtime_alias_still_parses_clean():
+    from hermes_cli.model_switch import parse_model_switch_args
+
+    for raw in ("local", "primary", "cloud"):
+        request = parse_model_switch_args(raw)
+        assert request.runtime_alias, raw
+        assert request.errors == (), raw
