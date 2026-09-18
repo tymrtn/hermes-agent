@@ -3020,6 +3020,25 @@ import weakref as _weakref
 _gateway_runner_ref: _weakref.ref = lambda: None
 
 
+# The loop's internal truncation sentinel, as it reaches ``final_response`` on the paths that
+# deliver it instead of an empty partial.
+_TRUNCATION_SENTINEL = "response truncated due to output length limit"
+
+
+def _is_leaked_truncation_sentinel(agent_result: dict, response: str) -> bool:
+    """True when ``response`` IS that sentinel — never when it merely talks about truncation.
+
+    Gated twice, because a successful answer is free to contain the words "truncate" and
+    "length" (asking for `textwrap.shorten` is enough): the turn must have been cut off, and
+    the sentinel must be the WHOLE response rather than a substring of a real reply.
+    """
+    if not (agent_result.get("partial")
+            or str(agent_result.get("failure_reason") or "") == "truncated"):
+        return False
+    stripped = str(response).strip().lstrip("\u26a0\ufe0f").strip()
+    return stripped.rstrip(".").lower() == _TRUNCATION_SENTINEL
+
+
 def _normalize_empty_agent_response(
     agent_result: dict, response: str, *, history_len: int = 0) -> str:
     """Normalize empty/None agent responses into user-facing messages.
@@ -3041,8 +3060,7 @@ def _normalize_empty_agent_response(
     if response and not (is_overflow and _looks_like_gateway_provider_error(response)):
         # Some paths surface the internal truncation sentinel AS the final response instead of
         # returning an empty partial, and the user then reads a developer string as the answer.
-        _lowered = str(response).lower()
-        if "truncat" in _lowered and "length" in _lowered:
+        if _is_leaked_truncation_sentinel(agent_result, response):
             return (
                 "⚠️ The response hit the model output limit before it finished. "
                 "Send `continue` to resume, or ask for a shorter answer or an attached file."

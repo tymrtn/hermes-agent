@@ -188,3 +188,11 @@ class TestNonempty400EnvelopeOverflowReply:
         assert "output limit" in response
         assert "continue" in response.lower()
 
+
+    def test_a_successful_answer_about_truncation_is_not_rewritten(self):
+        """The sentinel rewrite must match the sentinel, not any prose containing its words."""
+        answer = ("Use `textwrap.shorten` when you need to truncate a string to a maximum "
+                  "length without cutting a word in half.")
+        result = {"final_response": answer, "api_calls": 2, "partial": False, "interrupted": False}
+
+        assert _normalize_empty_agent_response(result, answer, history_len=10) == answer
