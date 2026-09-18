@@ -212,12 +212,14 @@ def ensure_local_endpoint(entry: Any) -> dict:
     # The server outlives the turn, so it must not keep the LAUNCH profile's credentials for that
     # lifetime: under multiplex the process env belongs to whichever profile started the gateway,
     # not to the one that asked for a local endpoint. ``inherit_credentials=False`` is the same
-    # choice the browser driver launch makes — a local model server needs no Hermes secret.
+    # choice the browser driver launch makes — a local model server needs no Hermes secret — and
+    # it scrubs the provider/tool blocklist unconditionally, with no profile scope required.
     from tools.environments.local import served_profile_child_env
     try:
         child_env = served_profile_child_env(inherit_credentials=False)
     except Exception as exc:
-        result["error"] = f"refusing to launch {command}: cannot resolve a scoped environment: {exc}"
+        # Launching with the ambient environment instead would be the leak this call prevents.
+        result["error"] = f"refusing to launch {command}: cannot build a scrubbed environment: {exc}"
         return result
 
     try:

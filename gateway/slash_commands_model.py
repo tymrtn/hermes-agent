@@ -469,9 +469,14 @@ class GatewayModelCommandsMixin:
                 logger.warning("Failed to clear session model override: %s", exc, exc_info=True)
                 unsaved = _OVERRIDE_WRITE_FAILED_NOTE
             self._evict_cached_agent(session_key)
+            if unsaved:
+                # The persisted override is what the next turn rehydrates, and we could not clear
+                # it. "Already on the primary model" would be a guess about state we cannot read.
+                return ("⚠️ Could not clear the stored model override, so the next turn may still "
+                        "run on it. Try again in a moment; details are in `hermes logs`.")
             if not (released or had_override):
                 return "✅ Already on the primary model."
-            return f"✅ Switched back to the primary model.{unsaved}"
+            return "✅ Switched back to the primary model."
 
         from agent.local_endpoint import ensure_local_endpoint
         from hermes_cli.fallback_config import resolve_entry_api_key

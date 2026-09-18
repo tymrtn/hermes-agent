@@ -283,4 +283,20 @@ async def test_primary_alias_reports_an_override_it_could_not_clear(monkeypatch,
 
     reply = await runner._handle_runtime_model_alias("primary", SESSION_KEY)
 
-    assert "could not be saved" in reply
+    assert "Could not clear the stored model override" in reply
+    assert "✅" not in reply
+
+
+@pytest.mark.asyncio
+async def test_primary_alias_does_not_claim_already_primary_when_the_clear_failed(
+    monkeypatch, config_with_local
+):
+    """After a restart the in-memory map is empty but a persisted local override survives; a
+    failed clear must not be reported as "already on primary"."""
+    runner = _StubRunner()  # no in-memory override, no cached agent
+    runner.async_session_store = _FailingStore()
+
+    reply = await runner._handle_runtime_model_alias("primary", SESSION_KEY)
+
+    assert "Already on the primary model" not in reply
+    assert "could not" in reply.lower()
