@@ -117,3 +117,28 @@ class TestSearch:
         result = _search(start_date="last tuesday")
         assert result["success"] is False
         assert "last tuesday" in result["error"]
+
+
+class TestWalVisibility:
+    """Messages keeps ``chat.db`` in WAL mode, so an ``immutable=1`` open silently loses the newest
+    messages: SQLite is told the file cannot change and skips the write-ahead log entirely."""
+
+    def test_a_message_committed_to_the_wal_is_found(self, chat_db, monkeypatch):
+        monkeypatch.setenv("IMESSAGE_SEARCH_ENABLED", "true")
+        # Hold the connection open so the WAL is never checkpointed back into the main file,
+        # exactly as the running Messages app does.
+        live = sqlite3.connect(chat_db)
+        try:
+            live.execute("PRAGMA journal_mode=WAL")
+            live.execute(
+                "INSERT INTO message VALUES (5, 'g5', ?, 0, 'iMessage', 'brunch tomorrow?', 1)",
+                (_apple_ns("2026-07-01T10:00:00"),))
+            live.execute("INSERT INTO chat_message_join VALUES (1, 5)")
+            live.commit()
+
+            result = _search(query="brunch")
+        finally:
+            live.close()
+
+        assert result["total_matches"] == 1, result
+        assert result["results"][0]["text"] == "brunch tomorrow?"

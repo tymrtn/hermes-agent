@@ -50,7 +50,11 @@ def _apple_ns_to_iso(value: Any) -> Optional[str]:
 
 
 def _open_db(path: Path) -> sqlite3.Connection:
-    uri = f"file:{path}?mode=ro&immutable=1"
+    # ``mode=ro`` only. ``immutable=1`` tells SQLite the file cannot change, which makes it skip
+    # the write-ahead log — and Messages keeps ``chat.db`` in WAL mode, so every message committed
+    # since the last checkpoint would silently vanish from the results while the tool reported
+    # success. A live WAL that cannot be read fails loudly here instead.
+    uri = f"file:{path}?mode=ro"
     conn = sqlite3.connect(uri, uri=True)
     conn.row_factory = sqlite3.Row
     return conn
