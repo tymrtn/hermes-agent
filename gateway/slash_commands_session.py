@@ -153,6 +153,13 @@ class GatewaySessionCommandsMixin:
         """Handle /new or /reset command."""
         source = event.source
         session_key = self._session_key_for_source(source)
+        # /new is the visible boundary, so the old conversation's chrome goes with it rather than
+        # vanishing minutes later above a fresh one. The hold would still delete them on its own
+        # schedule (the session key survives the reset) — this is about when, not whether.
+        from gateway.run import _platform_config_key
+        await self._flush_meta_cleanup_for_session(
+            session_key, platform_key=_platform_config_key(source.platform),
+        )
         self._invalidate_session_run_generation(session_key, reason="session_reset")
         # Evict the running-agent slot now that the generation is bumped: the in-flight run's own
         # guarded release (old generation) returns False and would leave a zombie slot that silently

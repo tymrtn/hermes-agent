@@ -115,6 +115,24 @@ class TurnRunner:
             return
         self._track_progress_result(res)
 
+    def _track_bg_review_cleanup_id(self, fut) -> None:
+        """Hand a post-delivery background-review bubble to the session hold registry. It is not a
+        turn, so it restarts the quiet window without counting toward ``cleanup_progress_max_exchanges``."""
+        ctx = self._ctx
+        try:
+            res = fut.result()
+        except Exception:
+            return
+        if not (getattr(res, "success", False) and getattr(res, "message_id", None)):
+            return
+        with suppress(Exception):
+            self._runner._schedule_meta_message_cleanup(
+                session_key=ctx.session_key, chat_id=ctx._status_chat_id, adapter=ctx._status_adapter,
+                message_ids=[str(res.message_id)], loop=ctx._loop_for_step,
+                idle_seconds=ctx._cleanup_idle_seconds, max_exchanges=ctx._cleanup_max_exchanges,
+                count_exchange=False,
+            )
+
     # ── progress_callback (agent thread → progress queue) ───────────────────────────────────
 
     def progress_callback(self, event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
@@ -842,9 +860,9 @@ class TurnRunner:
         """Status adapter present and this run is still the current generation."""
         return bool(self._ctx._status_adapter) and self._ctx._run_still_current()
 
-    def _send_status_text(self, text: str, metadata, log_message: str) -> None:
+    def _send_status_text(self, text: str, metadata, log_message: str):
         ctx = self._ctx
-        self._schedule(ctx._status_adapter.send(ctx._status_chat_id, text, metadata=metadata), log_message)
+        return self._schedule(ctx._status_adapter.send(ctx._status_chat_id, text, metadata=metadata), log_message)
 
     def _attach_session_title_callback(self, agent, ctx) -> None:
         """Wire the platform thread-rename lane onto the agent as `_on_session_title`.
@@ -1181,12 +1199,17 @@ class TurnRunner:
         pending_lock = threading.Lock()
 
         def deliver(message: str) -> None:
-            if self._status_live():
-                self._send_status_text(
-                    message,
-                    _interim_metadata(_non_conversational_metadata(ctx._status_thread_metadata, platform=ctx.source.platform)),
-                    "background_review_callback scheduling error",
-                )
+            if not self._status_live():
+                return
+            fut = self._send_status_text(
+                message,
+                _interim_metadata(_non_conversational_metadata(ctx._status_thread_metadata, platform=ctx.source.platform)),
+                "background_review_callback scheduling error",
+            )
+            # These land AFTER the turn's own cleanup ran, so the only thing that can still retire
+            # them is the hold registry. With no retention window they stay, as they do upstream.
+            if fut is not None and (ctx._cleanup_idle_seconds > 0 or ctx._cleanup_max_exchanges > 0):
+                fut.add_done_callback(self._track_bg_review_cleanup_id)
 
         def release() -> None:
             release_evt.set()

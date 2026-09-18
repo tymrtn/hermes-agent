@@ -882,6 +882,22 @@ display:
 
 Defaults to `false`. Only platforms whose adapter implements `delete_message` honor the setting (currently Telegram and Discord). Failed runs **skip** cleanup so the bubbles remain as breadcrumbs.
 
+#### Keeping bubbles around for a while
+
+By default the bubbles disappear the moment the answer arrives, which is abrupt if you were reading them. Two optional settings hold them instead, deleting the batch later:
+
+```yaml
+display:
+  platforms:
+    telegram:
+      cleanup_progress: true
+      cleanup_progress_idle_seconds: 300   # delete once the session has been quiet 5 minutes
+      cleanup_progress_max_exchanges: 5    # ...or after 5 more tracked turns, whichever comes first
+      cleanup_progress_on_reset: true      # /new flushes held bubbles right away (default)
+```
+
+Both thresholds default to `0`, which is the immediate-delete behavior above. While bubbles are held, each new turn restarts the idle window, and background-review notices ("💾 Memory updated") join the batch. `cleanup_progress_on_reset` clears the batch at the `/new` boundary so the old conversation's chrome goes with it; set it to `false` and held bubbles instead wait out their normal window above the fresh conversation.
+
 ## Next Steps
 
 - [Telegram Setup](telegram.md)

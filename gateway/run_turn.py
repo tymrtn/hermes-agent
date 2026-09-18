@@ -3034,11 +3034,18 @@ class GatewayTurnMixin:
         ):
             _cleanup_progress = False
             _cleanup_adapter = None
+        _cleanup_idle_seconds, _cleanup_max_exchanges = self._cleanup_retention_window(disp) if _cleanup_progress else (0.0, 0)
+        # A held session's quiet period ends the moment this turn starts; the end of the turn re-arms
+        # it. Without the pause an idle delete could land mid-turn, deleting bubbles the user is
+        # still reading alongside live ones.
+        if session_key and (_cleanup_idle_seconds > 0 or _cleanup_max_exchanges > 0):
+            self._pause_meta_cleanup_for_session(session_key)
 
         # The one-slot progress/holder containers shared with the callbacks are TurnContext defaults.
         turn_ctx = TurnContext(
             source=source, message=message, AIAgent=AIAgent, session_key=session_key,
             run_generation=run_generation, _cleanup_progress=_cleanup_progress,
+            _cleanup_idle_seconds=_cleanup_idle_seconds, _cleanup_max_exchanges=_cleanup_max_exchanges,
             _run_still_current=self._run_still_current_fn(session_key, run_generation),
             progress_queue=queue.Queue() if disp.needs_progress_queue else None,
             _voice_ack_guild=_voice_ack_guild, _voice_ack_loop=asyncio.get_running_loop(),
@@ -4020,24 +4027,45 @@ class GatewayTurnMixin:
     def _run_agent_schedule_bubble_cleanup(self, response: Any, _cleanup_adapter: Any, turn_ctx: TurnContext) -> None:
         """Schedule deletion of tracked temporary progress bubbles after the final response lands.
 
-        Failed runs keep them as breadcrumbs. Only on adapters with ``delete_message``; failures swallowed."""
+        Failed runs keep them as breadcrumbs. With a retention window configured
+        (``cleanup_progress_idle_seconds`` / ``_max_exchanges``) the ids are handed to the
+        session-scoped hold registry instead of deleted outright. Only on adapters with
+        ``delete_message``; failures swallowed."""
         from gateway.run import safe_schedule_threadsafe
         _cleanup_msg_ids, session_key = turn_ctx._cleanup_msg_ids, turn_ctx.session_key
         if not (
             turn_ctx._cleanup_progress
             and _cleanup_adapter is not None
-            and _cleanup_msg_ids
             and session_key
             and isinstance(response, dict)
-            and not response.get("failed")
             and hasattr(_cleanup_adapter, "register_post_delivery_callback")
         ):
             return
-        _ids_snapshot = list(_cleanup_msg_ids)
+        _idle, _exchanges = turn_ctx._cleanup_idle_seconds, turn_ctx._cleanup_max_exchanges
+        _held = _idle > 0 or _exchanges > 0
+        _ids_snapshot = [] if response.get("failed") else list(_cleanup_msg_ids)
+        # A failed or bubble-free turn has nothing of its own to retire, but it still ended the quiet
+        # period that `_run_agent_build_turn_context` paused — so a held session must be re-armed.
+        if not _ids_snapshot and not (_held and self._has_paused_meta_cleanup(session_key)):
+            return
         _chat_id_snapshot = turn_ctx.source.chat_id
         _loop_snapshot = asyncio.get_running_loop()
 
         def _cleanup_temp_bubbles() -> None:
+            if _held:
+                with suppress(Exception):
+                    if _ids_snapshot:
+                        self._schedule_meta_message_cleanup(
+                            session_key=session_key, chat_id=_chat_id_snapshot, adapter=_cleanup_adapter,
+                            message_ids=_ids_snapshot, loop=_loop_snapshot,
+                            idle_seconds=_idle, max_exchanges=_exchanges,
+                        )
+                    else:
+                        self._resume_paused_meta_cleanup_for_session(
+                            session_key, loop=_loop_snapshot, idle_seconds=_idle, max_exchanges=_exchanges,
+                        )
+                return
+
             async def _delete_all() -> None:
                 for _mid in _ids_snapshot:
                     with suppress(Exception):

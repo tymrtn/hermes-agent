@@ -28,6 +28,15 @@ _GLOBAL_DEFAULTS: dict[str, Any] = {
     # Delete tool-progress / "⏳ Working" bubbles after a SUCCESSFUL final response where deletion is
     # supported (Telegram); failed runs keep them as breadcrumbs.
     "cleanup_progress": False,
+    # Retention window for cleanup_progress. Both 0 (the default) deletes the turn's own bubbles as
+    # soon as its final response lands. A non-zero value instead HOLDS them in a session-scoped
+    # registry: idle_seconds deletes once the session has been quiet that long, max_exchanges after
+    # that many cleanup-tracked turns. Held bubbles stay readable while the user is still working.
+    "cleanup_progress_idle_seconds": 0,
+    "cleanup_progress_max_exchanges": 0,
+    # /new and /reset flush held bubbles at the boundary rather than letting them expire minutes
+    # later above a fresh conversation.
+    "cleanup_progress_on_reset": True,
     # Working-state text on text-rendering indicators (Slack assistant status): "full"/true = verb +
     # argument preview, "verb" = verb only (keeps paths out of shared channels), "off"/false = static.
     "live_status": "full",
@@ -182,6 +191,17 @@ def _norm_int(value: Any) -> int:
         return 0
 
 
+def _norm_nonneg_int(value: Any) -> int:
+    return max(0, _norm_int(value))
+
+
+def _norm_nonneg_float(value: Any) -> float:
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        return 0.0
+
+
 _NORMALISERS: dict[str, Any] = {
     "tool_progress": _norm_tristate("all", "off", {"off", "new", "all", "verbose", "log"}),
     "show_reasoning": _norm_bool,
@@ -193,6 +213,9 @@ _NORMALISERS: dict[str, Any] = {
     "busy_steer_ack_enabled": _norm_bool,
     "thinking_progress": _norm_bool,
     "cleanup_progress": _norm_cleanup_progress,
+    "cleanup_progress_on_reset": _norm_cleanup_progress,
+    "cleanup_progress_idle_seconds": _norm_nonneg_float,
+    "cleanup_progress_max_exchanges": _norm_nonneg_int,
     "live_status": _norm_tristate("full", "off", {"full", "verb", "off"}, extra_truthy={"all"}),
     "tool_progress_grouping": _norm_choice(("accumulate", "separate")),
     "reasoning_style": _norm_choice(("code", "blockquote", "subtext")),

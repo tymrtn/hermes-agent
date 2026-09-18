@@ -37,6 +37,10 @@ class TurnContext:
     _LONG_TOOL_THRESHOLD_S: float = 30.0
     _cleanup_progress: bool = False
     _cleanup_msg_ids: List[str] = field(default_factory=list)
+    # Retention window for _cleanup_msg_ids; both 0 = delete this turn's bubbles at final response,
+    # non-zero = hold them in the session registry (see gateway/run_meta_cleanup.py).
+    _cleanup_idle_seconds: float = 0.0
+    _cleanup_max_exchanges: int = 0
     _progress_metadata: Optional[dict] = None
     _progress_reply_to: Optional[Any] = None
     message: Optional[str] = None  # the only rebindable field
