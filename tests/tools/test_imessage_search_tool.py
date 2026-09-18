@@ -173,3 +173,11 @@ class TestProfileScope:
     def test_a_single_profile_deployment_still_reads_the_process_env(self, monkeypatch):
         monkeypatch.setenv("IMESSAGE_SEARCH_ENABLED", "true")
         assert check_imessage_search_requirements() is True
+
+
+def test_the_imessage_toolset_is_user_configurable():
+    """Otherwise ``_recover_platform_native_toolsets`` folds it onto saved toolset lists as if it
+    were a platform-native capability, and it cannot be unchecked in ``hermes tools``."""
+    from hermes_cli.tools_config import CONFIGURABLE_TOOLSETS
+
+    assert "imessage" in {key for key, _, _ in CONFIGURABLE_TOOLSETS}
