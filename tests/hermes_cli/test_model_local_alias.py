@@ -6,6 +6,7 @@ snapshot ``/model primary`` restores), so the CLI's own copy of the route has
 to be re-synced from the agent afterwards.
 """
 
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -172,3 +173,25 @@ def test_runtime_aliases_need_a_running_agent(printed):
     cli = _make_cli(agent=None)
     cli._handle_runtime_model_alias("local")
     assert "need a running agent" in "\n".join(printed)
+
+
+def test_a_cli_runtime_alias_disarms_a_pending_once_restore(monkeypatch):
+    """``/model B --once`` then ``/model local``: the turn finalizer must not reinstate B."""
+    from hermes_cli.cli_model_switch_mixin import CLIModelSwitchMixin
+
+    class _Cli(CLIModelSwitchMixin):
+        def __init__(self):
+            self.agent = SimpleNamespace(_fallback_activated=False)
+            self.model = "local-model"
+            self.provider = "custom"
+            self._pending_one_turn_model_restore = {"model": "B"}
+            self._pending_model_switch_note = None
+
+        def _sync_runtime_from_agent(self):
+            pass
+
+    cli = _Cli()
+    monkeypatch.setattr("agent.agent_runtime_helpers.release_local_fallback_hold", lambda a: False)
+    cli._handle_runtime_model_alias("primary")
+
+    assert cli._pending_one_turn_model_restore is None

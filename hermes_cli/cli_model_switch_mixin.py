@@ -789,6 +789,15 @@ class CLIModelSwitchMixin:
         if isinstance(getattr(agent, "base_url", None), str):
             self._explicit_base_url = agent.base_url
 
+    def _disarm_one_turn_model_restore(self) -> None:
+        """Drop a pending ``/model --once`` restore, as an ordinary permanent switch does.
+
+        A runtime alias is a standing choice of runtime. Left armed, the next turn's finalizer
+        reinstated the pre-once snapshot and silently undid the alias. ``/model primary`` disarms
+        even when it finds the session already primary: the user still asked to stay there.
+        """
+        self._pending_one_turn_model_restore = None
+
     def _handle_runtime_model_alias(self, alias: str) -> None:
         """``/model local`` and ``/model primary``.
 
@@ -814,6 +823,7 @@ class CLIModelSwitchMixin:
             if not outcome.get("ok"):
                 _cprint(f"  ✗ {outcome.get('error') or 'Could not switch to the local endpoint.'}")
                 return
+            self._disarm_one_turn_model_restore()
             self._sync_runtime_from_agent()
             verb = "Already on" if outcome.get("already_active") else "Switched to"
             _cprint(f"  ✓ {verb} local endpoint: {format_model_for_display(self.model)}")
@@ -823,6 +833,7 @@ class CLIModelSwitchMixin:
             _cprint("    Holding this endpoint until you run /model primary.")
         else:
             from agent.agent_runtime_helpers import release_local_fallback_hold
+            self._disarm_one_turn_model_restore()
             release_local_fallback_hold(agent)
             if not getattr(agent, "_fallback_activated", False):
                 self._sync_runtime_from_agent()

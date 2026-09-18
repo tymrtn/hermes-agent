@@ -443,6 +443,15 @@ class GatewayModelCommandsMixin:
             event=event, command="model", title=warning.title, message=message, handler=_on_cost_confirm,
         )
 
+    def _disarm_one_turn_model_restore(self, session_key: str) -> None:
+        """Drop a pending ``/model --once`` restore, as an ordinary permanent switch does.
+
+        A runtime alias is a standing choice. Left armed, the next turn's finalizer reinstated
+        the pre-once override and silently undid the alias.
+        """
+        if hasattr(self, "_pending_one_turn_model_restores"):
+            self._pending_one_turn_model_restores.pop(session_key, None)
+
     async def _handle_runtime_model_alias(self, alias: str, session_key: str, *, source=None) -> str:
         """``/model local`` and ``/model primary``.
 
@@ -454,6 +463,7 @@ class GatewayModelCommandsMixin:
         from hermes_cli.model_switch import RUNTIME_ALIAS_LOCAL, resolve_local_fallback_entry
 
         if alias != RUNTIME_ALIAS_LOCAL:
+            self._disarm_one_turn_model_restore(session_key)
             released = False
             cached_agent = self._cached_agent_for(session_key)
             if cached_agent is not None:
@@ -503,6 +513,7 @@ class GatewayModelCommandsMixin:
                 logger.warning("Could not consume pending auto-reset before pinning the local "
                                "endpoint; the pin may not survive the next message: %s", exc)
 
+        self._disarm_one_turn_model_restore(session_key)
         model = str(entry.get("model") or "")
         provider = str(entry.get("provider") or "")
         base_url = str(entry.get("base_url") or "")

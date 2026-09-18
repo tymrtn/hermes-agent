@@ -51,6 +51,7 @@ class _StubRunner:
     # This tree already has the cached-agent accessor; the fork's duplicate is dropped.
     _cached_agent_for = GatewayRunner._cached_agent_for
     _handle_runtime_model_alias = GatewayRunner._handle_runtime_model_alias
+    _disarm_one_turn_model_restore = GatewayRunner._disarm_one_turn_model_restore
 
     def __init__(self, cached_agent=None):
         self._session_model_overrides = {}
@@ -300,3 +301,39 @@ async def test_primary_alias_does_not_claim_already_primary_when_the_clear_faile
 
     assert "Already on the primary model" not in reply
     assert "could not" in reply.lower()
+
+
+@pytest.mark.asyncio
+async def test_a_runtime_alias_disarms_an_earlier_once_restore(monkeypatch, config_with_local):
+    """``/model B --once`` then ``/model local``: the finalizer must not reinstate B and undo local."""
+    _patch_ensure(monkeypatch, {"started": False, "ready": True, "error": ""})
+    runner = _StubRunner()
+    runner._pending_one_turn_model_restores = {SESSION_KEY: {"had_override": True, "override": {"model": "B"}}}
+
+    await runner._handle_runtime_model_alias("local", SESSION_KEY)
+
+    assert SESSION_KEY not in runner._pending_one_turn_model_restores
+
+
+@pytest.mark.asyncio
+async def test_primary_alias_disarms_an_earlier_once_restore(config_with_local):
+    runner = _StubRunner()
+    runner._pending_one_turn_model_restores = {SESSION_KEY: {"had_override": True, "override": {"model": "B"}}}
+
+    await runner._handle_runtime_model_alias("primary", SESSION_KEY)
+
+    assert SESSION_KEY not in runner._pending_one_turn_model_restores
+
+
+@pytest.mark.asyncio
+async def test_a_failed_local_start_leaves_the_once_restore_armed(monkeypatch, config_with_local):
+    """Nothing was switched, so nothing the earlier --once armed should be discarded."""
+    _patch_ensure(monkeypatch, {"started": True, "ready": False, "error": "did not answer"})
+    runner = _StubRunner()
+    snapshot = {"had_override": True, "override": {"model": "B"}}
+    runner._pending_one_turn_model_restores = {SESSION_KEY: snapshot}
+
+    reply = await runner._handle_runtime_model_alias("local", SESSION_KEY)
+
+    assert reply.startswith("❌")
+    assert runner._pending_one_turn_model_restores[SESSION_KEY] == snapshot
