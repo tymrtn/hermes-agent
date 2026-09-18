@@ -94,6 +94,36 @@ class GatewaySessionWatchersMixin:
             logger.warning("Invalid gateway.afk_followup config; AFK follow-up disabled: %s", exc)
             return AfkFollowupConfig(enabled=False)
 
+    def _afk_config_for_session(self, source) -> AfkFollowupConfig:
+        """The AFK settings of the profile that OWNS this chat, not the launch profile's.
+
+        Several profiles share one gateway process, and an autonomous turn spends the owning
+        profile's tokens and runs its tools, so it follows that profile's opt-in. Whether the
+        watcher runs at all is still decided by the launch profile at startup: a satellite
+        cannot arm one on its own, and with the launch profile opted out no profile gets AFK
+        turns from this process.
+        """
+        name = (getattr(source, "profile", "") or "").strip()
+        launch_config = getattr(self, "_afk_followup_config", AfkFollowupConfig())
+        if not name:
+            return launch_config
+        cache = getattr(self, "_afk_profile_configs", None)
+        if cache is None:
+            cache = self._afk_profile_configs = {}
+        if name not in cache:
+            from hermes_cli.config import cfg_get
+            from gateway.run import _load_gateway_config
+            try:
+                home = self._resolve_profile_home_for_source(source)
+                raw = cfg_get(_load_gateway_config(home / "config.yaml"),
+                              "gateway", "afk_followup", default={})
+                cache[name] = parse_afk_followup_config(raw)
+            except Exception as exc:
+                # Fail closed: an unreadable profile config must not inherit somebody else's opt-in.
+                logger.warning("AFK follow-up: could not read %s's config; leaving it off: %s", name, exc)
+                cache[name] = AfkFollowupConfig(enabled=False)
+        return cache[name]
+
     async def _afk_followup_watcher(self) -> None:
         """Inject bounded synthetic follow-up turns into idle sessions while the user is away."""
         config = getattr(self, "_afk_followup_config", AfkFollowupConfig())
@@ -147,6 +177,9 @@ class GatewaySessionWatchersMixin:
             source = self._source_from_afk_origin(getattr(entry, "origin", None))
             if source is None:
                 logger.debug("AFK follow-up: no routable source for %s", entry.session_key)
+                continue
+            if not self._afk_config_for_session(source).enabled:
+                logger.debug("AFK follow-up: %s's profile has not opted in", entry.session_key)
                 continue
             # Resolve the way every other delivery path does: a satellite profile's adapter lives
             # in ``_profile_adapters``, and a relay-delivered source keeps its underlying platform

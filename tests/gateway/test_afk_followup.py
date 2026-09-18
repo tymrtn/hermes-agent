@@ -319,6 +319,9 @@ async def test_afk_followup_tick_reaches_a_secondary_profile_adapter(monkeypatch
     # Only the secondary profile has a Telegram adapter; the primary map is empty.
     runner.adapters = {}
     runner._profile_adapters = {"satellite": {Platform.TELEGRAM: adapter}}
+    # The satellite opted in for itself.
+    runner._afk_profile_configs = {
+        "satellite": AfkFollowupConfig(enabled=True, thresholds_minutes=(5,), interval_seconds=1)}
     monkeypatch.setattr("gateway.run_watchers.datetime", SimpleNamespace(now=lambda tz=None: now))
 
     await runner._afk_followup_tick()
@@ -336,3 +339,35 @@ def test_afk_followup_config_does_not_arm_on_a_string_false():
         assert parse_afk_followup_config({"enabled": raw_enabled}).enabled is False, raw_enabled
     for raw_enabled in (True, "true", "yes", "1", "on"):
         assert parse_afk_followup_config({"enabled": raw_enabled}).enabled is True, raw_enabled
+
+
+@pytest.mark.asyncio
+async def test_afk_followup_respects_a_satellite_profiles_own_opt_in(monkeypatch, tmp_path):
+    """Several profiles share one process; autonomous turns follow the opt-in of the profile
+    whose chat they land in, not the launch profile's."""
+    from gateway.afk_followup import AfkFollowupConfig
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    runner._afk_followup_config = AfkFollowupConfig(enabled=True, thresholds_minutes=(5,), interval_seconds=1)
+    runner._afk_fired_thresholds = {}
+    runner._running_agents = {}
+    runner._queued_events = {}
+
+    entry, now = _entry(minutes_idle=10, session_key="agent:satellite:telegram:dm:123")
+    entry.origin = SimpleNamespace(
+        platform=Platform.TELEGRAM, chat_id="123", thread_id=None, profile="satellite")
+    runner.session_store = SimpleNamespace(list_sessions=lambda: [entry])
+
+    adapter = SimpleNamespace(_pending_messages={}, handle_message=AsyncMock())
+    runner.adapters = {}
+    runner._profile_adapters = {"satellite": {Platform.TELEGRAM: adapter}}
+    # The satellite never opted in.
+    monkeypatch.setattr(
+        GatewayRunner, "_resolve_profile_home_for_source", lambda self, source: tmp_path)
+    monkeypatch.setattr("gateway.run._load_gateway_config", lambda *a, **k: {})
+    monkeypatch.setattr("gateway.run_watchers.datetime", SimpleNamespace(now=lambda tz=None: now))
+
+    await runner._afk_followup_tick()
+
+    assert adapter.handle_message.call_count == 0
