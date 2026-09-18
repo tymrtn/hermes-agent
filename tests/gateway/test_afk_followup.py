@@ -296,3 +296,33 @@ async def test_internal_afk_response_delivers_even_if_user_message_arrived_mid_r
     assert adapter.sent[0][1] == "AFK task completed: checked logs."
     assert adapter.sent[0][2].get("reply_to") is None
     assert len(adapter.sent) >= 1
+
+
+@pytest.mark.asyncio
+async def test_afk_followup_tick_reaches_a_secondary_profile_adapter(monkeypatch):
+    """A satellite profile's sessions are AFK-eligible too; its adapter is not in ``adapters``."""
+    from gateway.afk_followup import AfkFollowupConfig
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    runner._afk_followup_config = AfkFollowupConfig(enabled=True, thresholds_minutes=(5,), interval_seconds=1)
+    runner._afk_fired_thresholds = {}
+    runner._running_agents = {}
+    runner._queued_events = {}
+
+    entry, now = _entry(minutes_idle=10, session_key="agent:satellite:telegram:dm:123")
+    entry.origin = SimpleNamespace(
+        platform=Platform.TELEGRAM, chat_id="123", thread_id=None, profile="satellite")
+    runner.session_store = SimpleNamespace(list_sessions=lambda: [entry])
+
+    adapter = SimpleNamespace(_pending_messages={}, handle_message=AsyncMock())
+    # Only the secondary profile has a Telegram adapter; the primary map is empty.
+    runner.adapters = {}
+    runner._profile_adapters = {"satellite": {Platform.TELEGRAM: adapter}}
+    monkeypatch.setattr("gateway.run_watchers.datetime", SimpleNamespace(now=lambda tz=None: now))
+
+    await runner._afk_followup_tick()
+
+    assert adapter.handle_message.call_count == 1
+    event = adapter.handle_message.call_args.args[0]
+    assert event.source.profile == "satellite"

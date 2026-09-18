@@ -148,7 +148,11 @@ class GatewaySessionWatchersMixin:
             if source is None:
                 logger.debug("AFK follow-up: no routable source for %s", entry.session_key)
                 continue
-            adapter = adapters.get(source.platform)
+            # Resolve the way every other delivery path does: a satellite profile's adapter lives
+            # in ``_profile_adapters``, and a relay-delivered source keeps its underlying platform
+            # while the transport is registered as RELAY. A bare ``adapters[platform]`` silently
+            # skips both.
+            adapter = self._adapter_for_source(source)
             if adapter is None:
                 logger.debug("AFK follow-up: no adapter for %s (%s)", entry.session_key, source.platform)
                 continue
@@ -180,11 +184,14 @@ class GatewaySessionWatchersMixin:
         chat_id = getattr(origin, "chat_id", None)
         if not chat_id:
             return None
+        # ``profile`` and ``scope_id`` are what adapter resolution keys off for a satellite or a
+        # scoped workspace; dropping them here routed the follow-up out of the default bot.
         return SessionSource(
             platform=platform, chat_id=str(chat_id), chat_name=getattr(origin, "chat_name", None),
             chat_type=getattr(origin, "chat_type", "dm") or "dm",
             user_id=getattr(origin, "user_id", None), user_name=getattr(origin, "user_name", None),
-            thread_id=getattr(origin, "thread_id", None), chat_topic=getattr(origin, "chat_topic", None))
+            thread_id=getattr(origin, "thread_id", None), chat_topic=getattr(origin, "chat_topic", None),
+            scope_id=getattr(origin, "scope_id", None), profile=getattr(origin, "profile", None))
 
     def _session_stall_timeout_seconds(self) -> float:
         """Return configured stall timeout (seconds); 0 disables the watchdog."""
