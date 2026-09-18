@@ -436,7 +436,7 @@ class GatewayModelCommandsMixin:
             event=event, command="model", title=warning.title, message=message, handler=_on_cost_confirm,
         )
 
-    async def _handle_runtime_model_alias(self, alias: str, session_key: str) -> str:
+    async def _handle_runtime_model_alias(self, alias: str, session_key: str, *, source=None) -> str:
         """``/model local`` and ``/model primary``.
 
         ``local`` starts the configured loopback endpoint when it is down and pins the session
@@ -474,6 +474,18 @@ class GatewayModelCommandsMixin:
         status = await asyncio.to_thread(ensure_local_endpoint, entry)
         if not status.get("ready"):
             return f"❌ {status.get('error') or 'Local endpoint is not reachable.'}"
+
+        # Consume a pending auto-reset before storing the pin, exactly as ``_record_model_switch``
+        # does (#48031): the next message opens the session, treats the flag as a conversation
+        # boundary and clears every session-scoped override — including the one stored below.
+        if source is not None:
+            try:
+                _sess_entry = await self.async_session_store.get_or_create_session(source)
+                if getattr(_sess_entry, "was_auto_reset", False):
+                    _sess_entry.was_auto_reset = False
+            except Exception as exc:
+                logger.warning("Could not consume pending auto-reset before pinning the local "
+                               "endpoint; the pin may not survive the next message: %s", exc)
 
         model = str(entry.get("model") or "")
         provider = str(entry.get("provider") or "")
@@ -519,7 +531,8 @@ class GatewayModelCommandsMixin:
         # /model local and /model primary select a runtime, not a model: they never enter the
         # resolution pipeline below.
         if request.runtime_alias:
-            return await self._handle_runtime_model_alias(request.runtime_alias, session_key)
+            return await self._handle_runtime_model_alias(
+                request.runtime_alias, session_key, source=source)
         ctx = _ModelSwitchContext(
             # Gateway routing columns — forward ALL of them at CREATE time, same fix as the
             # compression-rotation bug in agent/conversation_compression.py. Without these, the branched

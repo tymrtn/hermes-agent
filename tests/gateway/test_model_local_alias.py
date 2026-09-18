@@ -201,9 +201,10 @@ async def test_model_command_routes_aliases_before_the_switch_pipeline(monkeypat
 
     seen = {}
 
-    async def _fake_alias(alias, session_key):
+    async def _fake_alias(alias, session_key, *, source=None):
         seen["alias"] = alias
         seen["session_key"] = session_key
+        seen["source"] = source
         return "✅ routed"
 
     runner._handle_runtime_model_alias = _fake_alias
@@ -222,3 +223,30 @@ async def test_model_command_routes_aliases_before_the_switch_pipeline(monkeypat
     assert reply == "✅ routed"
     assert seen["alias"] == "local"
     assert seen["session_key"]
+    # The handler needs the source to consume a pending auto-reset before pinning.
+    assert seen["source"] is not None
+
+
+class _ResetStore(_StubStore):
+    """A store whose session entry still carries a pending auto-reset."""
+
+    def __init__(self):
+        super().__init__()
+        self.entry = MagicMock(was_auto_reset=True)
+
+    async def get_or_create_session(self, source):
+        return self.entry
+
+
+@pytest.mark.asyncio
+async def test_local_alias_consumes_a_pending_auto_reset(monkeypatch, config_with_local):
+    """Otherwise the next message's conversation boundary wipes the pin we just installed (#48031)."""
+    _patch_ensure(monkeypatch, {"started": False, "ready": True, "error": ""})
+    runner = _StubRunner()
+    runner.async_session_store = _ResetStore()
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="12345")
+
+    reply = await runner._handle_runtime_model_alias("local", SESSION_KEY, source=source)
+
+    assert "Local endpoint active" in reply
+    assert runner.async_session_store.entry.was_auto_reset is False
