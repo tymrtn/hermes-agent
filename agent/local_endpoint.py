@@ -209,6 +209,17 @@ def ensure_local_endpoint(entry: Any) -> dict:
         result["error"] = invalid
         return result
 
+    # The server outlives the turn, so it must not keep the LAUNCH profile's credentials for that
+    # lifetime: under multiplex the process env belongs to whichever profile started the gateway,
+    # not to the one that asked for a local endpoint. ``inherit_credentials=False`` is the same
+    # choice the browser driver launch makes — a local model server needs no Hermes secret.
+    from tools.environments.local import served_profile_child_env
+    try:
+        child_env = served_profile_child_env(inherit_credentials=False)
+    except Exception as exc:
+        result["error"] = f"refusing to launch {command}: cannot resolve a scoped environment: {exc}"
+        return result
+
     try:
         subprocess.Popen(
             [command],
@@ -216,6 +227,7 @@ def ensure_local_endpoint(entry: Any) -> dict:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             cwd=os.path.dirname(command) or None,
+            env=child_env,
             # Detach: the server outlives this turn, and Ctrl-C in Hermes
             # must not take down a server the user may still be using.
             start_new_session=True,

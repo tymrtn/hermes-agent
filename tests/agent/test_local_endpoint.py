@@ -393,3 +393,30 @@ def test_unknown_entry_keys_survive_config_normalization():
     assert entry["start_timeout"] == 90
     assert entry["base_url"] == "http://127.0.0.1:18765/v1"
     assert os.path.isabs(entry["start_command"])
+
+
+class TestLaunchEnvironment:
+    """The server outlives the turn that started it; it must not carry the launch profile's
+    credentials into that lifetime."""
+
+    def test_the_server_is_launched_with_a_scoped_child_env(self, monkeypatch, tmp_path):
+        script = _write_script(tmp_path / "serve.command", "exit 0")
+        monkeypatch.setattr(local_endpoint, "endpoint_healthy", lambda *a, **k: False)
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-launch-profile-only")
+        seen = {}
+
+        def _fake_popen(argv, **kwargs):
+            seen["kwargs"] = kwargs
+            return object()
+
+        monkeypatch.setattr(local_endpoint.subprocess, "Popen", _fake_popen)
+
+        ensure_local_endpoint({
+            "base_url": "http://127.0.0.1:18765/v1",
+            "start_command": script,
+            "start_timeout": 0,
+        })
+
+        env = seen["kwargs"].get("env")
+        assert env is not None, "Popen inherited the whole process environment"
+        assert env.get("OPENAI_API_KEY") != "sk-launch-profile-only"
