@@ -1,0 +1,8 @@
+{
+  "title": "sample marketplace triage",
+  "messages": [
+    {"role": "user", "content": "Any movement on the seller onboarding queue? TRANSCRIPT_CANARY_JSON_MM45."},
+    {"role": "assistant", "content": "Two listings triaged; follow-up needed on the flagged duplicate before Friday."},
+    {"role": "user", "content": "Park it until the export lands."}
+  ]
+}
