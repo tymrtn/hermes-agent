@@ -1,0 +1,5 @@
+{"role": "user", "content": "Where did we land on the nightly continuity design? TRANSCRIPT_CANARY_USER_ZX81 must never persist."}
+{"role": "assistant", "content": "The collector is read-only and bounded; TODO: wire the retriever hook so fresh sessions actually receive open threads. TRANSCRIPT_CANARY_ASSISTANT_QL72."}
+{"role": "user", "content": "Make sure reruns cannot duplicate anything."}
+{"role": "assistant", "content": "Idempotency comes from database constraints: unique run ids, dedupe keys, and one disposition per thread per day."}
+{"role": "system", "content": "housekeeping line that must not appear in previews"}

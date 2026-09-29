@@ -1,0 +1,5 @@
+{"role": "user", "content": "first valid line before corruption"}
+{not json at all — truncated write
+@@@@@@@ merge-conflict-shaped debris (encoded without a literal git marker)
+{"role": "assistant"  "content": "missing comma makes this invalid"}
+plain text tail line TRANSCRIPT_CANARY_TAIL_RV33 that previews must not surface

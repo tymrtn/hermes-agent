@@ -1,0 +1,6 @@
+Root-level scratch notes: no canonical-path match, so routing must come from
+explicit refs or aliases — or abstain.
+
+Follow-up needed on the klas duplicate-listing verification before Friday.
+
+TODO: schedule the quarterly export review with no project mentioned anywhere.

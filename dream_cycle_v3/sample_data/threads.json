@@ -1,0 +1,182 @@
+[
+  {
+    "schema_version": 1,
+    "thread_id": "sample-thread-0001-kanban-done",
+    "project_id": "hermes-continuity",
+    "external_task_ref": "kanban:sample-board:T-1001",
+    "link_disposition": "linked",
+    "title": "Repair the board notification subscription",
+    "normalized_next_action": "verify the repaired subscription delivers one notification per event",
+    "owner": "nagatha",
+    "state": "active",
+    "opened_from": "session:20260710-hermes-session",
+    "evidence_refs": [
+      {
+        "source_type": "session",
+        "source_id": "profile:sessions/20260710-hermes-session.jsonl",
+        "observed_at": "2026-07-10T21:00:00+00:00",
+        "fingerprint": "fp-sample-0000000000000001"
+      }
+    ],
+    "last_disposition_date": "2026-07-10",
+    "idempotency_key": "sample-idem-0001-kanban-done"
+  },
+  {
+    "schema_version": 1,
+    "thread_id": "sample-thread-0002-blocked-future",
+    "project_id": "hermes-continuity",
+    "external_task_ref": "kanban:sample-board:T-1002",
+    "link_disposition": "linked",
+    "title": "Offload the long-running collection step",
+    "normalized_next_action": "apply the offload patch once the owner approves the approach",
+    "owner": "nagatha",
+    "state": "blocked",
+    "blocked_by": "tyler decision on offload approach",
+    "follow_up_after": "2026-07-14T09:00:00+00:00",
+    "opened_from": "v2-migration-sample",
+    "evidence_refs": [
+      {
+        "source_type": "file",
+        "source_id": "profile:state/loose-threads.md",
+        "observed_at": "2026-07-10T21:00:00+00:00",
+        "fingerprint": "fp-sample-0000000000000002"
+      }
+    ],
+    "last_disposition_date": "2026-07-10",
+    "idempotency_key": "sample-idem-0002-blocked-future"
+  },
+  {
+    "schema_version": 1,
+    "thread_id": "sample-thread-0003-waiting-elapsed",
+    "project_id": "hermes-continuity",
+    "external_task_ref": null,
+    "link_disposition": "not_actionable",
+    "title": "Await the tracker export before reconciling",
+    "normalized_next_action": "reconcile board state against the delivered export",
+    "owner": "nagatha",
+    "state": "waiting",
+    "blocked_by": "tracker export delivery",
+    "follow_up_after": "2026-07-10T09:00:00+00:00",
+    "opened_from": "v2-migration-sample",
+    "evidence_refs": [
+      {
+        "source_type": "file",
+        "source_id": "profile:state/wake-up.md",
+        "observed_at": "2026-07-10T21:00:00+00:00",
+        "fingerprint": "fp-sample-0000000000000003"
+      }
+    ],
+    "last_disposition_date": "2026-07-10",
+    "idempotency_key": "sample-idem-0003-waiting-elapsed"
+  },
+  {
+    "schema_version": 1,
+    "thread_id": "sample-thread-0004-stale-aged",
+    "project_id": "hermes-continuity",
+    "external_task_ref": null,
+    "link_disposition": "not_actionable",
+    "title": "Build the wrapper for the analyzed data toolkit",
+    "normalized_next_action": "decide whether the wrapper is still worth building",
+    "owner": "nagatha",
+    "state": "active",
+    "opened_from": "v2-migration-sample",
+    "evidence_refs": [
+      {
+        "source_type": "file",
+        "source_id": "profile:state/loose-threads.md",
+        "observed_at": "2026-06-20T21:00:00+00:00",
+        "fingerprint": "fp-sample-0000000000000004"
+      }
+    ],
+    "last_disposition_date": "2026-06-20",
+    "idempotency_key": "sample-idem-0004-stale-aged"
+  },
+  {
+    "schema_version": 1,
+    "thread_id": "sample-thread-0005-needs-link",
+    "project_id": "hermes-continuity",
+    "external_task_ref": null,
+    "link_disposition": "needs_link",
+    "title": "Fix forwarded-message reply metadata",
+    "normalized_next_action": "create a tracker task for the reply-metadata fix and link it here",
+    "owner": "nagatha",
+    "state": "observed",
+    "opened_from": "session:20260710-hermes-session",
+    "evidence_refs": [
+      {
+        "source_type": "session",
+        "source_id": "profile:sessions/20260710-hermes-session.jsonl",
+        "observed_at": "2026-07-10T21:00:00+00:00",
+        "fingerprint": "fp-sample-0000000000000005"
+      }
+    ],
+    "last_disposition_date": "2026-07-10",
+    "idempotency_key": "sample-idem-0005-needs-link"
+  },
+  {
+    "schema_version": 1,
+    "thread_id": "sample-thread-0006-todoist-done",
+    "project_id": "klas-sample",
+    "external_task_ref": "todoist:8000000002",
+    "link_disposition": "linked",
+    "title": "Close out the duplicate-listing follow-up",
+    "normalized_next_action": "confirm the flagged duplicate listing was resolved",
+    "owner": "nagatha",
+    "state": "active",
+    "opened_from": "session:20260710-klas-session",
+    "evidence_refs": [
+      {
+        "source_type": "session",
+        "source_id": "profile:sessions/20260710-klas-session.json",
+        "observed_at": "2026-07-10T21:00:00+00:00",
+        "fingerprint": "fp-sample-0000000000000006"
+      }
+    ],
+    "last_disposition_date": "2026-07-10",
+    "idempotency_key": "sample-idem-0006-todoist-done"
+  },
+  {
+    "schema_version": 1,
+    "thread_id": "sample-thread-0007-authority-gated",
+    "project_id": "klas-sample",
+    "external_task_ref": "todoist:8000000001",
+    "link_disposition": "linked",
+    "title": "Send the seller onboarding draft",
+    "normalized_next_action": "send the drafted onboarding email to the seller list",
+    "owner": "nagatha",
+    "state": "queued",
+    "opened_from": "session:20260710-klas-session",
+    "evidence_refs": [
+      {
+        "source_type": "session",
+        "source_id": "profile:sessions/20260710-klas-session.json",
+        "observed_at": "2026-07-10T21:00:00+00:00",
+        "fingerprint": "fp-sample-0000000000000007"
+      }
+    ],
+    "last_disposition_date": "2026-07-10",
+    "idempotency_key": "sample-idem-0007-authority-gated"
+  },
+  {
+    "schema_version": 1,
+    "thread_id": "sample-thread-0008-active-open",
+    "project_id": "hermes-continuity",
+    "external_task_ref": "kanban:sample-board:T-1003",
+    "link_disposition": "linked",
+    "title": "Wire the retriever hook for fresh sessions",
+    "normalized_next_action": "draft the bounded retriever interface for session start",
+    "owner": "nagatha",
+    "state": "active",
+    "opened_from": "session:20260710-hermes-session",
+    "evidence_refs": [
+      {
+        "source_type": "session",
+        "source_id": "profile:sessions/20260710-hermes-session.jsonl",
+        "observed_at": "2026-07-10T21:00:00+00:00",
+        "fingerprint": "fp-sample-0000000000000008"
+      }
+    ],
+    "last_disposition_date": "2026-07-10",
+    "idempotency_key": "sample-idem-0008-active-open"
+  }
+]
