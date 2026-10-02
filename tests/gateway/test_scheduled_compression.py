@@ -773,14 +773,31 @@ async def _stop_session(runner, source: SessionSource, session_key: str) -> None
         invalidation_reason="stop_command_pending")
 
 
-def test_stop_midflight_leaves_the_successor_turn_owning_its_slot_and_lease(live):
-    """``/stop`` clears the reservation's sentinel and a successor turn claims the slot (and the
-    lease the stop swept free) before the compression finishes unwinding. The compression's tail must
-    release only its OWN generation: an unconditional release clears the successor's live turn, which
-    silently disables busy routing and /stop for a turn that is really running."""
+def _profile_home(tmp_path, monkeypatch, *, extra_config: str = ""):
+    """A profile home for PROFILE, optionally with extra compression config."""
+    home = tmp_path / ".hermes" / "profiles" / PROFILE
+    home.mkdir(parents=True)
+    (home / "config.yaml").write_text(_TEST_CONFIG + extra_config)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    config = GatewayConfig(platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")})
+    return config, SessionStore(sessions_dir=home / "sessions", config=config)
+
+
+@pytest.mark.parametrize("extra_config, rotates", [("", False), ("  in_place: false\n", True)])
+def test_stop_midflight_keeps_the_mutation_lease_until_the_worker_stops(
+        tmp_path, monkeypatch, extra_config, rotates):
+    """``/stop`` lands while the compression is parked inside its summarizer.
+
+    It may free the UI/admission slot — that is what /stop is for, and the successor turn claims it.
+    What it must NOT do is hand the successor the canonical mutation lease: the summarization runs on
+    an executor thread that no interrupt or cancellation stops, and it still archives (in place) or
+    rotates the very transcript the successor would load. So the successor must be fenced out of the
+    [read history → commit] region until the worker has really finished — and the compression's tail
+    must still touch only its OWN slot and lease.
+    """
     from gateway.turn_lease import TurnLeaseTimeoutError
 
-    config, store, _home = live
+    config, store = _profile_home(tmp_path, monkeypatch, extra_config=extra_config)
     entry = _seed(store, _source(), _history())
     runner = _runner(config, store)
     started, release = threading.Event(), threading.Event()
@@ -797,30 +814,114 @@ def test_stop_midflight_leaves_the_successor_turn_owning_its_slot_and_lease(live
         state.turn.agent = MagicMock()
         state.turn.started_ts = time.time()
         successor = runner._begin_session_run_generation(entry.session_key)
-        # Not fatal here: the point of the assertions is what the compression's TAIL does, and a base
-        # that parks its lease token outside the session's own map leaves /stop unable to sweep it —
-        # so record the refusal and keep going instead of ending the test on it.
-        lease_error = None
+        # The real turn region starts HERE (``run_turn.py::_hmwa_acquire_turn_lease``, before the
+        # transcript load). While the worker lives it must fail closed.
+        fenced = False
         try:
-            state.turn.lease_tokens[successor] = await runner._turn_leases.acquire(
-                entry.session_id, owner_key=entry.session_key, generation=successor, timeout=1.0)
-        except TurnLeaseTimeoutError as exc:
-            lease_error = exc
+            await runner._turn_leases.acquire(entry.session_id, owner_key=entry.session_key,
+                                              generation=successor, timeout=0.3)
+        except TurnLeaseTimeoutError:
+            fenced = True
         release.set()
-        return successor, lease_error, await task
+        result = await task
+        # Worker done: the successor may now enter, on whichever id the conversation ended up on.
+        live_id = store.lookup_by_session_key(entry.session_key).session_id
+        state.turn.lease_tokens[successor] = await runner._turn_leases.acquire(
+            live_id, owner_key=entry.session_key, generation=successor, timeout=2.0)
+        return successor, fenced, result
 
     with _real_compression(runner) as llm:
         llm.side_effect = _barrier_summary(started, release)
-        successor, lease_error, result = asyncio.run(_scenario())
+        successor, fenced, result = asyncio.run(_scenario())
 
+    assert fenced is True, (
+        "the successor turn entered the history-read/commit region while the compression worker "
+        "could still mutate the transcript")
     state = runner._peek_session_state(entry.session_key)
     assert runner._is_session_running(entry.session_key) is True, \
         "the compression's tail cleared the successor turn's slot"
     assert state.turn.agent is not None
-    assert lease_error is None, \
-        f"/stop could not free the reservation's lease for the successor turn: {lease_error}"
     assert successor in state.turn.lease_tokens, "the successor's lease token was stolen"
     assert result["counts"] == {"applied": 1}, result
+    assert result["sessions"][0]["rotated"] is rotates
+
+
+def test_a_stale_lease_acquisition_does_not_compress(tmp_path, monkeypatch):
+    """The lease acquisition AWAITS under contention, and /stop can invalidate the reservation in
+    that window. Winning the lease afterwards must not start a compression on behalf of a
+    reservation that no longer owns the conversation: it defers before reading any history."""
+    config, store = _profile_home(tmp_path, monkeypatch)
+    history = _history()
+    entry = _seed(store, _source(), history)
+    runner = _runner(config, store)
+
+    async def _scenario():
+        # A second routing key resolving this same session_id holds the lease (the switch_session
+        # many-to-one case): the slot is free, so the reservation is claimed and then WAITS.
+        alias = await runner._turn_leases.acquire(
+            entry.session_id, owner_key="agent:main:alias", generation=1, timeout=1.0)
+        task = asyncio.create_task(run_scheduled_compression(
+            runner, profile=PROFILE, cycle_id=CYCLE))
+        assert await _await_until(
+            lambda: runner._turn_leases._leases[entry.session_id].pending_acquires > 0), \
+            "the cycle never reached the contended lease"
+        # /stop while it waits, then the holder lets go so the stale acquisition wins the lease.
+        await _stop_session(runner, _source(), entry.session_key)
+        runner._turn_leases.release(alias)
+        return await task
+
+    with _real_compression(runner) as llm:
+        result = asyncio.run(_scenario())
+
+    row = result["sessions"][0]
+    assert row["status"] == "deferred" and row["reason"] == "reservation_invalidated", row
+    llm.assert_not_called()
+    assert store.lookup_by_session_key(entry.session_key).session_id == entry.session_id
+    assert len(store.load_transcript(entry.session_id)) == len(history)
+    assert store.get_session_metadata(entry.session_key, CYCLE_METADATA_KEY) is None
+    # The lease it briefly won is given back, so the next real turn is not fenced out forever.
+    assert runner._turn_leases._leases[entry.session_id].holder is None
+
+
+def test_cancelling_the_cycle_holds_the_lease_until_the_worker_really_stops(tmp_path, monkeypatch):
+    """Cancelling the awaiting coroutine does not stop the summarization — it runs on an executor
+    thread. So the mutation lease must stay held past the cancellation and be given back only when the
+    worker (and the writes it performs) has actually finished."""
+    from gateway.turn_lease import TurnLeaseTimeoutError
+
+    config, store = _profile_home(tmp_path, monkeypatch)
+    entry = _seed(store, _source(), _history())
+    runner = _runner(config, store)
+    started, release = threading.Event(), threading.Event()
+
+    async def _scenario():
+        task = asyncio.create_task(run_scheduled_compression(
+            runner, profile=PROFILE, cycle_id=CYCLE))
+        assert await asyncio.to_thread(started.wait, 20), "compression never reached the summarizer"
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        fenced = False
+        try:
+            await runner._turn_leases.acquire(entry.session_id, owner_key="agent:main:alias",
+                                              generation=99, timeout=0.3)
+        except TurnLeaseTimeoutError:
+            fenced = True
+        release.set()
+        freed = await _await_until(
+            lambda: runner._turn_leases._leases[entry.session_id].holder is None, timeout=20.0)
+        return fenced, freed
+
+    with _real_compression(runner) as llm:
+        llm.side_effect = _barrier_summary(started, release)
+        fenced, freed = asyncio.run(_scenario())
+
+    assert fenced is True, "the lease was released while the compression worker could still write"
+    assert freed is True, "the lease was never given back after the worker finished"
+    # The worker was never interrupted, so its rewrite still landed.
+    continuation = store.load_transcript(
+        store.lookup_by_session_key(entry.session_key).session_id)
+    assert any(is_compaction_summary_message(m) for m in continuation)
 
 
 def test_inbound_parks_on_the_reservation_instead_of_redispatching(live):

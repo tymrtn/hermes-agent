@@ -70,20 +70,28 @@ nightly job asks the OWNING process to run the existing manual-`/compress` path 
 Never reimplement it caller-side — an offline `state.db` rewrite desyncs the cached agent. It
 **RESERVES** the conversation before reading its history — the pending-sentinel turn slot (the
 predicate `_is_session_running` the inbound admission gate reads), a fresh run generation and the
-per-session_id turn lease (token parked in `turn.lease_tokens` like a real turn's) — so inbound waits
-behind it instead of running a turn against a transcript about to be rotated away. A reservation has
-no turn behind it, so it carries `turn.reservation`: inbound **parks its task** on that event
-(`_hm_park_on_turn_reservation`) rather than queueing into the adapter's pending slot, which nothing
-would drain and whose in-band drain re-dispatched the parked event in a tight loop; slash commands
-still dispatch, so `/stop` stays the escape hatch, and every slot release (`TurnState.clear`) sets
-the event. Release and rebind are GENERATION-GUARDED: a `/stop` mid-flight plus a successor turn is
-the case an unconditional release broke, clearing a live turn's slot. It defers on a running turn,
-in-flight compression or a contended lease; it stamps its outcome
-in the routing entry's metadata for per-cycle idempotence; and it reports `applied` only on an
-explicit COMMIT (`_persist_manual_compression` returning True) plus before/after evidence —
-`compress_now` answering `compressed` covers a refused would-grow candidate and a rolled-back
-persistence failure, both of which must stay retryable. It binds scope through
-`_profile_scope_for_source` like every other standalone entry point (see § Profile scope).
+per-session_id turn lease — so inbound waits behind it instead of running a turn against a
+transcript about to be rotated away. A reservation has no turn behind it, so it carries
+`turn.reservation`: inbound **parks its task** on that event (`_hm_park_on_turn_reservation`) rather
+than queueing into the adapter's pending slot, which nothing would drain and whose in-band drain
+re-dispatched the parked event in a tight loop; slash commands still dispatch, so `/stop` stays the
+escape hatch, and every slot release (`TurnState.clear`) sets the event. The SLOT release is
+GENERATION-GUARDED (a `/stop` mid-flight plus a successor turn is the case an unconditional release
+broke, clearing a live turn's slot), but the MUTATION LEASE is not part of that handoff: its token
+is held privately on the reservation, outside `turn.lease_tokens`, because `_drop_turn_slot` sweeps
+that map for older generations and `/stop` would hand the lease to a successor while the
+summarization — an executor thread no interrupt or cancellation stops — can still archive or rotate
+the transcript. One release site, after the worker has truly stopped (on cancellation the lease
+travels with the worker via its done callback); every registry call is identity-checked, so a
+successor's lease is never released or rebound by it. The lease acquisition awaits under contention,
+so the reservation's generation is re-checked the instant the lease is ours and BEFORE any history
+is read: a `/stop` in that window means give the lease back and defer (`reservation_invalidated`).
+It defers on a running turn, in-flight compression or a contended lease; it stamps its outcome in
+the routing entry's metadata for per-cycle idempotence; and it reports `applied` only on an explicit
+COMMIT (`_persist_manual_compression` returning True) plus before/after evidence — `compress_now`
+answering `compressed` covers a refused would-grow candidate and a rolled-back persistence failure,
+both of which must stay retryable. It binds scope through `_profile_scope_for_source` like every
+other standalone entry point (see § Profile scope).
 
 ## Background process notifications
 
