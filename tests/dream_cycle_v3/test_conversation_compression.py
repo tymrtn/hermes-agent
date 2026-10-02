@@ -255,3 +255,81 @@ def test_cycle_records_the_unreachable_gateway_rather_than_failing(env):
 def test_replay_may_not_drive_conversation_compression(env):
     with pytest.raises(DreamCycleError, match="historical_replay"):
         make_config(env, conversation_compression=True, historical_replay=True)
+
+
+def test_candidate_homes_resolve_from_the_configured_hermes_root(tmp_path, monkeypatch):
+    """`HERMES_HOME` elsewhere than `~/.hermes` is a real installation, not a reason to probe a path
+    no gateway listens on and then report `unavailable`."""
+    root = tmp_path / "opt" / "hermes"
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    assert control_home_candidates(PROFILE) == [root / "profiles" / PROFILE, root]
+
+    # Launched from the profile home itself: the ROOT is still where a multiplexer would listen.
+    monkeypatch.setenv("HERMES_HOME", str(root / "profiles" / PROFILE))
+    assert control_home_candidates(PROFILE) == [root / "profiles" / PROFILE, root]
+
+
+def test_retry_publishes_its_own_attempt_record_when_the_report_is_already_published(env,
+                                                                                    monkeypatch):
+    """The cycle report is publish-once, so a retry's outcome can never reach it. A retry that really
+    compressed must therefore publish its own trusted record, and advertise THAT — never let a
+    durable report saying `unavailable` stand as the receipt for an applied compression."""
+    import sqlite3
+
+    from dream_cycle_v3 import runtime as runtime_mod
+
+    answers = [
+        classify_conversation_compression(None, profile=PROFILE, cycle_id=DATE,
+                                          unavailable_reason="gateway was asleep"),
+        classify_conversation_compression(_answer(_applied_row()), profile=PROFILE, cycle_id=DATE),
+    ]
+    monkeypatch.setattr(runtime_mod, "request_conversation_compression",
+                        lambda **kwargs: answers.pop(0))
+
+    config = make_config(env, conversation_compression=True, gateway_home=str(env["home"]))
+    first = run_cycle(config)
+    second = run_cycle(make_config(env, conversation_compression=True,
+                                   gateway_home=str(env["home"])))
+
+    # Same run: the durable report is the FIRST attempt's, unchanged and still trusted.
+    assert second.report_path == first.report_path
+    published = json.loads(first.report_path.read_text(encoding="utf-8"))
+    assert published["conversation_compression"]["claim"] == CLAIM_UNAVAILABLE
+
+    # The retry's outcome has its own record, and that is what the run advertises.
+    assert second.conversation_attempt_path != first.conversation_attempt_path
+    retry_record = json.loads(second.conversation_attempt_path.read_text(encoding="utf-8"))
+    assert retry_record["claim"] == CLAIM_APPLIED
+    assert retry_record["tokens"]["before"] > retry_record["tokens"]["after"] > 0
+    assert f"conversation_report={second.conversation_attempt_path}" in second.status_line
+    assert "conversation=applied" in second.status_line
+
+    # Trusted, not a loose file: each attempt is attested by its own durable event.
+    with sqlite3.connect(env["v3_root"] / "continuity.db") as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("SELECT payload FROM events WHERE event_type = ?",
+                            (runtime_mod.CONVERSATION_EVENT_TYPE,)).fetchall()
+    claims = {json.loads(r["payload"])["claim"] for r in rows}
+    attested = {json.loads(r["payload"])["attempt_report"] for r in rows}
+    assert claims == {CLAIM_UNAVAILABLE, CLAIM_APPLIED}
+    assert attested == {first.conversation_attempt_path.name,
+                        second.conversation_attempt_path.name}
+
+
+def test_an_identical_rerun_reuses_its_attempt_record(env, monkeypatch):
+    """Content-addressed: the same outcome twice is one verified record, not a second file."""
+    from dream_cycle_v3 import runtime as runtime_mod
+
+    monkeypatch.setattr(
+        runtime_mod, "request_conversation_compression",
+        lambda **kwargs: classify_conversation_compression(
+            _answer(_applied_row()), profile=PROFILE, cycle_id=DATE))
+
+    first = run_cycle(make_config(env, conversation_compression=True,
+                                  gateway_home=str(env["home"])))
+    second = run_cycle(make_config(env, conversation_compression=True,
+                                   gateway_home=str(env["home"])))
+
+    assert second.conversation_attempt_path == first.conversation_attempt_path
+    assert len(list((env["v3_root"] / "reports").glob("*.conversation-*.json"))) == 1

@@ -68,8 +68,15 @@ than raising when no gateway answers, so callers fall back or report "not done" 
 `compress-session` (`gateway/scheduled_compression.py`) is the scheduled-compression entry point: a
 nightly job asks the OWNING process to run the existing manual-`/compress` path for one profile.
 Never reimplement it caller-side — an offline `state.db` rewrite desyncs the cached agent. It
-defers on a running turn or in-flight compression, stamps its outcome in the routing entry's
-metadata for per-cycle idempotence, and reports `applied` only with before/after evidence.
+**RESERVES** the conversation before reading its history — the pending-sentinel turn slot (the
+predicate `_is_session_running` the inbound admission gate reads) plus the per-session_id turn lease
+— so inbound queues behind it instead of running a turn against a transcript about to be rotated
+away; it defers on a running turn, in-flight compression or a contended lease; it stamps its outcome
+in the routing entry's metadata for per-cycle idempotence; and it reports `applied` only on an
+explicit COMMIT (`_persist_manual_compression` returning True) plus before/after evidence —
+`compress_now` answering `compressed` covers a refused would-grow candidate and a rolled-back
+persistence failure, both of which must stay retryable. It binds scope through
+`_profile_scope_for_source` like every other standalone entry point (see § Profile scope).
 
 ## Background process notifications
 

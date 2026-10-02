@@ -59,6 +59,7 @@ REPLAY_SUMMARY_KIND = "dream-cycle-v3-historical-replay-summary"
 CUTOVER_GATE_KIND = "dream-cycle-v3-cutover-gate"
 CYCLE_EVENT_TYPE = "runtime_cycle_completed"
 REPLAY_SUMMARY_EVENT_TYPE = "historical_replay_summary_completed"
+CONVERSATION_EVENT_TYPE = "runtime_conversation_compression"
 REPLAY_WINDOW_COUNT = 7
 # Same-day controlled cutover (authoritative product policy, 2026-07-17): a
 # single genuine, current-source, successful shadow run is sufficient
@@ -256,6 +257,10 @@ class CycleResult:
     report_path: Path
     status_line: str
     ok: bool
+    #: This attempt's own conversation-compression record. The cycle report is publish-once, so on a
+    #: retry `report_path` carries the FIRST attempt's section and only this file carries THIS
+    #: attempt's outcome. None when conversation compression was not requested.
+    conversation_attempt_path: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -470,7 +475,8 @@ def _hot_memory_task_leakage(store: ContinuityStore) -> dict[str, int]:
             "promoted_candidates": promoted}
 
 
-def _status_line(report: dict[str, Any], report_path: Path, ok: bool) -> str:
+def _status_line(report: dict[str, Any], report_path: Path, ok: bool, *,
+                 conversation_attempt_path: Path | None = None) -> str:
     if not ok:
         return (f"dream-cycle-v3 cycle FAIL reason=retrieval_smoke "
                 f"mode={report['mode']} profile={report['profile']} "
@@ -499,7 +505,9 @@ def _status_line(report: dict[str, Any], report_path: Path, ok: bool) -> str:
             f"receipts={report['invariants']['write_receipts']} "
             f"smoke={smoke_state} continuity={compression_state} "
             f"conversation={conversation_state} "
-            f"report={report_path}")
+            + (f"conversation_report={conversation_attempt_path} "
+               if conversation_attempt_path is not None else "")
+            + f"report={report_path}")
 
 
 def _trusted_report_hash(conn, *, run_id: str, profile: str, mode: str,
@@ -549,6 +557,58 @@ def _trusted_report_hash(conn, *, run_id: str, profile: str, mode: str,
             f"completion evidence for run {run_id!r} has conflicting report "
             "hashes; refusing reuse")
     return next(iter(trusted_hashes), None)
+
+
+def _publish_conversation_attempt(store: ContinuityStore, section: dict[str, Any],
+                                  reports_dir: Path, *, run_id: str, profile: str,
+                                  cycle_date: str) -> tuple[Path, str]:
+    """Publish THIS attempt's conversation-compression outcome as its own trusted artifact,
+    returning (path, sha256-hex digest of the exact bytes on disk).
+
+    The cycle report is publish-once — its bytes are the trust anchor for completion evidence — so a
+    retry for the same run id can never update it: the first attempt's section stands forever. A
+    retry that really compressed the conversation would otherwise be advertised by a durable report
+    still saying `unavailable`, which is the receipt lying about what happened.
+
+    So the attempt gets its own record. The name is content-addressed, so an identical rerun is a
+    verified no-op and differing bytes can never land on an existing name; a
+    `runtime_conversation_compression` event records the digest, making the file durable evidence
+    joined to this run rather than a loose dict on disk. The canonical report points at the first
+    attempt; the status line points at the current one.
+    """
+    body = (canonical_json(section) + "\n").encode("utf-8")
+    digest = hashlib.sha256(body).hexdigest()
+    path = reports_dir / f"{run_id}.conversation-{digest[:16]}.json"
+    if path.exists():
+        if path.is_symlink() or not path.is_file():
+            raise DreamCycleError(
+                f"conversation-compression attempt record is not a regular owned "
+                f"file: {path}")
+        try:
+            raw = path.read_bytes()
+        except OSError as exc:
+            raise DreamCycleError(
+                f"conversation-compression attempt record is unreadable; "
+                f"refusing reuse: {exc}") from None
+        if hashlib.sha256(raw).hexdigest() != digest:
+            raise DreamCycleError(
+                f"conversation-compression attempt record at {path} does not "
+                "match the digest in its own name; refusing reuse")
+    else:
+        reports_dir.mkdir(parents=True, exist_ok=True)
+        create_file_exclusive(path, body)
+    # The runtime's own wall clock, like every other completion event: an attempt is something that
+    # happened now, never something a pinned as_of may backdate.
+    executed_at = datetime.now(timezone.utc).isoformat()
+    with store.transaction() as conn:
+        store._emit_event(conn, entity_type="run", entity_id=run_id,
+                          event_type=CONVERSATION_EVENT_TYPE,
+                          payload={"cycle_date": cycle_date, "profile": profile,
+                                   "claim": section.get("claim"),
+                                   "attempt_sha256": digest,
+                                   "attempt_report": path.name},
+                          run_id=run_id, now=executed_at)
+    return path, digest
 
 
 def _publish_cycle_report_once(store: ContinuityStore, report: dict[str, Any],
@@ -740,12 +800,25 @@ def run_cycle(config: RuntimeConfig) -> CycleResult:
             # the existing manual-/compress path, and records only what that
             # answer proves. Never raises — an unreachable gateway is honest
             # evidence that nothing was applied, not a failed cycle.
+            conversation_attempt_path: Path | None = None
             if config.conversation_compression:
                 conversation_report = request_conversation_compression(
                     profile=config.profile,
                     cycle_id=config.disposition_date,
                     limit=config.conversation_compression_limit,
                     gateway_home=config.gateway_home)
+                # Published BEFORE the cycle report, and separately from it: the cycle report is
+                # publish-once, so on a retry this attempt's outcome can reach nothing else.
+                conversation_attempt_path, conversation_attempt_sha = (
+                    _publish_conversation_attempt(
+                        store, conversation_report, reports_dir, run_id=run_id,
+                        profile=config.profile,
+                        cycle_date=config.disposition_date))
+                conversation_report = {
+                    **conversation_report,
+                    "attempt_sha256": conversation_attempt_sha,
+                    "attempt_report": conversation_attempt_path.name,
+                }
             else:
                 conversation_report = {"enabled": False}
 
@@ -846,8 +919,11 @@ def run_cycle(config: RuntimeConfig) -> CycleResult:
                 })
 
     return CycleResult(report=report, report_path=report_path,
-                       status_line=_status_line(report, report_path, ok),
-                       ok=ok)
+                       status_line=_status_line(
+                           report, report_path, ok,
+                           conversation_attempt_path=conversation_attempt_path),
+                       ok=ok,
+                       conversation_attempt_path=conversation_attempt_path)
 
 
 # ---------------------------------------------------------------------------

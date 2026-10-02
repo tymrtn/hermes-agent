@@ -63,10 +63,19 @@ def control_home_candidates(profile: str, *, gateway_home: str | os.PathLike | N
     A profile is served either by its own single-profile gateway (socket under the profile home) or
     by a multiplexer running from the default home (one socket, `profile` selects the namespace).
     An explicit *gateway_home* short-circuits the guess.
+
+    The base is the CONFIGURED Hermes root (`get_default_hermes_root`), never a hardcoded
+    `~/.hermes`: an installation whose `HERMES_HOME` points elsewhere — including a Windows native
+    home, which is not under `~` at all — would otherwise be probed at a path no gateway listens on
+    and the cycle would report `unavailable` while its own gateway was answering.
     """
     if gateway_home:
         return [Path(gateway_home).expanduser()]
-    base = Path(home) if home is not None else Path.home() / ".hermes"
+    if home is not None:
+        base = Path(home)
+    else:
+        from hermes_constants import get_default_hermes_root  # noqa: PLC0415
+        base = get_default_hermes_root()
     candidates = [base / "profiles" / profile, base] if profile not in ("", "default") else [base]
     seen: list[Path] = []
     for candidate in candidates:

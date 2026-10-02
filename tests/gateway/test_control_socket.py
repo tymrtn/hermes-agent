@@ -455,3 +455,72 @@ def test_runtime_inventory_prefers_socket_supervisor(tmp_path: Path, monkeypatch
     # supervisor comes from the gateway's own declaration, not a PID scan
     assert gws[0].supervisor == "systemd"
     assert gws[0].code_sha == "SHA555"
+
+
+# ---------------------------------------------------------------------------
+# The pipe protocol answers off the loop it is driven on
+# ---------------------------------------------------------------------------
+
+class _RecordingTransport:
+    """Minimal ``asyncio.Transport`` stand-in: records what the protocol wrote and when it closed."""
+
+    def __init__(self) -> None:
+        self.written = bytearray()
+        self.closed = False
+
+    def write(self, data: bytes) -> None:
+        self.written.extend(data)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_pipe_protocol_does_not_run_a_handler_on_its_own_loop():
+    """``data_received`` is driven ON the gateway loop. A verb that marshals work back onto that
+    loop and awaits it (``compress-session``) therefore deadlocks if the handler runs inline — the
+    loop is blocked inside the handler, so the marshalled coroutine can never be scheduled.
+
+    This is the protocol class itself, on a real event loop; nothing about the host OS is faked.
+    """
+    import asyncio
+    import concurrent.futures
+    import json as _json
+
+    from gateway.control_socket import (CONTROL_PROTOCOL_VERSION, GatewayControlServer,
+                                        _PipeControlProtocol)
+
+    async def _exercise():
+        loop = asyncio.get_running_loop()
+
+        async def _on_the_loop():
+            return {"ran_on_loop": True}
+
+        def _verb(params):
+            # Exactly the shape of the real scheduled-compression handler: hop to the loop, wait.
+            future = asyncio.run_coroutine_threadsafe(_on_the_loop(), loop)
+            try:
+                return future.result(timeout=5.0)
+            except concurrent.futures.TimeoutError:
+                return {"pending": True}
+
+        server = GatewayControlServer(Path("/nonexistent"), verb_handlers={"marshalling": _verb})
+        protocol = _PipeControlProtocol(server)
+        transport = _RecordingTransport()
+        protocol.connection_made(transport)
+        protocol.data_received(_json.dumps(
+            {"verb": "marshalling", "id": 3,
+             "protocol": CONTROL_PROTOCOL_VERSION}).encode("utf-8") + b"\n")
+        # The protocol must have returned control to the loop with no answer written yet.
+        assert bytes(transport.written) == b""
+        for _ in range(200):
+            if transport.closed:
+                break
+            await asyncio.sleep(0.01)
+        return transport
+
+    transport = asyncio.run(_exercise())
+    assert transport.closed is True
+    response = json.loads(bytes(transport.written))
+    assert response["ok"] is True and response["id"] == 3
+    # Not "pending": the marshalled coroutine really ran, so the loop was never blocked.
+    assert response["result"] == {"ran_on_loop": True}

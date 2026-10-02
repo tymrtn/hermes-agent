@@ -24,8 +24,19 @@ exists, and reports only what the answer proves.
   summary the compressor already writes is what preserves constraints, corrections, key decisions,
   blockers and the live user ask; `## Active Task`/tail protection is what keeps the current request
   and prevents a closed thread from resurrecting.
-- A busy conversation **defers** (`turn_running`, `compression_in_flight`) and is never interrupted
-  or forced. A short conversation defers rather than spending a summarization.
+- A busy conversation **defers** (`turn_running`, `compression_in_flight`, `turn_lease_contended`)
+  and is never interrupted or forced. A short conversation defers rather than spending a
+  summarization.
+- The reverse direction is enforced too: the operation **reserves the conversation before it reads
+  the history** — the pending-sentinel turn slot (the predicate the inbound admission gate itself
+  reads) plus the per-`session_id` turn lease. A message arriving mid-compression therefore queues
+  for the next turn instead of running a turn against a parent session the rotation is about to
+  close. `/stop` remains the escape hatch.
+- `applied` requires an explicit **commit**: `_persist_manual_compression` now returns whether the
+  rewrite really landed (rotation persisted and repointed, or the in-place archive ran).
+  `compress_now` answering `compressed` is not proof — a refused would-grow candidate and a
+  rolled-back persistence failure both leave the transcript untouched under that status. Such an
+  attempt is reported `failed` / `rewrite_not_committed` and stays retryable in the same cycle.
 - Idempotent per cycle: the outcome is stamped on the routing entry's own metadata
   (`set_session_metadata`, which does not advance the activity clock), so a retry the same night
   reports `already_applied`. A deferral is not stamped as settled, so it stays retryable.
@@ -36,8 +47,28 @@ exists, and reports only what the answer proves.
   gateway reported as applied **and** that carry before/after token and message counts. An absent,
   pending, or evidence-free answer degrades to `unavailable`/`deferred`. A stored request is never an
   outcome.
-- The status line now reads `continuity=<outcome>/rev<N> conversation=<claim>[counts]`. The old
-  `compression=` token is gone: it was the misleading label.
+- The status line now reads `continuity=<outcome>/rev<N> conversation=<claim>[counts]
+  conversation_report=<path> report=<path>`. The old `compression=` token is gone: it was the
+  misleading label.
+- **Each attempt publishes its own trusted record.** The cycle report is publish-once (its bytes are
+  the trust anchor for completion evidence), so a retry's outcome can never reach it: a retry that
+  really compressed would otherwise be advertised by a durable report still saying `unavailable`.
+  The attempt is therefore written to `reports/<run_id>.conversation-<digest16>.json` —
+  content-addressed, so an identical rerun is a verified no-op and differing bytes can never land on
+  an existing name — and attested by its own `runtime_conversation_compression` event joined to the
+  run. `conversation_report=` in the status line always points at THIS attempt; the morning-receipt
+  job reads that file, never the cycle report's own section.
+- Control-socket homes resolve from the configured Hermes root (`get_default_hermes_root()`), not a
+  hardcoded `~/.hermes`, so a custom `HERMES_HOME` (or a Windows native home) is probed where its
+  gateway actually listens instead of being reported `unavailable`.
+- Scope is bound through the runner's `_profile_scope_for_source` (and so
+  `_standalone_launch_scope`), like every other standalone entry point: a standalone gateway with
+  `multiplex_profiles: false` whose hosted room has armed the process-wide secret guard still
+  resolves its launch profile's credentials instead of raising `UnscopedSecretError`.
+- The Windows named-pipe control transport now answers through the executor like the POSIX path.
+  `_PipeControlProtocol.data_received` runs ON the gateway loop, so calling a verb that marshals work
+  back onto that loop and waits would freeze the gateway for the verb's whole timeout and then answer
+  `pending`.
 - Report rows carry a `session_ref` digest, never the session key (it embeds chat and user ids).
   Highlight bullets pass through the dream-cycle sanitizers (secretguard + PII redaction + caps).
 
@@ -112,3 +143,17 @@ persisted continuation → the next turn's `load_transcript` of the live id. Onl
 `ContextCompressor._call_summary_llm` is a fixture, so this is a **simulated model boundary** — the
 plumbing is proven, summary *quality* is not and needs one real live run to judge. Nothing here has
 been run against the live Nagatha profile, gateway, or Telegram.
+
+Also proven there, against real imports: an inbound turn cannot be admitted while a compression is
+mid-flight (both in-place and rotating configurations), a second routing key on the same `session_id`
+is blocked by the held turn lease, a forced `archive_and_compact` failure reports `failed` /
+`rewrite_not_committed` and the SAME cycle then retries successfully, and a standalone gateway whose
+hosted room armed the secret guard compresses under its launch profile's credentials across
+A → B → A. `tests/gateway/test_control_socket.py` drives `_PipeControlProtocol` on a real event loop
+with a marshalling handler (no OS is faked) and `tests/dream_cycle_v3/test_conversation_compression.py`
+pins the attempt-record publication and the configured-root home resolution.
+
+Known limitations, unchanged by this repair: a user `/stop` arriving mid-compression clears the
+reservation (it is the documented escape hatch), and the published cycle report for a retried run id
+still carries the FIRST attempt's `conversation_compression` section — which is why the receipt must
+read `conversation_report=`.

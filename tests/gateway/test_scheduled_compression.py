@@ -16,7 +16,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
-from datetime import datetime
+import threading
+import time
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -130,13 +132,21 @@ def _seed(store: SessionStore, source: SessionSource, history: list[dict]):
 
 def _runner(config, store, *, running: dict | None = None):
     from gateway.run import GatewayRunner
+    from gateway.turn_lease import SessionTurnLeaseRegistry
 
     runner = object.__new__(GatewayRunner)
     runner.config = config
     runner.session_store = store
     runner._async_session_store = AsyncSessionStore(store)
     runner._session_db = _AsyncDbShim(store._db_for_session_id(""))
-    runner._snapshot_running_agents = lambda: dict(running or {})
+    # The real per-session turn-slot map and lease registry: the scheduled compression reserves the
+    # conversation through the same two mechanisms an inbound turn does, so stubbing them out would
+    # test nothing about the serialization.
+    runner._turn_leases = SessionTurnLeaseRegistry()
+    for session_key, agent in (running or {}).items():
+        state = runner._session_state(session_key)
+        state.turn.agent = agent
+        state.turn.started_ts = time.time()
     runner._session_has_compression_in_flight = _never_in_flight
     runner._evicted = []
     runner._evict_cached_agent = runner._evicted.append
@@ -457,3 +467,216 @@ def test_origin_that_no_longer_reproduces_the_key_fails_closed(live):
     assert result["sessions"][0]["reason"] == "origin_key_mismatch"
     llm.assert_not_called()
     assert len(store.load_transcript(entry.session_id)) == len(history)
+
+
+# ---------------------------------------------------------------------------
+# Reservation: a message arriving mid-compression must not start a turn
+# ---------------------------------------------------------------------------
+
+def _barrier_summary(started: threading.Event, release: threading.Event):
+    """Summarizer fixture that parks mid-compression so the test can inspect the live gateway."""
+    def _call(*_args, **_kwargs):
+        started.set()
+        assert release.wait(20), "test never released the parked compression"
+        return FIXTURE_SUMMARY
+    return _call
+
+
+async def _observe_midflight(runner, session_key: str, session_id: str,
+                             started: threading.Event, release: threading.Event):
+    """Run one cycle and, while the compressor is parked, probe what an inbound turn would see."""
+    from gateway.run import _AGENT_PENDING_SENTINEL
+    from gateway.scheduled_compression import _claim_turn_slot
+    from gateway.turn_lease import TurnLeaseTimeoutError
+
+    task = asyncio.create_task(run_scheduled_compression(runner, profile=PROFILE, cycle_id=CYCLE))
+    assert await asyncio.to_thread(started.wait, 20), "compression never reached the summarizer"
+    state = runner._peek_session_state(session_key)
+    observed = {
+        # The predicate the inbound admission gate itself uses (run_inbound: _is_session_running ->
+        # _hm_handle_running_session_message), so a True here IS "the next message queues".
+        "running": runner._is_session_running(session_key),
+        # A pending sentinel (not a live agent) is what makes the busy path skip interrupt/steer and
+        # merge the message for the next turn instead.
+        "sentinel": (state.turn.agent if state else None) is _AGENT_PENDING_SENTINEL,
+        "second_claim_refused": not _claim_turn_slot(runner, session_key),
+    }
+    try:
+        await runner._turn_leases.acquire(session_id, owner_key="agent:main:alias",
+                                         generation=99, timeout=0.05)
+        observed["lease_blocked"] = False
+    except TurnLeaseTimeoutError:
+        observed["lease_blocked"] = True
+    release.set()
+    return observed, await task
+
+
+def _assert_serialized(runner, session_key, observed, result):
+    assert observed["running"] is True, "inbound admission would have started a turn mid-compression"
+    assert observed["sentinel"] is True
+    assert observed["second_claim_refused"] is True
+    assert observed["lease_blocked"] is True, \
+        "a second routing key on this session_id could have entered the turn region"
+    assert result["counts"] == {"applied": 1}, result
+    # The reservation is given back, so the next real message runs normally.
+    assert runner._is_session_running(session_key) is False
+
+
+def test_inbound_cannot_start_a_turn_while_in_place_compression_runs(live):
+    config, store, _home = live
+    entry = _seed(store, _source(), _history())
+    runner = _runner(config, store)
+    started, release = threading.Event(), threading.Event()
+
+    with _real_compression(runner) as llm:
+        llm.side_effect = _barrier_summary(started, release)
+        observed, result = asyncio.run(_observe_midflight(
+            runner, entry.session_key, entry.session_id, started, release))
+
+    _assert_serialized(runner, entry.session_key, observed, result)
+
+
+def test_inbound_cannot_start_a_turn_while_rotating_compression_runs(tmp_path, monkeypatch):
+    """``compression.in_place: false`` CLOSES the parent session, so an unserialized concurrent turn
+    flushing against it is the ``CompressionSessionClosedError`` the review reproduced."""
+    home = tmp_path / ".hermes" / "profiles" / PROFILE
+    home.mkdir(parents=True)
+    (home / "config.yaml").write_text(_TEST_CONFIG + "  in_place: false\n")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    config = GatewayConfig(platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")})
+    store = SessionStore(sessions_dir=home / "sessions", config=config)
+    entry = _seed(store, _source(), _history())
+    runner = _runner(config, store)
+    started, release = threading.Event(), threading.Event()
+
+    with _real_compression(runner) as llm:
+        llm.side_effect = _barrier_summary(started, release)
+        observed, result = asyncio.run(_observe_midflight(
+            runner, entry.session_key, entry.session_id, started, release))
+
+    _assert_serialized(runner, entry.session_key, observed, result)
+    assert result["sessions"][0]["rotated"] is True
+
+
+# ---------------------------------------------------------------------------
+# `applied` requires a committed rewrite, not a status word
+# ---------------------------------------------------------------------------
+
+def test_failed_persistence_is_not_applied_and_stays_retryable(live):
+    """``compress_now`` answers ``compressed`` even when the compressor caught the persistence
+    failure and restored the original transcript. That is not an applied compression."""
+    config, store, _home = live
+    history = _history()
+    entry = _seed(store, _source(), history)
+    runner = _runner(config, store)
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("archive_and_compact failed")
+
+    with _real_compression(runner) as llm:
+        with patch("hermes_state_messages.SessionMessagesMixin.archive_and_compact", _boom):
+            result = _run_cycle(runner)
+        row = result["sessions"][0]
+        assert row["status"] == "failed", row
+        assert row["reason"] == "rewrite_not_committed"
+        # Nothing was rewritten: the whole transcript is still there under the same id.
+        assert store.lookup_by_session_key(entry.session_key).session_id == entry.session_id
+        assert len(store.load_transcript(entry.session_id)) == len(history)
+        # The cycle is NOT stamped applied, so the same cycle may try again — and succeed.
+        assert store.get_session_metadata(
+            entry.session_key, CYCLE_METADATA_KEY)["status"] == "failed"
+        retry = _run_cycle(runner)
+
+    assert retry["counts"] == {"applied": 1}, retry
+    assert llm.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# Standalone gateway + a hosted room that armed the process-wide secret guard
+# ---------------------------------------------------------------------------
+
+@contextlib.contextmanager
+def _real_compression_with_scoped_credentials(runner, recorder: list):
+    """Like ``_real_compression``, but the provider credential is read through the REAL
+    ``get_secret`` at the moment the compression resolves its runtime kwargs.
+
+    So the api_key that reaches the throwaway agent is whatever the bound profile scope resolves —
+    and with no scope bound while the guard is armed, this read raises ``UnscopedSecretError``
+    exactly as production would.
+    """
+    from agent.secret_scope import get_secret
+
+    def _kwargs(*_args, **_kwargs):
+        key = get_secret("OPENROUTER_API_KEY")
+        recorder.append(key)
+        return {"api_key": key, "base_url": "https://openrouter.ai/api/v1",
+                "skip_context_files": True}
+
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(patch("gateway.run._resolve_runtime_agent_kwargs", _kwargs))
+        stack.enter_context(patch("gateway.run._resolve_gateway_model", return_value="test/model"))
+        stack.enter_context(patch.object(type(runner), "_sync_telegram_topic_binding",
+                                        lambda *a, **k: None))
+        yield stack.enter_context(patch(
+            "agent.context_compressor.ContextCompressor._call_summary_llm",
+            return_value=FIXTURE_SUMMARY))
+
+
+def _standalone_home(tmp_path, profile: str, *, api_key: str, extra_config: str = "") -> Path:
+    home = tmp_path / ".hermes" / "profiles" / profile
+    home.mkdir(parents=True)
+    (home / "config.yaml").write_text(_TEST_CONFIG + extra_config)
+    (home / ".env").write_text(f"OPENROUTER_API_KEY={api_key}\n", encoding="utf-8")
+    return home
+
+
+def test_standalone_gateway_compresses_after_a_hosted_room_armed_the_secret_guard(
+        tmp_path, monkeypatch):
+    """``multiplex_profiles`` is OFF, yet a native hosted room has flipped the process-wide guard, so
+    every unscoped credential read fails closed. Scheduled compression must bind the launch
+    profile's OWN scope (``run_turn.py::_standalone_launch_scope``) like every other standalone
+    entry point — not skip binding because the config flag is off.
+
+    Proven A → B → A across two launch homes: each cycle's credential must come from the home that
+    launched it, so a frozen module-level or first-caller-wins value cannot pass.
+    """
+    from agent import secret_scope
+    from agent.secret_scope import UnscopedSecretError, get_secret
+    from tui_gateway import launch_profile_policy
+
+    monkeypatch.setattr(secret_scope, "_MULTIPLEX_ACTIVE", False)
+    monkeypatch.setattr(launch_profile_policy, "_snapshot", None)
+    homes = {PROFILE: _standalone_home(tmp_path, PROFILE, api_key="key-for-nagatha"),
+             "other": _standalone_home(tmp_path, "other", api_key="key-for-other")}
+
+    def _cycle(profile: str, cycle_id: str = CYCLE) -> tuple[dict, list]:
+        monkeypatch.setenv("HERMES_HOME", str(homes[profile]))
+        config = GatewayConfig(multiplex_profiles=False, platforms={
+            Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")})
+        store = SessionStore(sessions_dir=homes[profile] / "sessions", config=config)
+        _seed(store, _source(chat_id=f"c-{profile}"), _history())
+        runner = _runner(config, store)
+        used: list[str] = []
+        with _real_compression_with_scoped_credentials(runner, used):
+            return _run_cycle(runner, profile=profile, cycle_id=cycle_id), used
+
+    # The hosted room's real activation: unscoped reads fail closed from here on.
+    monkeypatch.setenv("HERMES_HOME", str(homes[PROFILE]))
+    launch_profile_policy.activate_multi_profile_hosting()
+    assert secret_scope.is_multiplex_active()
+    with pytest.raises(UnscopedSecretError):
+        get_secret("OPENROUTER_API_KEY")
+
+    first, first_keys = _cycle(PROFILE)
+    second, second_keys = _cycle("other")
+    # A fresh cycle id: the return to home A must really compress again, not read back the first
+    # pass's idempotence marker.
+    third, third_keys = _cycle(PROFILE, cycle_id="2026-10-02")
+
+    for result in (first, second, third):
+        assert result["counts"] == {"applied": 1}, result
+    assert first_keys == third_keys == ["key-for-nagatha"]
+    assert second_keys == ["key-for-other"]
+    # The guard itself is never weakened by the operation.
+    with pytest.raises(UnscopedSecretError):
+        get_secret("OPENROUTER_API_KEY")

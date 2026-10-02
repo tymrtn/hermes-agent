@@ -13,13 +13,19 @@ over the gateway's own control socket. Consequences that are the whole point:
 - No offline ``state.db`` rewrite of a live session: the owning process does the rotation and
   evicts its cached agent, so the in-memory copy can never diverge from the persisted transcript.
 - A busy conversation DEFERS. A running turn or an in-flight compression is never interrupted and
-  never forced; the caller is told it deferred and why.
+  never forced; the caller is told it deferred and why. The reverse direction is just as important:
+  the operation RESERVES the conversation (pending-sentinel slot + per-session_id turn lease) before
+  it reads the history, so a message arriving mid-compression queues behind it instead of running a
+  turn against a transcript about to be rotated away.
 - Idempotent per cycle. The outcome is stamped into the routing entry's own metadata
   (``set_session_metadata``, which deliberately does not advance the activity clock), so a retry
   in the same cycle reports ``already_applied`` instead of compressing twice.
-- Honest evidence. ``applied`` exists only where ``compress_now`` returned ``compressed`` AND the
-  rewrite persisted; the before/after token and message counts come from that result. A request
-  that was merely sent reports ``requested``/``deferred``, never ``applied``.
+- Honest evidence. ``applied`` exists only where the rewrite COMMITTED — the rotation persisted and
+  the routing entry was repointed, or the in-place archive ran. ``compress_now`` answering
+  ``compressed`` is not enough: a refused (would-grow) candidate and a caught persistence failure
+  both leave the transcript untouched under that status, and such an attempt must stay retryable.
+  The before/after token and message counts come from that result. A request that was merely sent
+  reports ``requested``/``deferred``, never ``applied``.
 """
 
 from __future__ import annotations
@@ -82,6 +88,10 @@ class ManualCompressionOutcome:
     session_id: str = ""
     new_session_id: str = ""
     highlights: Dict[str, List[str]] = field(default_factory=dict)
+    #: The rewrite really COMMITTED (rotation persisted + repointed, or in-place archive). False
+    #: whenever ``status`` is ``compressed`` but the commit was a no-op — a refused would-grow
+    #: candidate, or a persistence failure the compressor caught and rolled back (#44794).
+    committed: bool = False
 
     @property
     def rotated(self) -> bool:
@@ -216,13 +226,60 @@ def _already_done(marker: Any, cycle_id: str) -> bool:
             and marker.get("status") == _STATUS_APPLIED)
 
 
-def _profile_scope(runner: Any, source: Any):
-    """Same scoping contract as ``/compress``: multiplexed gateways resolve credentials through the
-    fail-closed per-profile secret scope, which no control-socket caller installs."""
-    if not getattr(getattr(runner, "config", None), "multiplex_profiles", False):
-        return contextlib.nullcontext()
-    from gateway.run import _profile_runtime_scope
-    return _profile_runtime_scope(runner._resolve_profile_home_for_source(source))
+# ---------------------------------------------------------------------------
+# Reservation: this operation is a turn as far as the rest of the gateway is concerned
+# ---------------------------------------------------------------------------
+
+#: ``_acquire_session_lease`` sentinel: the lease is held by a turn we must not race.
+_LEASE_CONTENDED = object()
+
+
+def _claim_turn_slot(runner: Any, session_key: str) -> bool:
+    """Reserve this conversation's running-turn slot, or False when a turn already holds it.
+
+    The check and the claim must sit in ONE synchronous block: between them is exactly the window
+    the review reproduced — an inbound message passing the admission guard and starting a turn while
+    this operation reads the history it is about to rotate away. The claim is the same pending
+    sentinel the boot auto-resume path installs (``run_startup.py::
+    _schedule_resume_pending_sessions``), read by the same admission guard
+    (``run_inbound.py::_hm_handle_running_session_message`` via ``_is_session_running``), so inbound
+    QUEUES behind the compression instead of interrupting it: an interrupt is skipped for a
+    sentinel-held slot, and ``/stop`` stays the escape hatch.
+    """
+    from gateway.run import _AGENT_PENDING_SENTINEL
+
+    if runner._is_session_running(session_key):
+        return False
+    state = runner._session_state(session_key)
+    state.turn.agent = _AGENT_PENDING_SENTINEL
+    state.turn.started_ts = time.time()
+    runner._persist_active_agents()
+    return True
+
+
+async def _acquire_session_lease(runner: Any, session_key: str, session_id: str):
+    """Hold the per-session_id turn lease for the [read history → compress → commit] region.
+
+    The slot claim above is keyed by ROUTING KEY; the transcript is owned by SESSION_ID, and
+    ``switch_session`` makes that mapping many-to-one, so a second key resolving this same id would
+    still start a turn. This is the lease every real turn takes for the same region
+    (``run_turn.py::_hmwa_acquire_turn_lease``). Returns the token, None when unavailable, or
+    ``_LEASE_CONTENDED`` when a turn holds it — fail closed, defer, retry next cycle.
+    """
+    from gateway.turn_lease import DEFAULT_LEASE_WAIT, TurnLeaseTimeoutError
+
+    registry = getattr(runner, "_turn_leases", None)
+    if registry is None or not session_id:
+        return None
+    from gateway.run import _float_env
+    state = runner._peek_session_state(session_key)
+    generation = int(getattr(getattr(state, "persistent", None), "run_generation", 0) or 0)
+    try:
+        return await registry.acquire(
+            session_id, owner_key=session_key, generation=generation,
+            timeout=_float_env("HERMES_TURN_LEASE_TIMEOUT", DEFAULT_LEASE_WAIT))
+    except TurnLeaseTimeoutError:
+        return _LEASE_CONTENDED
 
 
 # ---------------------------------------------------------------------------
@@ -230,9 +287,11 @@ def _profile_scope(runner: Any, source: Any):
 # ---------------------------------------------------------------------------
 
 async def _deferral_reason(runner: Any, session_key: str) -> Optional[str]:
-    """Why this conversation must be left alone right now, or None."""
-    if session_key in (runner._snapshot_running_agents() or {}):
-        return "turn_running"
+    """Why this conversation must be left alone right now, or None.
+
+    The running-turn case is answered by ``_claim_turn_slot`` (atomically, as part of claiming);
+    this covers the compression lock, which may be held from outside this process.
+    """
     check = getattr(runner, "_session_has_compression_in_flight", None)
     if callable(check) and await check(session_key):
         return "compression_in_flight"
@@ -241,9 +300,6 @@ async def _deferral_reason(runner: Any, session_key: str) -> Optional[str]:
 
 async def _compress_one_entry(runner: Any, entry: Any, *, cycle_id: str, dry_run: bool,
                               include_highlights: bool) -> Dict[str, Any]:
-    from agent.conversation_compression_manual import MIN_MESSAGES, parse_compress_args
-    from gateway.session_transcript import TranscriptReadError
-
     session_key = entry.session_key
     store = runner.async_session_store
     row: Dict[str, Any] = {
@@ -268,10 +324,38 @@ async def _compress_one_entry(runner: Any, entry: Any, *, cycle_id: str, dry_run
     if derived != session_key:
         return {**row, "status": "failed", "reason": "origin_key_mismatch"}
 
-    deferred = await _deferral_reason(runner, session_key)
-    if deferred:
-        return {**row, "status": "deferred", "reason": deferred}
+    # Reserve the conversation BEFORE reading its history: everything from here to the commit must
+    # be serialized against inbound turns, or an arriving message runs a turn whose parent session
+    # this compression is about to close (rotation) or rewrite (in place).
+    if not _claim_turn_slot(runner, session_key):
+        return {**row, "status": "deferred", "reason": "turn_running"}
+    try:
+        deferred = await _deferral_reason(runner, session_key)
+        if deferred:
+            return {**row, "status": "deferred", "reason": deferred}
+        lease = await _acquire_session_lease(runner, session_key, entry.session_id)
+        if lease is _LEASE_CONTENDED:
+            return {**row, "status": "deferred", "reason": "turn_lease_contended"}
+        try:
+            return await _compress_reserved_entry(
+                runner, entry, row, cycle_id=cycle_id, dry_run=dry_run,
+                include_highlights=include_highlights, lease=lease)
+        finally:
+            if lease is not None:
+                runner._turn_leases.release(lease)
+    finally:
+        runner._release_running_agent_state(session_key)
 
+
+async def _compress_reserved_entry(runner: Any, entry: Any, row: Dict[str, Any], *, cycle_id: str,
+                                   dry_run: bool, include_highlights: bool, lease: Any
+                                   ) -> Dict[str, Any]:
+    """Read, compress and commit one RESERVED conversation (slot + turn lease already held)."""
+    from agent.conversation_compression_manual import MIN_MESSAGES, parse_compress_args
+    from gateway.session_transcript import TranscriptReadError
+
+    session_key = entry.session_key
+    store = runner.async_session_store
     try:
         history = await store.load_transcript(entry.session_id)
     except TranscriptReadError as exc:
@@ -282,11 +366,20 @@ async def _compress_one_entry(runner: Any, entry: Any, *, cycle_id: str, dry_run
     if dry_run:
         return {**row, "status": "eligible", "before_messages": len(history)}
 
-    with _profile_scope(runner, entry.origin):
+    with runner._profile_scope_for_source(entry.origin):
         outcome = await runner._run_manual_compression(
             entry.origin, entry, history, parse_compress_args(""))
-    status = _STATUS_APPLIED if outcome.compressed else (
-        "deferred" if outcome.status in {"lock_skipped", "nothing_to_do"} else "failed")
+    # ``compress_now`` answering ``compressed`` is NOT proof of a rewrite: the compressor refuses a
+    # candidate that would GROW the transcript, and a caught persistence failure restores the
+    # original — both leave the id unrotated with nothing committed (#44794). Only an explicit
+    # commit (rotation persisted and repointed, or an in-place archive) may be reported as applied,
+    # so a no-op stays retryable instead of stamping the cycle done.
+    if outcome.committed:
+        status = _STATUS_APPLIED
+    elif outcome.status in {"lock_skipped", "nothing_to_do"}:
+        status = "deferred"
+    else:
+        status = "failed"
     result = {
         **row, "status": status,
         "before_tokens": outcome.before_tokens, "after_tokens": outcome.after_tokens,
@@ -294,9 +387,13 @@ async def _compress_one_entry(runner: Any, entry: Any, *, cycle_id: str, dry_run
         "new_session_id": outcome.new_session_id, "rotated": outcome.rotated,
     }
     if status != _STATUS_APPLIED:
-        result["reason"] = outcome.status
+        result["reason"] = ("rewrite_not_committed" if outcome.compressed else outcome.status)
     if include_highlights and outcome.highlights:
         result["highlights"] = outcome.highlights
+    # The rotated id is the new serialization target for whatever runs next; follow it with the held
+    # lease before the caller releases, exactly as a real turn does (``_rebind_turn_lease``).
+    if lease is not None and outcome.rotated:
+        runner._turn_leases.rebind(lease, outcome.new_session_id)
     # Stamp AFTER the rewrite persisted, so a crash mid-compression leaves the cycle retryable.
     await store.set_session_metadata(session_key, CYCLE_METADATA_KEY, {
         "cycle_id": cycle_id, "status": status, "detail": outcome.status, "at": int(time.time()),

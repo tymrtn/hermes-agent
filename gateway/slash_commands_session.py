@@ -579,8 +579,9 @@ class GatewaySessionCommandsMixin:
                     reply=reply, status=result.status, before_tokens=result.before_tokens,
                     after_tokens=result.after_tokens, before_messages=len(result.before_messages),
                     after_messages=len(result.after_messages), session_id=original_session_id)
-            await self._persist_manual_compression(tmp_agent, session_entry, source, result.after_messages)
-            finalize_context_engine_compression_notification(tmp_agent, committed=True)
+            committed = await self._persist_manual_compression(
+                tmp_agent, session_entry, source, result.after_messages)
+            finalize_context_engine_compression_notification(tmp_agent, committed=committed)
             compressor = tmp_agent.context_compressor
             summary = result.summary
         finally:
@@ -593,7 +594,7 @@ class GatewaySessionCommandsMixin:
             status=result.status, before_tokens=result.before_tokens, after_tokens=result.after_tokens,
             before_messages=len(result.before_messages), after_messages=len(result.after_messages),
             session_id=original_session_id, new_session_id=session_entry.session_id,
-            highlights=handoff_highlights(result.after_messages))
+            committed=committed, highlights=handoff_highlights(result.after_messages))
 
     async def _build_manual_compression_agent(self, session_id: str, model, runtime_kwargs: dict):
         """Build the throwaway AIAgent that performs a manual /compress rewrite of *session_id*."""
@@ -633,13 +634,19 @@ class GatewaySessionCommandsMixin:
         tmp_agent._end_session_on_close = False
         return tmp_agent
 
-    async def _persist_manual_compression(self, tmp_agent, session_entry, source, compressed) -> None:
+    async def _persist_manual_compression(self, tmp_agent, session_entry, source, compressed) -> bool:
         """Commit a manual /compress result to the session store.  Rotation (new continuation id)
         writes the compressed messages into the NEW session so the original stays searchable;
         persist BEFORE repointing so a failed write is fatal and old history stays reachable.
         In-place compaction already archived + inserted rows, and a rewrite would DELETE the
-        archive; an unchanged id without in-place means rotation FAILED."""
+        archive; an unchanged id without in-place means rotation FAILED.
+
+        Returns whether a rewrite really COMMITTED. False is the #44794 no-op — the compressor
+        refused a would-grow candidate, or rolled a persistence failure back — so a caller that
+        records outcomes (scheduled compression) reports a retryable failure instead of claiming a
+        compression that did not happen."""
         new_session_id = tmp_agent.session_id
+        committed = bool(getattr(tmp_agent, "_last_compaction_in_place", False))
         if new_session_id != session_entry.session_id:
             if not await self.async_session_store.rewrite_transcript(new_session_id, compressed):
                 raise RuntimeError(
@@ -648,11 +655,13 @@ class GatewaySessionCommandsMixin:
             await self.async_session_store._save()
             await asyncio.to_thread(self._sync_telegram_topic_binding, source, session_entry,
                                     reason="compress-command")
-        elif not getattr(tmp_agent, "_last_compaction_in_place", False):
+            committed = True
+        elif not committed:
             logger.warning(
                 "Manual /compress: session rotation did not occur (session_id unchanged) and in-place "
                 "mode is off — preserving original transcript instead of overwriting it (#44794).")
         await self.async_session_store.update_session(session_entry.session_key, last_prompt_tokens=0)
+        return committed
 
     # ------------------------------------------------------------------------ /topic
 

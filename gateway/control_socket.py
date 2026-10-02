@@ -250,7 +250,10 @@ class GatewayControlServer:
 
 
 class _PipeControlProtocol(asyncio.Protocol):
-    """One-shot request/response protocol for the Windows named pipe."""
+    """One-shot request/response protocol for the Windows named pipe.
+
+    The request is answered asynchronously (executor hop, then write + close) so this protocol — which
+    is driven ON the gateway loop — never runs a verb handler inline. See :meth:`data_received`."""
     def __init__(self, server: GatewayControlServer) -> None:
         self._server = server
         self._transport: Any = None
@@ -259,14 +262,26 @@ class _PipeControlProtocol(asyncio.Protocol):
     def connection_made(self, transport) -> None:  # pragma: no cover - windows
         self._transport = transport
 
-    def data_received(self, data: bytes) -> None:  # pragma: no cover - windows
+    def data_received(self, data: bytes) -> None:
         self._buffer.extend(data)
         if len(self._buffer) > _MAX_REQUEST_BYTES:
             self._transport.close()
         elif b"\n" in self._buffer:
-            try:
-                self._transport.write(self._server.handle_request_line(bytes(self._buffer).partition(b"\n")[0]))
-            finally:
+            # Same executor hop as the POSIX path, and for a stronger reason than disk reads:
+            # ``data_received`` runs ON the gateway loop, and a handler may marshal work back onto
+            # that loop and wait for it (``compress-session``). Calling the handler inline deadlocks
+            # the whole gateway until the verb's own timeout expires and then answers ``pending``.
+            asyncio.ensure_future(self._respond(bytes(self._buffer).partition(b"\n")[0]))
+
+    async def _respond(self, line: bytes) -> None:
+        try:
+            response = await asyncio.get_running_loop().run_in_executor(
+                None, self._server.handle_request_line, line)
+            self._transport.write(response)
+        except Exception:
+            logger.debug("Control pipe request handler error", exc_info=True)
+        finally:
+            with contextlib.suppress(Exception):
                 self._transport.close()
 
 
