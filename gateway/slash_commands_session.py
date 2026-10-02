@@ -521,16 +521,24 @@ class GatewaySessionCommandsMixin:
         if request.preview:
             return _compress_preview_reply(history, request.partial, request.keep_last, request.focus_topic, _agg_note)
         try:
-            return await self._run_manual_compression(source, session_entry, history, request)
+            outcome = await self._run_manual_compression(source, session_entry, history, request)
+            return outcome.reply
         except Exception as e:
             logger.warning("Manual compress failed: %s", e)
             return t("gateway.compress.failed", error=e)
 
-    async def _run_manual_compression(self, source, session_entry, history: list, request) -> str:
-        """Build a temporary agent, run the shared compress core, persist, and describe the outcome."""
+    async def _run_manual_compression(self, source, session_entry, history: list, request
+                                      ) -> "ManualCompressionOutcome":
+        """Build a temporary agent, run the shared compress core, persist, and describe the outcome.
+
+        Returns the structured outcome (``.reply`` is the surface text ``/compress`` prints); the
+        scheduled-compression control verb reads the same before/after evidence off it rather than
+        re-deriving token counts or parsing the reply.
+        """
         from agent.conversation_compression import finalize_context_engine_compression_notification
         from agent.conversation_compression_manual import compress_now, render_compress_result
         from gateway.run import _platform_config_key
+        from gateway.scheduled_compression import ManualCompressionOutcome, handoff_highlights
 
         session_key = self._session_key_for_source(source)
         # Platform + stable gateway session key bind this agent (for external context engines) to
@@ -540,9 +548,13 @@ class GatewaySessionCommandsMixin:
         if str(runtime_kwargs.get("api_mode") or "").lower() == "codex_app_server":
             # Context lives in the server-side thread of the LIVE cached agent; a temporary agent
             # has none (and finally-eviction would destroy the real context).
-            return await self._compress_codex_app_server_session(session_key, session_entry.session_id)
+            return ManualCompressionOutcome(
+                reply=await self._compress_codex_app_server_session(session_key, session_entry.session_id),
+                status="codex_app_server", session_id=session_entry.session_id)
         if not runtime_kwargs.get("api_key"):
-            return t("gateway.compress.no_provider")
+            return ManualCompressionOutcome(reply=t("gateway.compress.no_provider"),
+                                            status="no_provider",
+                                            session_id=session_entry.session_id)
         # FULL transcript (tool results included), like auto-compress: user/assistant-only starves
         # tool-result pruning and can trip the protect-first/last early-return.
         msgs = [m for m in history if m.get("role") in {"user", "assistant", "tool"}]
@@ -552,6 +564,7 @@ class GatewaySessionCommandsMixin:
             runtime_kwargs["platform"] = platform_key
         runtime_kwargs["gateway_session_key"] = session_key
 
+        original_session_id = session_entry.session_id
         tmp_agent = await self._build_manual_compression_agent(session_entry.session_id, model, runtime_kwargs)
         try:
             # Not a bare run_in_executor: the profile secret scope is a contextvar the default
@@ -559,10 +572,13 @@ class GatewaySessionCommandsMixin:
             result = await self._run_in_executor_with_context(
                 lambda: compress_now(tmp_agent, msgs, request, system_message="", skip_without_window=True,
                                      task_id=session_entry.session_id or "default"))
-            if result.status == "nothing_to_do":
-                return t("gateway.compress.nothing_to_do")
             if result.status != "compressed":
-                return "\n".join(render_compress_result(result))
+                reply = (t("gateway.compress.nothing_to_do") if result.status == "nothing_to_do"
+                         else "\n".join(render_compress_result(result)))
+                return ManualCompressionOutcome(
+                    reply=reply, status=result.status, before_tokens=result.before_tokens,
+                    after_tokens=result.after_tokens, before_messages=len(result.before_messages),
+                    after_messages=len(result.after_messages), session_id=original_session_id)
             await self._persist_manual_compression(tmp_agent, session_entry, source, result.after_messages)
             finalize_context_engine_compression_notification(tmp_agent, committed=True)
             compressor = tmp_agent.context_compressor
@@ -572,7 +588,12 @@ class GatewaySessionCommandsMixin:
             self._evict_cached_agent(session_key)  # next turn rebuilds the prompt from current files
             # Off-loop + bounded: teardown can block on subprocess/network/SQLite.
             await self._cleanup_agent_resources_off_loop(tmp_agent, context="manual compression")
-        return "\n".join(_manual_compression_reply_lines(summary, compressor, request.focus_topic))
+        return ManualCompressionOutcome(
+            reply="\n".join(_manual_compression_reply_lines(summary, compressor, request.focus_topic)),
+            status=result.status, before_tokens=result.before_tokens, after_tokens=result.after_tokens,
+            before_messages=len(result.before_messages), after_messages=len(result.after_messages),
+            session_id=original_session_id, new_session_id=session_entry.session_id,
+            highlights=handoff_highlights(result.after_messages))
 
     async def _build_manual_compression_agent(self, session_id: str, model, runtime_kwargs: dict):
         """Build the throwaway AIAgent that performs a manual /compress rewrite of *session_id*."""

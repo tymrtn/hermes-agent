@@ -3,7 +3,11 @@
 #
 # Builds an explicit `python -m dream_cycle_v3 run` invocation from
 # environment variables — no ambient discovery, no LLM calls, no
-# credentials, no gateway restart. On success it prints the runtime's one
+# credentials, no gateway restart. With DC3_CONVERSATION_COMPRESSION=1 it
+# additionally asks the already-running gateway to compress the conversation
+# through its own /compress path; the aux-model call happens there, under that
+# gateway's credentials, and a gateway that does not answer is reported as
+# "not applied" rather than worked around. On success it prints the runtime's one
 # exact status line; any failure exits nonzero with a concise safe message
 # on stderr.
 #
@@ -17,6 +21,9 @@
 #   DC3_KANBAN_ROOT DC3_PROJECTS_HOME DC3_MIGRATE_V2_ROOTS (space-separated
 #   root keys) DC3_STALE_AFTER_DAYS DC3_SMOKE_MESSAGE
 #   DC3_SMOKE_EXPECT_PROJECT DC3_SMOKE_REQUIRE_THREAD=1 PYTHON
+#   DC3_CONVERSATION_COMPRESSION=1 (ask the live gateway to run one REAL
+#   conversation compression over its own control socket; still no LLM call
+#   from THIS process) DC3_CONVERSATION_COMPRESSION_LIMIT DC3_GATEWAY_HOME
 # Extra CLI arguments pass through verbatim: dream_cycle_v3_run.sh [ARGS...]
 set -euo pipefail
 
@@ -76,6 +83,8 @@ add_opt DC3_PROJECTS_HOME --projects-home
 add_opt DC3_STALE_AFTER_DAYS --stale-after-days
 add_opt DC3_SMOKE_MESSAGE --smoke-message
 add_opt DC3_SMOKE_EXPECT_PROJECT --smoke-expect-project
+add_opt DC3_CONVERSATION_COMPRESSION_LIMIT --conversation-compression-limit
+add_opt DC3_GATEWAY_HOME --gateway-home
 
 if [ -n "${DC3_MIGRATE_V2_ROOTS:-}" ]; then
   for key in $DC3_MIGRATE_V2_ROOTS; do
@@ -87,6 +96,9 @@ if [ "${DC3_GITHUB_AVAILABLE:-0}" = "1" ]; then
 fi
 if [ "${DC3_SMOKE_REQUIRE_THREAD:-0}" = "1" ]; then
   args+=(--smoke-require-thread)
+fi
+if [ "${DC3_CONVERSATION_COMPRESSION:-0}" = "1" ]; then
+  args+=(--conversation-compression)
 fi
 
 exec "${PYTHON:-python3}" -m dream_cycle_v3 "${args[@]}" "$@"

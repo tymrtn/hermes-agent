@@ -42,6 +42,8 @@ from .canonical import canonical_json, stable_id
 from .carry_forward import CarryForwardPolicy, run_carry_forward
 from .collect import CollectionBounds, collect_to_manifest
 from .contracts import is_iso_date, is_iso_datetime, parse_iso_datetime
+from .conversation_compression import (conversation_compression_status,
+                                       request_conversation_compression)
 from .daily_compression import compress_day
 from .errors import DreamCycleError, RootResolutionError, RuntimeLockError
 from .lookup import continuity_lookup
@@ -187,6 +189,17 @@ class RuntimeConfig:
     # and the compression is the durable, bounded hand-off the next wake
     # reads. Read-only toward every source; it only appends its own record.
     daily_compression: bool = True
+    # Ask the live gateway to run one REAL conversation compression for this
+    # profile (the existing manual-/compress path, driven in the owning
+    # process over its control socket). Opt-in: unlike every other step this
+    # one asks another process to mutate conversation history, so it is never
+    # implied by running a cycle. A gateway that does not answer means NOT
+    # APPLIED; nothing here falls back to editing a session store.
+    conversation_compression: bool = False
+    conversation_compression_limit: int = 1
+    # Explicit control-socket home. None probes the profile home, then the
+    # default home (one multiplexer, many profiles).
+    gateway_home: str | os.PathLike | None = None
 
     def __post_init__(self) -> None:
         errors: list[str] = []
@@ -220,6 +233,15 @@ class RuntimeConfig:
         if (self.smoke_expected_project is None) != (self.smoke_message is None):
             errors.append("retrieval smoke requires both smoke_message and "
                           "smoke_expected_project")
+        # A replay walks many past dates in one sitting; asking the gateway to
+        # compress the LIVE conversation once per replayed day would mutate
+        # today's history N times in the name of history.
+        if self.conversation_compression and self.historical_replay:
+            errors.append("conversation_compression cannot run under "
+                          "historical_replay: it would compress the live "
+                          "conversation once per replayed date")
+        if self.conversation_compression_limit < 1:
+            errors.append("conversation_compression_limit must be >= 1")
         if errors:
             raise DreamCycleError("RuntimeConfig: " + "; ".join(errors))
 
@@ -458,9 +480,14 @@ def _status_line(report: dict[str, Any], report_path: Path, ok: bool) -> str:
     smoke = report["retrieval_smoke"]
     smoke_state = "pass" if smoke["configured"] else "off"
     compression = report.get("daily_compression") or {"enabled": False}
+    # Labelled `continuity=`: this record compacts the continuity STORE, never the
+    # conversation. The conversation's own compression reports separately under
+    # `conversation=`, so a receipt cannot read one as the other.
     compression_state = (
         f"{compression['outcome']}/rev{compression['revision']}"
         if compression.get("enabled") else "off")
+    conversation_state = conversation_compression_status(
+        report.get("conversation_compression"))
     dispositioned = carry["dispositioned"] + carry["already_dispositioned"]
     return (f"dream-cycle-v3 cycle ok mode={report['mode']} "
             f"profile={report['profile']} date={report['cycle_date']} "
@@ -470,7 +497,8 @@ def _status_line(report: dict[str, Any], report_path: Path, ok: bool) -> str:
             f"threads_new={report['threads_seed']['inserted']} "
             f"dispositions={dispositioned}/{carry['selected']} "
             f"receipts={report['invariants']['write_receipts']} "
-            f"smoke={smoke_state} compression={compression_state} "
+            f"smoke={smoke_state} continuity={compression_state} "
+            f"conversation={conversation_state} "
             f"report={report_path}")
 
 
@@ -707,6 +735,20 @@ def run_cycle(config: RuntimeConfig) -> CycleResult:
             else:
                 compression_report = {"enabled": False}
 
+            # Real conversation compression, last of the store steps and
+            # deliberately outside the store: it asks the owning gateway to run
+            # the existing manual-/compress path, and records only what that
+            # answer proves. Never raises — an unreachable gateway is honest
+            # evidence that nothing was applied, not a failed cycle.
+            if config.conversation_compression:
+                conversation_report = request_conversation_compression(
+                    profile=config.profile,
+                    cycle_id=config.disposition_date,
+                    limit=config.conversation_compression_limit,
+                    gateway_home=config.gateway_home)
+            else:
+                conversation_report = {"enabled": False}
+
             if config.smoke_configured:
                 smoke = _retrieval_smoke(config, db_path)
             else:
@@ -765,6 +807,7 @@ def run_cycle(config: RuntimeConfig) -> CycleResult:
                 },
                 "carry_forward": carry_bounded,
                 "daily_compression": compression_report,
+                "conversation_compression": conversation_report,
                 "retrieval_smoke": smoke,
                 "run_report": run_report,
                 "invariants": {

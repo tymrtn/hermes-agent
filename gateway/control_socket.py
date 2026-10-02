@@ -378,3 +378,23 @@ def purge_gateway_profile_identity(home: Path, name: str, *,
     ``{"ok": True, "dropped": N, ...}`` answer, or None when no gateway answers / the gateway predates
     the verb."""
     return query_gateway_control(home, "purge-profile-identity", params={"name": name}, timeout=timeout)
+
+
+def compress_gateway_session(home: Path, *, profile: str, cycle_id: str,
+                             limit: Optional[int] = None, session_keys: Optional[list] = None,
+                             dry_run: bool = False, timeout: float = 300.0
+                             ) -> Optional[dict[str, Any]]:
+    """Ask the gateway serving ``home`` to run one scheduled real compression cycle for ``profile``.
+
+    Returns its ``{"counts", "sessions", ...}`` answer (see ``gateway.scheduled_compression``), or
+    None when no gateway answers / the gateway predates the verb — the caller then records that the
+    compression was NOT applied. There is deliberately no offline fallback: rewriting a live
+    session's transcript from another process would desync the owning gateway's cached agent.
+    ``timeout`` must exceed the verb's own wait, or a real compression reads back as unreachable.
+    """
+    params: dict[str, Any] = {"profile": profile, "cycle_id": cycle_id, "dry_run": bool(dry_run)}
+    if limit is not None:
+        params["limit"] = int(limit)
+    if session_keys:
+        params["session_keys"] = [str(key) for key in session_keys]
+    return query_gateway_control(home, "compress-session", params=params, timeout=timeout)

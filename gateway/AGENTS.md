@@ -56,6 +56,21 @@ truth: `chat.*Stream` speaks STANDARD markdown, not mrkdwn; `stopStream.markdown
 `startStream`/`stopStream` are Tier 2 (~20/min). Check `draft_stream_is_message is True` —
 MagicMock adapters in older tests auto-create truthy attributes.
 
+## Control socket (`gateway/control_socket.py`)
+
+One local-only socket per `HERMES_HOME` answering versioned JSON verbs; the gateway registers them
+in `run.py::_start_gateway_start_control_socket`. Handlers run on the socket's executor thread, so
+anything touching the session store, agent cache or adapters is marshalled onto the loop
+(`run_coroutine_threadsafe`) with a bounded wait — a slow verb answers `pending`, it does not
+abandon the work. Client-side helpers live beside the server; **every** one returns `None` rather
+than raising when no gateway answers, so callers fall back or report "not done" instead of dying.
+
+`compress-session` (`gateway/scheduled_compression.py`) is the scheduled-compression entry point: a
+nightly job asks the OWNING process to run the existing manual-`/compress` path for one profile.
+Never reimplement it caller-side — an offline `state.db` rewrite desyncs the cached agent. It
+defers on a running turn or in-flight compression, stamps its outcome in the routing entry's
+metadata for per-cycle idempotence, and reports `applied` only with before/after evidence.
+
 ## Background process notifications
 
 `terminal(background=true, notify_on_complete=true)` starts a gateway watcher that detects

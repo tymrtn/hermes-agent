@@ -242,6 +242,9 @@ def cmd_run(args: argparse.Namespace) -> int:
         disposition_date=args.date,
         as_of=(args.as_of.isoformat() if args.as_of
                else args.window_end.isoformat()),
+        conversation_compression=bool(args.conversation_compression),
+        conversation_compression_limit=args.conversation_compression_limit,
+        gateway_home=args.gateway_home,
         **_cycle_source_kwargs(args),
     )
     result = run_cycle(config)
@@ -562,6 +565,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--as-of", type=_parse_dt, default=None,
                    help="pin `now` explicitly; defaults to the window end "
                         "so unpinned retries stay byte-identical")
+    p.add_argument("--conversation-compression", action="store_true",
+                   help="also ask the live gateway to run one REAL "
+                        "conversation compression for this profile (its own "
+                        "/compress path, in the owning process)")
+    p.add_argument("--conversation-compression-limit", type=int, default=1,
+                   metavar="N",
+                   help="how many of the profile's most recent conversations "
+                        "the gateway may compress this cycle (default 1)")
+    p.add_argument("--gateway-home",
+                   help="control-socket home of the gateway serving this "
+                        "profile; default probes the profile home then the "
+                        "default home")
     p.set_defaults(func=cmd_run)
 
     replay_description = (

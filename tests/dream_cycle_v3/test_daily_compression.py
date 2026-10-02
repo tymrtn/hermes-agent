@@ -143,7 +143,7 @@ def test_cycle_produces_retrievable_daily_compression(env):
     assert section["date"] == DATE
     assert section["revision"] == 1
     assert section["outcome"] == OUTCOME_RECORDED
-    assert f"compression={OUTCOME_RECORDED}/rev1" in result.status_line
+    assert f"continuity={OUTCOME_RECORDED}/rev1" in result.status_line
 
     record = read_daily_compression(store_path(env), profile=PROFILE,
                                     compression_date=DATE,
@@ -495,7 +495,7 @@ def test_cycle_can_be_run_without_daily_compression(env):
     result = run_cycle(make_config(env, daily_compression=False))
     assert result.ok is True
     assert result.report["daily_compression"] == {"enabled": False}
-    assert "compression=off" in result.status_line
+    assert "continuity=off" in result.status_line
     with open_store(env) as store:
         assert store.counts()["daily_compressions"] == 0
     assert current_daily_compression(
