@@ -69,9 +69,16 @@ than raising when no gateway answers, so callers fall back or report "not done" 
 nightly job asks the OWNING process to run the existing manual-`/compress` path for one profile.
 Never reimplement it caller-side — an offline `state.db` rewrite desyncs the cached agent. It
 **RESERVES** the conversation before reading its history — the pending-sentinel turn slot (the
-predicate `_is_session_running` the inbound admission gate reads) plus the per-session_id turn lease
-— so inbound queues behind it instead of running a turn against a transcript about to be rotated
-away; it defers on a running turn, in-flight compression or a contended lease; it stamps its outcome
+predicate `_is_session_running` the inbound admission gate reads), a fresh run generation and the
+per-session_id turn lease (token parked in `turn.lease_tokens` like a real turn's) — so inbound waits
+behind it instead of running a turn against a transcript about to be rotated away. A reservation has
+no turn behind it, so it carries `turn.reservation`: inbound **parks its task** on that event
+(`_hm_park_on_turn_reservation`) rather than queueing into the adapter's pending slot, which nothing
+would drain and whose in-band drain re-dispatched the parked event in a tight loop; slash commands
+still dispatch, so `/stop` stays the escape hatch, and every slot release (`TurnState.clear`) sets
+the event. Release and rebind are GENERATION-GUARDED: a `/stop` mid-flight plus a successor turn is
+the case an unconditional release broke, clearing a live turn's slot. It defers on a running turn,
+in-flight compression or a contended lease; it stamps its outcome
 in the routing entry's metadata for per-cycle idempotence; and it reports `applied` only on an
 explicit COMMIT (`_persist_manual_compression` returning True) plus before/after evidence —
 `compress_now` answering `compressed` covers a refused would-grow candidate and a rolled-back

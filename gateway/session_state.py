@@ -23,14 +23,22 @@ class TurnState:
     started_ts: float = 0.0  # 0.0 = not running
     lease: Any = None  # cross-process active-session slot lease
     busy_ack_ts: float = 0.0  # debounce; 0.0 = never acked
+    # Set only while the slot is held by a RESERVATION rather than a turn (scheduled compression):
+    # an ``asyncio.Event`` inbound parks on, because no turn will drain the adapter's pending slot.
+    # ``clear()`` sets it, so every slot-release path unblocks the waiters.
+    reservation: Any = None
     # Held turn-lease tokens keyed by acquiring run generation: release/rebind resolve the
     # token for their own generation, so a displaced turn's unwind frees only its own lease and
     # never a successor's (an evicted turn and its replacement may both hold one briefly).
     lease_tokens: Dict[int, Any] = field(default_factory=dict)
 
     def clear(self) -> None:
-        """Reset the per-turn slot.  The caller pops ``lease`` first to release it."""
-        self.agent = self.lease = None
+        """Reset the per-turn slot.  The caller pops ``lease`` first to release it.  A reservation is
+        SET before being dropped: /stop, eviction and the reservation's own release all land here, and
+        an inbound task parked on it must wake the moment the slot is free, not on its timeout."""
+        if self.reservation is not None:
+            self.reservation.set()
+        self.agent = self.lease = self.reservation = None
         self.started_ts = self.busy_ack_ts = 0.0
 
 

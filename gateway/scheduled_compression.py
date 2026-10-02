@@ -234,8 +234,18 @@ def _already_done(marker: Any, cycle_id: str) -> bool:
 _LEASE_CONTENDED = object()
 
 
-def _claim_turn_slot(runner: Any, session_key: str) -> bool:
-    """Reserve this conversation's running-turn slot, or False when a turn already holds it.
+@dataclass
+class _Reservation:
+    """This operation's claim on one conversation, and the handles that make it releasable exactly
+    once by its OWN tail: the run generation that owns the turn slot and the lease token, plus the
+    event an inbound task parks on until the slot is given back."""
+
+    generation: int
+    released: Any  # asyncio.Event
+
+
+def _claim_turn_slot(runner: Any, session_key: str) -> Optional[_Reservation]:
+    """Reserve this conversation's running-turn slot, or None when a turn already holds it.
 
     The check and the claim must sit in ONE synchronous block: between them is exactly the window
     the review reproduced — an inbound message passing the admission guard and starting a turn while
@@ -245,41 +255,60 @@ def _claim_turn_slot(runner: Any, session_key: str) -> bool:
     (``run_inbound.py::_hm_handle_running_session_message`` via ``_is_session_running``), so inbound
     QUEUES behind the compression instead of interrupting it: an interrupt is skipped for a
     sentinel-held slot, and ``/stop`` stays the escape hatch.
+
+    Two things make the claim a real turn's claim rather than a lookalike:
+
+    - ``turn.reservation`` — a sentinel slot held by a reservation has NO turn behind it, so nothing
+      would ever drain the adapter's pending slot; inbound parks on this event instead of queueing
+      into a slot the adapter's own in-band drain re-dispatches immediately (a tight redispatch loop).
+    - a fresh RUN GENERATION, exactly as ``_handle_message`` takes after its own sentinel claim. Every
+      release/rebind this operation performs is guarded by it, so a ``/stop`` that clears this
+      sentinel mid-flight and a successor turn that claims the slot in that window keep their own
+      turn slot and their own lease — this operation's tail can only ever free its own.
     """
     from gateway.run import _AGENT_PENDING_SENTINEL
 
     if runner._is_session_running(session_key):
-        return False
+        return None
     state = runner._session_state(session_key)
     state.turn.agent = _AGENT_PENDING_SENTINEL
     state.turn.started_ts = time.time()
+    state.turn.reservation = asyncio.Event()
+    reservation = _Reservation(runner._begin_session_run_generation(session_key),
+                               state.turn.reservation)
     runner._persist_active_agents()
-    return True
+    return reservation
 
 
-async def _acquire_session_lease(runner: Any, session_key: str, session_id: str):
+async def _acquire_session_lease(runner: Any, session_key: str, session_id: str,
+                                 reservation: _Reservation) -> bool:
     """Hold the per-session_id turn lease for the [read history → compress → commit] region.
 
     The slot claim above is keyed by ROUTING KEY; the transcript is owned by SESSION_ID, and
     ``switch_session`` makes that mapping many-to-one, so a second key resolving this same id would
     still start a turn. This is the lease every real turn takes for the same region
-    (``run_turn.py::_hmwa_acquire_turn_lease``). Returns the token, None when unavailable, or
-    ``_LEASE_CONTENDED`` when a turn holds it — fail closed, defer, retry next cycle.
+    (``run_turn.py::_hmwa_acquire_turn_lease``), and the token is parked in the same place — the
+    session's own ``turn.lease_tokens`` under the acquiring generation — so the canonical
+    generation-keyed ``_release_turn_lease`` / ``_rebind_turn_lease`` own it from here and a
+    successor turn's lease can never be released or rebound by this operation's tail. True when the
+    region is ours (held, or no registry to hold); ``_LEASE_CONTENDED`` when a turn holds it — fail
+    closed, defer, retry next cycle.
     """
     from gateway.turn_lease import DEFAULT_LEASE_WAIT, TurnLeaseTimeoutError
 
     registry = getattr(runner, "_turn_leases", None)
     if registry is None or not session_id:
-        return None
+        return True
     from gateway.run import _float_env
-    state = runner._peek_session_state(session_key)
-    generation = int(getattr(getattr(state, "persistent", None), "run_generation", 0) or 0)
     try:
-        return await registry.acquire(
-            session_id, owner_key=session_key, generation=generation,
+        token = await registry.acquire(
+            session_id, owner_key=session_key, generation=reservation.generation,
             timeout=_float_env("HERMES_TURN_LEASE_TIMEOUT", DEFAULT_LEASE_WAIT))
     except TurnLeaseTimeoutError:
         return _LEASE_CONTENDED
+    if token is not None:
+        runner._session_state(session_key).turn.lease_tokens[reservation.generation] = token
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -327,29 +356,38 @@ async def _compress_one_entry(runner: Any, entry: Any, *, cycle_id: str, dry_run
     # Reserve the conversation BEFORE reading its history: everything from here to the commit must
     # be serialized against inbound turns, or an arriving message runs a turn whose parent session
     # this compression is about to close (rotation) or rewrite (in place).
-    if not _claim_turn_slot(runner, session_key):
+    reservation = _claim_turn_slot(runner, session_key)
+    if reservation is None:
         return {**row, "status": "deferred", "reason": "turn_running"}
     try:
         deferred = await _deferral_reason(runner, session_key)
         if deferred:
             return {**row, "status": "deferred", "reason": deferred}
-        lease = await _acquire_session_lease(runner, session_key, entry.session_id)
-        if lease is _LEASE_CONTENDED:
+        if await _acquire_session_lease(
+                runner, session_key, entry.session_id, reservation) is _LEASE_CONTENDED:
             return {**row, "status": "deferred", "reason": "turn_lease_contended"}
         try:
             return await _compress_reserved_entry(
                 runner, entry, row, cycle_id=cycle_id, dry_run=dry_run,
-                include_highlights=include_highlights, lease=lease)
+                include_highlights=include_highlights, reservation=reservation)
         finally:
-            if lease is not None:
-                runner._turn_leases.release(lease)
+            # Keyed by (routing key, OUR generation): a /stop that swept this token already freed it
+            # and a successor's token lives under its own generation, so this frees only ours.
+            runner._release_turn_lease(session_key, reservation.generation)
     finally:
-        runner._release_running_agent_state(session_key)
+        # Generation-guarded, exactly as a real turn's finalizer (``run_inbound.py::_handle_message``):
+        # /stop can clear this sentinel while the compression is still unwinding and a successor turn
+        # may already own the slot — an unconditional release would clear ITS live turn, leaving busy
+        # routing and interruption disabled for a turn that is actually running.
+        runner._release_running_agent_state(session_key, run_generation=reservation.generation)
+        # A release the generation guard refused did not reach ``turn.clear()``, so nothing set this;
+        # an inbound task parked on a reservation that is over must not wait out its whole cap.
+        reservation.released.set()
 
 
 async def _compress_reserved_entry(runner: Any, entry: Any, row: Dict[str, Any], *, cycle_id: str,
-                                   dry_run: bool, include_highlights: bool, lease: Any
-                                   ) -> Dict[str, Any]:
+                                   dry_run: bool, include_highlights: bool,
+                                   reservation: _Reservation) -> Dict[str, Any]:
     """Read, compress and commit one RESERVED conversation (slot + turn lease already held)."""
     from agent.conversation_compression_manual import MIN_MESSAGES, parse_compress_args
     from gateway.session_transcript import TranscriptReadError
@@ -391,9 +429,11 @@ async def _compress_reserved_entry(runner: Any, entry: Any, row: Dict[str, Any],
     if include_highlights and outcome.highlights:
         result["highlights"] = outcome.highlights
     # The rotated id is the new serialization target for whatever runs next; follow it with the held
-    # lease before the caller releases, exactly as a real turn does (``_rebind_turn_lease``).
-    if lease is not None and outcome.rotated:
-        runner._turn_leases.rebind(lease, outcome.new_session_id)
+    # lease before the caller releases, exactly as a real turn does. Generation-keyed, so a rotation
+    # racing a /stop + successor rebinds only a lease this operation still holds — never the
+    # successor's (``_rebind_turn_lease`` resolves the token under OUR generation or no-ops).
+    if outcome.rotated:
+        runner._rebind_turn_lease(session_key, reservation.generation, outcome.new_session_id)
     # Stamp AFTER the rewrite persisted, so a crash mid-compression leaves the cycle retryable.
     await store.set_session_metadata(session_key, CYCLE_METADATA_KEY, {
         "cycle_id": cycle_id, "status": status, "detail": outcome.status, "at": int(time.time()),

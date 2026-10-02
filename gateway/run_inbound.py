@@ -38,6 +38,20 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
 
+#: ``_hm_handle_running_session_message`` answer meaning "the turn reservation this task parked on is
+#: over — re-evaluate admission". Never returned to an adapter.
+_RESERVATION_RELEASED = object()
+#: Cap on one inbound task's park behind a turn reservation. Above ``compress-session``'s own socket
+#: timeout (``scheduled_compression.DEFAULT_VERB_TIMEOUT``), so a real nightly compression finishes
+#: inside it and only a wedged reservation reaches the refusal.
+_RESERVATION_PARK_TIMEOUT_SECONDS = 300.0
+#: How many consecutive reservations one message waits out before it is refused rather than held.
+_MAX_RESERVATION_PARKS = 2
+_RESERVATION_PARK_REFUSAL = (
+    "⏳ This conversation is being compressed right now, so this message was not processed. "
+    "Please resend it in a moment."
+)
+
 
 class GatewayInboundMixin:
     """Inbound message pipeline (_handle_message, text/media preparation, durable-turn markers, plugin injection) for GatewayRunner."""
@@ -664,12 +678,46 @@ class GatewayInboundMixin:
         # — that copy was never consumed and grew unbounded.
         running_agent.interrupt(_interrupt_text)
 
+    def _hm_turn_reservation(self, _quick_key: str):
+        """The release event when this session's turn slot is held by a RESERVATION — a scheduled
+        compression holding the slot with no turn behind it (``scheduled_compression::
+        _claim_turn_slot``) — else None."""
+        _state = self._peek_session_state(_quick_key)
+        return getattr(_state.turn, "reservation", None) if _state is not None else None
+
+    async def _hm_park_on_turn_reservation(self, _quick_key: str, reservation) -> Optional[str]:
+        """Hold THIS inbound task until the reservation is given back, then let the caller admit the
+        message as an ordinary new turn.
+
+        Queueing is not an option here: a reservation has no turn behind it, so nothing drains the
+        adapter's pending slot, and the adapter's own in-band drain re-dispatched the parked event
+        immediately — the same message looping through admission, hooks and the typing lifecycle
+        thousands of times a second. Parking the task keeps the adapter's session guard installed, so
+        concurrent inbound merges into the pending slot as usual and the turn that follows drains it.
+        Every slot-release path sets the event (``TurnState.clear``), so /stop and eviction unblock
+        the park at once; cancellation (``cancel_session_processing``, shutdown) propagates."""
+        logger.info("Parking inbound for %s behind a turn reservation (scheduled compression)",
+                    _quick_key)
+        try:
+            await asyncio.wait_for(reservation.wait(), timeout=_RESERVATION_PARK_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            logger.warning("Turn reservation for %s outlasted the inbound park (%.0fs) — refusing "
+                           "this message instead of parking it further",
+                           _quick_key, _RESERVATION_PARK_TIMEOUT_SECONDS)
+            return _RESERVATION_PARK_REFUSAL
+        return _RESERVATION_RELEASED
+
     async def _hm_handle_running_session_message(
         self, event: "MessageEvent", source: SessionSource, _quick_key: str
     ) -> Optional[str]:
         """Fast-path while this session's agent is running: interrupt by default (minimal latency);
-        busy_input_mode queue/steer, subagent and compression protection demote to queue."""
+        busy_input_mode queue/steer, subagent and compression protection demote to queue. A slot held
+        by a RESERVATION instead of a turn parks the task (see ``_hm_park_on_turn_reservation``);
+        slash commands still dispatch per their busy policy, so /stop stays the escape hatch."""
         from gateway.run import _AGENT_PENDING_SENTINEL
+        _reservation = self._hm_turn_reservation(_quick_key) if not event.get_command() else None
+        if _reservation is not None:
+            return await self._hm_park_on_turn_reservation(_quick_key, _reservation)
         _handled, _result = await self._hm_busy_slash_or_photo(event, source, _quick_key)
         if _handled:
             return _result
@@ -1279,8 +1327,18 @@ class GatewayInboundMixin:
         self._hm_evict_idle_stale_agent(_quick_key)
         if self._is_session_running(_quick_key):
             self._hm_evict_reaped_agent(_quick_key)
-        if self._is_session_running(_quick_key):
-            return await self._hm_handle_running_session_message(event, source, _quick_key)
+        # A parked inbound task (a scheduled compression held the slot) re-evaluates instead of
+        # returning: the slot may now be free — this message becomes an ordinary new turn below — or
+        # a real turn may have claimed it meanwhile, which is the normal busy path. Bounded, so
+        # back-to-back reservations cannot hold one message forever.
+        for _parks_left in range(_MAX_RESERVATION_PARKS, -1, -1):
+            if not self._is_session_running(_quick_key):
+                break
+            _busy_result = await self._hm_handle_running_session_message(event, source, _quick_key)
+            if _busy_result is not _RESERVATION_RELEASED:
+                return _busy_result
+            if not _parks_left:
+                return _RESERVATION_PARK_REFUSAL
 
         _handled, _result = await self._hm_dispatch_idle_commands(event, source, _quick_key)
         if _handled:

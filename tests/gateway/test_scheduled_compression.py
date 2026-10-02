@@ -25,6 +25,8 @@ import pytest
 
 from agent.context_compressor import is_compaction_summary_message
 from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.platforms.base import BasePlatformAdapter, SendResult
+from gateway.platforms.event import MessageEvent, MessageType
 from gateway.scheduled_compression import (CYCLE_METADATA_KEY, eligible_entries,
                                            handoff_highlights, key_namespace_for_profile,
                                            run_scheduled_compression, session_ref)
@@ -680,3 +682,251 @@ def test_standalone_gateway_compresses_after_a_hosted_room_armed_the_secret_guar
     # The guard itself is never weakened by the operation.
     with pytest.raises(UnscopedSecretError):
         get_secret("OPENROUTER_API_KEY")
+
+
+# ---------------------------------------------------------------------------
+# The reservation is released by its OWN generation, and inbound PARKS on it
+# ---------------------------------------------------------------------------
+
+class _NoTransportAdapter(BasePlatformAdapter):  # type: ignore[misc]
+    """The shipped adapter dispatch (guard, background task, in-band drain) with no network."""
+
+    async def connect(self, *, is_reconnect: bool = False):
+        pass
+
+    async def disconnect(self):
+        pass
+
+    async def get_chat_info(self, chat_id):
+        return None
+
+    async def send(self, *args, **kwargs):
+        self.sent.append(args[1] if len(args) > 1 else kwargs.get("text"))
+        return SendResult(success=True, message_id="m1")
+
+
+def _no_transport_adapter() -> "_NoTransportAdapter":
+    """A real ``BasePlatformAdapter`` without its heavy ``__init__`` — the dispatch path under test
+    (``_start_session_processing`` → ``_process_message_background`` → in-band drain) is the shipped
+    one; only the wire is absent."""
+    adapter = object.__new__(_NoTransportAdapter)
+    adapter.config = PlatformConfig(enabled=True, token="***", typing_indicator=False)
+    adapter.platform = Platform.TELEGRAM
+    adapter.sent = []
+    adapter._message_handler = None
+    adapter._busy_session_handler = None
+    adapter._active_sessions = {}
+    adapter._pending_messages = {}
+    adapter._session_tasks = {}
+    adapter._background_tasks = set()
+    adapter._post_delivery_callbacks = {}
+    adapter._expected_cancelled_tasks = set()
+    adapter._fatal_error_code = adapter._fatal_error_message = adapter._fatal_error_handler = None
+    adapter._fatal_error_retryable = True
+    adapter._running = True
+    adapter._busy_text_mode = "queue"
+    adapter._busy_text_debounce_seconds = 0.0
+    adapter._busy_text_hard_cap_seconds = 0.5
+    adapter._text_debounce = {}
+    adapter._auto_tts_default = False
+    adapter._auto_tts_enabled_chats = set()
+    adapter._auto_tts_disabled_chats = set()
+    adapter._typing_paused = set()
+    adapter._streaming_tts_completed_turns = set()
+    return adapter
+
+
+def _wire_inbound(runner, adapter, dispatches: list, turns: list):
+    """Point the adapter at the REAL ``_handle_message``. Two seams are fixtures: admission (auth /
+    hooks / profile routing, upstream of the busy gate) and the agent turn itself."""
+    async def _admit(event):
+        dispatches.append(event.text)
+        return event, event.source, False
+
+    async def _turn(event, _source, _key, _generation):
+        turns.append(event.text)
+        return "answered"
+
+    runner._hm_admit_event = _admit
+    runner._handle_message_with_agent = _turn
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    adapter._message_handler = runner._handle_message
+    return adapter
+
+
+async def _await_until(predicate, timeout: float = 5.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        await asyncio.sleep(0.02)
+    return False
+
+
+async def _stop_session(runner, source: SessionSource, session_key: str) -> None:
+    """The real /stop funnel both stop handlers use (``slash_commands._handle_stop_command`` →
+    ``_interrupt_and_clear_session``) for a sentinel-held slot."""
+    from gateway.run import _INTERRUPT_REASON_STOP
+
+    await runner._interrupt_and_clear_session(
+        session_key, source, interrupt_reason=_INTERRUPT_REASON_STOP,
+        invalidation_reason="stop_command_pending")
+
+
+def test_stop_midflight_leaves_the_successor_turn_owning_its_slot_and_lease(live):
+    """``/stop`` clears the reservation's sentinel and a successor turn claims the slot (and the
+    lease the stop swept free) before the compression finishes unwinding. The compression's tail must
+    release only its OWN generation: an unconditional release clears the successor's live turn, which
+    silently disables busy routing and /stop for a turn that is really running."""
+    from gateway.turn_lease import TurnLeaseTimeoutError
+
+    config, store, _home = live
+    entry = _seed(store, _source(), _history())
+    runner = _runner(config, store)
+    started, release = threading.Event(), threading.Event()
+
+    async def _scenario():
+        task = asyncio.create_task(run_scheduled_compression(
+            runner, profile=PROFILE, cycle_id=CYCLE))
+        assert await asyncio.to_thread(started.wait, 20), "compression never reached the summarizer"
+        await _stop_session(runner, _source(), entry.session_key)
+        assert runner._is_session_running(entry.session_key) is False, "/stop did not free the slot"
+
+        # The successor turn, claimed exactly as ``_handle_message`` does once the slot came free.
+        state = runner._session_state(entry.session_key)
+        state.turn.agent = MagicMock()
+        state.turn.started_ts = time.time()
+        successor = runner._begin_session_run_generation(entry.session_key)
+        # Not fatal here: the point of the assertions is what the compression's TAIL does, and a base
+        # that parks its lease token outside the session's own map leaves /stop unable to sweep it —
+        # so record the refusal and keep going instead of ending the test on it.
+        lease_error = None
+        try:
+            state.turn.lease_tokens[successor] = await runner._turn_leases.acquire(
+                entry.session_id, owner_key=entry.session_key, generation=successor, timeout=1.0)
+        except TurnLeaseTimeoutError as exc:
+            lease_error = exc
+        release.set()
+        return successor, lease_error, await task
+
+    with _real_compression(runner) as llm:
+        llm.side_effect = _barrier_summary(started, release)
+        successor, lease_error, result = asyncio.run(_scenario())
+
+    state = runner._peek_session_state(entry.session_key)
+    assert runner._is_session_running(entry.session_key) is True, \
+        "the compression's tail cleared the successor turn's slot"
+    assert state.turn.agent is not None
+    assert lease_error is None, \
+        f"/stop could not free the reservation's lease for the successor turn: {lease_error}"
+    assert successor in state.turn.lease_tokens, "the successor's lease token was stolen"
+    assert result["counts"] == {"applied": 1}, result
+
+
+def test_inbound_parks_on_the_reservation_instead_of_redispatching(live):
+    """One message arriving mid-reservation, through the REAL adapter dispatch. Queueing it was the
+    defect: a reservation has no turn behind it, so the adapter's in-band drain re-dispatched the same
+    event in a tight loop. It must park once and then run exactly one turn."""
+    config, store, _home = live
+    entry = _seed(store, _source(), _history())
+    runner = _runner(config, store)
+    dispatches, turns = [], []
+    adapter = _wire_inbound(runner, _no_transport_adapter(), dispatches, turns)
+    started, release = threading.Event(), threading.Event()
+
+    async def _scenario():
+        task = asyncio.create_task(run_scheduled_compression(
+            runner, profile=PROFILE, cycle_id=CYCLE))
+        assert await asyncio.to_thread(started.wait, 20), "compression never reached the summarizer"
+        event = MessageEvent(text="anything still open?", message_type=MessageType.TEXT,
+                             source=_source())
+        assert adapter._start_session_processing(event, entry.session_key) is True
+        await asyncio.sleep(0.25)  # long enough for a redispatch loop to show thousands of passes
+        parked = {"dispatches": len(dispatches), "turns": list(turns),
+                  "pending": dict(adapter._pending_messages)}
+        release.set()
+        result = await task
+        assert await _await_until(lambda: bool(turns)), "the parked message never ran its turn"
+        await asyncio.gather(*list(adapter._background_tasks), return_exceptions=True)
+        return parked, result
+
+    with _real_compression(runner) as llm:
+        llm.side_effect = _barrier_summary(started, release)
+        parked, result = asyncio.run(_scenario())
+
+    assert parked["dispatches"] == 1, \
+        f"the message was re-dispatched {parked['dispatches']} times during the reservation"
+    assert parked["turns"] == [], "a turn ran against the transcript being compressed"
+    assert parked["pending"] == {}, "the event was queued into a slot nothing would drain"
+    # Released: the same inbound task admits the message as one ordinary turn, nothing duplicated.
+    assert turns == ["anything still open?"]
+    assert dispatches == ["anything still open?"]
+    assert result["counts"] == {"applied": 1}, result
+
+
+def test_stop_during_a_reservation_wakes_the_parked_inbound_at_once(live):
+    """/stop is the escape hatch: it clears the slot, so the park must end on the release — not on
+    its timeout — and the message must then run."""
+    config, store, _home = live
+    entry = _seed(store, _source(), _history())
+    runner = _runner(config, store)
+    dispatches, turns = [], []
+    adapter = _wire_inbound(runner, _no_transport_adapter(), dispatches, turns)
+    started, release = threading.Event(), threading.Event()
+
+    async def _scenario():
+        task = asyncio.create_task(run_scheduled_compression(
+            runner, profile=PROFILE, cycle_id=CYCLE))
+        assert await asyncio.to_thread(started.wait, 20), "compression never reached the summarizer"
+        adapter._start_session_processing(
+            MessageEvent(text="status?", message_type=MessageType.TEXT, source=_source()),
+            entry.session_key)
+        await asyncio.sleep(0.1)
+        assert turns == []
+        await _stop_session(runner, _source(), entry.session_key)
+        woke = await _await_until(lambda: bool(turns), timeout=5.0)
+        release.set()
+        result = await task
+        await asyncio.gather(*list(adapter._background_tasks), return_exceptions=True)
+        return woke, result
+
+    with _real_compression(runner) as llm:
+        llm.side_effect = _barrier_summary(started, release)
+        woke, result = asyncio.run(_scenario())
+
+    assert woke is True, "the parked message waited past /stop clearing the reservation"
+    assert turns == ["status?"] and dispatches == ["status?"]
+    assert result["counts"] == {"applied": 1}, result
+
+
+def test_cancelling_a_parked_inbound_does_not_wedge_the_compression(live):
+    """The adapter's own cancellation (``cancel_session_processing``: shutdown, reset-like commands)
+    must unwind a parked task without running its turn and without disturbing the compression."""
+    config, store, _home = live
+    entry = _seed(store, _source(), _history())
+    runner = _runner(config, store)
+    dispatches, turns = [], []
+    adapter = _wire_inbound(runner, _no_transport_adapter(), dispatches, turns)
+    started, release = threading.Event(), threading.Event()
+
+    async def _scenario():
+        task = asyncio.create_task(run_scheduled_compression(
+            runner, profile=PROFILE, cycle_id=CYCLE))
+        assert await asyncio.to_thread(started.wait, 20), "compression never reached the summarizer"
+        adapter._start_session_processing(
+            MessageEvent(text="never mind", message_type=MessageType.TEXT, source=_source()),
+            entry.session_key)
+        await asyncio.sleep(0.1)
+        await asyncio.wait_for(
+            adapter.cancel_session_processing(entry.session_key), timeout=5.0)
+        release.set()
+        return await task
+
+    with _real_compression(runner) as llm:
+        llm.side_effect = _barrier_summary(started, release)
+        result = asyncio.run(_scenario())
+
+    assert turns == [], "a cancelled park still ran its turn"
+    assert dispatches == ["never mind"]
+    assert result["counts"] == {"applied": 1}, result
+    assert runner._is_session_running(entry.session_key) is False
