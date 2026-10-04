@@ -33,8 +33,12 @@ CONVERSATION_COMPRESSION_SCHEMA_VERSION = 1
 DEFAULT_TIMEOUT_SECONDS = 300.0
 DEFAULT_LIMIT = 1
 
-MAX_HIGHLIGHTS = 3
 HIGHLIGHT_CHARS = 160
+#: Per-key caps for the handoff projection the gateway returns. ``latest_reply`` is the retained
+#: final assistant text (two sentences), so it gets more room than a bullet.
+HIGHLIGHT_LIMITS = {"open_threads": 3, "learnings": 3, "active_task": 1, "open_items": 4,
+                    "corrections": 3, "latest_reply": 1}
+HIGHLIGHT_CHAR_LIMITS = {"latest_reply": 280}
 MAX_SESSION_ROWS = 6
 
 # `claim` — the one field a receipt may quote. Each value is a statement about what HAPPENED.
@@ -91,14 +95,14 @@ def _highlights(rows: Sequence[Mapping[str, Any]]) -> dict[str, list[str]]:
         raw = row.get("highlights")
         if not isinstance(raw, Mapping):
             continue
-        for name in ("open_threads", "learnings"):
+        for name, limit in HIGHLIGHT_LIMITS.items():
             values = raw.get(name)
             if not isinstance(values, list):
                 continue
             bucket = merged.setdefault(name, [])
             for value in values:
-                text = sanitize_text(value, HIGHLIGHT_CHARS)
-                if text and text not in bucket and len(bucket) < MAX_HIGHLIGHTS:
+                text = sanitize_text(value, HIGHLIGHT_CHAR_LIMITS.get(name, HIGHLIGHT_CHARS))
+                if text and text not in bucket and len(bucket) < limit:
                     bucket.append(text)
     return {k: v for k, v in merged.items() if v}
 

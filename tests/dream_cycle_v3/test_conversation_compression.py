@@ -147,6 +147,22 @@ def test_highlights_pass_through_the_shared_sanitizers():
     assert "tyler@example.com" not in blob
 
 
+def test_brief_sections_are_sanitized_and_bounded_like_every_highlight():
+    row = _applied_row(highlights={
+        "open_items": [f"item {n}" for n in range(9)],
+        "corrections": [f"rotate key {SECRET_CANARY}"],
+        "latest_reply": ["word " * 200],
+        "active_task": ["first task", "second task"]})
+
+    highlights = classify_conversation_compression(
+        _answer(row), profile=PROFILE, cycle_id=DATE)["highlights"]
+
+    assert highlights["open_items"] == [f"item {n}" for n in range(4)]
+    assert highlights["active_task"] == ["first task"]
+    assert SECRET_CANARY not in json.dumps(highlights)
+    assert 160 < len(highlights["latest_reply"][0]) <= 280
+
+
 # -- client plumbing ---------------------------------------------------------
 
 def test_candidate_homes_try_the_profile_home_before_the_multiplexer():

@@ -7,9 +7,10 @@
 # additionally asks the already-running gateway to compress the conversation
 # through its own /compress path; the aux-model call happens there, under that
 # gateway's credentials, and a gateway that does not answer is reported as
-# "not applied" rather than worked around. On success it prints the runtime's one
-# exact status line; any failure exits nonzero with a concise safe message
-# on stderr.
+# "not applied" rather than worked around. On success stdout is the human daily
+# brief rendered from the cycle's own records (no model call) and the one exact
+# machine status line goes to stderr; DC3_OUTPUT=status restores the status line
+# on stdout. Any failure exits nonzero with a concise safe message on stderr.
 #
 # Required env:
 #   DC3_PROFILE DC3_OWNER DC3_ROOTS DC3_WINDOW_START DC3_WINDOW_END DC3_DATE
@@ -24,6 +25,7 @@
 #   DC3_CONVERSATION_COMPRESSION=1 (ask the live gateway to run one REAL
 #   conversation compression over its own control socket; still no LLM call
 #   from THIS process) DC3_CONVERSATION_COMPRESSION_LIMIT DC3_GATEWAY_HOME
+#   DC3_OUTPUT=brief|status (default brief)
 # Extra CLI arguments pass through verbatim: dream_cycle_v3_run.sh [ARGS...]
 set -euo pipefail
 
@@ -52,6 +54,7 @@ if [ -n "${DC3_V3_ROOT:-}" ] && [ -n "${DC3_SHADOW_ROOT:-}" ]; then
 fi
 
 args=(run
+  --output "${DC3_OUTPUT:-brief}"
   --profile "$DC3_PROFILE"
   --owner "$DC3_OWNER"
   --window-start "$DC3_WINDOW_START"

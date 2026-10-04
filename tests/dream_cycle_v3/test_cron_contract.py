@@ -306,8 +306,11 @@ def test_shim_runs_the_wrapper_in_shadow_mode(tmp_path):
     proc = subprocess.run(["bash", str(SHIM)], env=env,
                           capture_output=True, text=True, timeout=300)
     assert proc.returncode == 0, proc.stderr
-    assert proc.stdout.count("\n") == 1
-    assert proc.stdout.startswith("dream-cycle-v3 cycle ok mode=shadow ")
+    # The scheduled path's stdout is what the cron job delivers: the human brief, while the machine
+    # status line stays on stderr beside the persisted report.
+    assert proc.stdout.startswith("🌙 **Nagatha · Dream Cycle**")
+    assert "dream-cycle-v3 cycle" not in proc.stdout and "sources=" not in proc.stdout
+    assert proc.stderr.startswith("dream-cycle-v3 cycle ok mode=shadow ")
 
     shadow_root = hermes / "dream-cycle" / "v3-shadow"
     assert (shadow_root / "continuity.db").is_file()

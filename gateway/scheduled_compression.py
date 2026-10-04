@@ -30,6 +30,12 @@ over the gateway's own control socket. Consequences that are the whole point:
   both leave the transcript untouched under that status, and such an attempt must stay retryable.
   The before/after token and message counts come from that result. A request that was merely sent
   reports ``requested``/``deferred``, never ``applied``.
+- Reconciled handoff. The compressor keeps the latest user message and everything after it
+  verbatim, and by contract that tail WINS over the summary — so the handoff's ``## Blocked`` /
+  ``## Active State`` lag exactly the exchange where work usually finishes. The morning brief reads
+  those sections, so the scheduled run lets its one summarizer call see the retained tail as
+  reference (``reconcile_handoff_with_tail``); otherwise the brief reports a blocker the final
+  exchange already resolved. The tail stays verbatim; its last assistant text is ``latest_reply``.
 """
 
 from __future__ import annotations
@@ -67,6 +73,13 @@ _OPEN_THREAD_HEADINGS = ("Blocked", "Active Task", "Active State", "Historical T
 _LEARNING_HEADINGS = ("Key Decisions", "Errors & Fixes", "Constraints & Preferences")
 MAX_HIGHLIGHTS = 3
 MAX_HIGHLIGHT_CHARS = 160
+#: Brief sections, each read from ONE handoff heading so a consumer knows what a line is: an open
+#: item is something the handoff lists as blocked, never an Active State fact relabelled.
+MAX_OPEN_ITEMS = 4
+MAX_CORRECTIONS = 3
+MAX_LATEST_REPLY_CHARS = 280
+_ACTIVE_TASK_RE = re.compile(r"^\*{0,2}active task:?\*{0,2}:?\s*", re.IGNORECASE)
+
 
 _STATUS_APPLIED = "applied"
 _STATUS_ALREADY = "already_applied"
@@ -119,22 +132,48 @@ def session_ref(session_key: str) -> str:
 # Handoff highlights (bounded projection of the summary the compressor wrote)
 # ---------------------------------------------------------------------------
 
-def _summary_text(messages: Any) -> str:
-    """Text of the LAST compaction-handoff message in *messages*, or ""."""
+def _message_text(message: Any) -> str:
+    content = message.get("content") if isinstance(message, dict) else message
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            part.get("text", "") for part in content
+            if isinstance(part, dict) and isinstance(part.get("text"), str))
+    return ""
+
+
+def _last_summary_index(messages: Any) -> Optional[int]:
+    """Index of the LAST compaction-handoff message in *messages*, or None."""
     from agent.context_compressor import is_compaction_summary_message
 
     if not isinstance(messages, list):
-        return ""
-    for message in reversed(messages):
-        if not is_compaction_summary_message(message):
+        return None
+    for index in range(len(messages) - 1, -1, -1):
+        if is_compaction_summary_message(messages[index]):
+            return index
+    return None
+
+
+def _clip(text: str, limit: int) -> str:
+    """*text* cut at a word boundary to at most *limit* characters, with an ellipsis when cut."""
+    text = " ".join(text.split())
+    if len(text) <= limit:
+        return text
+    cut = text[:limit - 1].rsplit(" ", 1)[0]
+    return cut.rstrip(" ,;:-") + "…"
+
+
+def _latest_reply(messages: Any, after: int) -> str:
+    """The newest assistant text retained verbatim after the handoff — the conversation's own last
+    word, which by the compressor's contract supersedes the summary. First two sentences, clipped."""
+    for message in reversed(messages[after + 1:]):
+        if not isinstance(message, dict) or message.get("role") != "assistant":
             continue
-        content = message.get("content") if isinstance(message, dict) else message
-        if isinstance(content, str):
-            return content
-        if isinstance(content, list):
-            return "\n".join(
-                part.get("text", "") for part in content
-                if isinstance(part, dict) and isinstance(part.get("text"), str))
+        text = " ".join(_message_text(message).split())
+        if text:
+            sentences = re.split(r"(?<=[.!?])\s+", text)
+            return _clip(" ".join(sentences[:2]), MAX_LATEST_REPLY_CHARS)
     return ""
 
 
@@ -162,14 +201,46 @@ def _bullets(body: str) -> List[str]:
     return lines
 
 
-def handoff_highlights(messages: Any) -> Dict[str, List[str]]:
-    """``{"open_threads": [...], "learnings": [...]}`` from the handoff summary, or ``{}``.
+def _top_level_bullets(body: str, limit: int) -> List[str]:
+    """Up to *limit* top-level list items of one section body. Nested sub-bullets are detail of the
+    item above them, not items of their own."""
+    items: List[str] = []
+    for raw in (body or "").splitlines():
+        match = re.match(r"^(?:[-*•]|\d+[.)])\s+(.*)$", raw)
+        if not match:
+            continue
+        item = match.group(1).strip().rstrip(":").strip()
+        if not item or item.lower() in {"none", "n/a", "none.", "(none)"} or item.startswith("["):
+            continue
+        items.append(_clip(item, MAX_HIGHLIGHT_CHARS))
+        if len(items) >= limit:
+            break
+    return items
 
-    Derived from the compaction summary only — the first heading in each group that actually has
-    content wins, so a summary whose ``## Blocked`` is empty falls through to ``## Active State``
-    rather than reporting an empty bullet.
+
+def _active_task(sections: Dict[str, str]) -> str:
+    """The handoff's own statement of the current task: ``## Active Task`` when the template has
+    it, else the ``Active task:`` line the lean template writes under ``## Active State``."""
+    for item in _top_level_bullets(sections.get("Active Task", ""), 1):
+        return item
+    for raw in (sections.get("Active State") or "").splitlines():
+        line = raw.strip().lstrip("-*•").strip()
+        if _ACTIVE_TASK_RE.match(line):
+            return _clip(_ACTIVE_TASK_RE.sub("", line), MAX_HIGHLIGHT_CHARS)
+    return ""
+
+
+def handoff_highlights(messages: Any) -> Dict[str, List[str]]:
+    """Bounded projection of the handoff the compressor wrote, plus the retained final reply.
+
+    ``open_threads``/``learnings``: the first heading in each group that actually has content wins,
+    so a summary whose ``## Blocked`` is empty falls through to ``## Active State`` rather than
+    reporting an empty bullet. The brief sections each come from exactly one heading:
+    ``active_task``, ``open_items`` (``## Blocked``), ``corrections`` (``## Errors & Fixes``), and
+    ``latest_reply`` — the newest assistant text after the handoff, which the summary cannot reflect.
     """
-    sections = _sections(_summary_text(messages))
+    index = _last_summary_index(messages)
+    sections = _sections(_message_text(messages[index])) if index is not None else {}
     if not sections:
         return {}
     out: Dict[str, List[str]] = {}
@@ -179,7 +250,30 @@ def handoff_highlights(messages: Any) -> Dict[str, List[str]]:
             if bullets:
                 out[name] = bullets
                 break
+    brief = {
+        "active_task": [t for t in (_active_task(sections),) if t],
+        "open_items": _top_level_bullets(sections.get("Blocked", ""), MAX_OPEN_ITEMS),
+        "corrections": _top_level_bullets(sections.get("Errors & Fixes", ""), MAX_CORRECTIONS),
+        "latest_reply": [t for t in (_latest_reply(messages, index),) if t],
+    }
+    out.update({name: items for name, items in brief.items() if items})
     return out
+
+
+def reconcile_handoff_with_tail(compressor: Any) -> bool:
+    """Let *compressor*'s summarizer see the verbatim tail so the handoff's state sections reflect
+    it; False if it is not the built-in ``ContextCompressor`` (a plugin context engine keeps its own
+    summary policy).
+
+    Only ever applied to the throwaway agent a scheduled compression builds, so no live agent's
+    compression changes. Same single summarizer call; the tail is added to its input, not summarized.
+    """
+    from agent.context_compressor import ContextCompressor
+
+    if not isinstance(compressor, ContextCompressor):
+        return False
+    compressor.reconcile_with_retained_tail = True
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -478,7 +572,7 @@ async def _compress_reserved_entry(runner: Any, entry: Any, row: Dict[str, Any],
 
     with runner._profile_scope_for_source(entry.origin):
         outcome = await runner._run_manual_compression(
-            entry.origin, entry, history, parse_compress_args(""))
+            entry.origin, entry, history, parse_compress_args(""), reconcile=True)
     # ``compress_now`` answering ``compressed`` is NOT proof of a rewrite: the compressor refuses a
     # candidate that would GROW the transcript, and a caught persistence failure restores the
     # original — both leave the id unrotated with nothing committed (#44794). Only an explicit

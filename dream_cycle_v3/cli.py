@@ -23,6 +23,7 @@ from .carry_forward import CarryForwardPolicy, run_carry_forward
 from .collect import CollectionBounds, collect_to_manifest
 from .context_health import audit_context_health, write_context_health
 from .contracts import parse_iso_datetime, require_valid
+from .daily_brief import render_daily_brief
 from .daily_compression import read_daily_compression
 from .dry_run import execute_dry_run
 from .errors import DreamCycleError, RootResolutionError
@@ -248,11 +249,21 @@ def cmd_run(args: argparse.Namespace) -> int:
         **_cycle_source_kwargs(args),
     )
     result = run_cycle(config)
-    if result.ok:
-        print(result.status_line)
+    if not result.ok:
+        print(result.status_line, file=sys.stderr)
+        return 1
+    if args.output == "brief":
+        # THIS attempt's conversation record: on a retry the publish-once cycle report still
+        # carries the first attempt's section.
+        conversation = result.report.get("conversation_compression")
+        if result.conversation_attempt_path is not None:
+            conversation = json.loads(
+                result.conversation_attempt_path.read_text(encoding="utf-8"))
+        print(render_daily_brief(result.report, conversation))
+        print(result.status_line, file=sys.stderr)
         return 0
-    print(result.status_line, file=sys.stderr)
-    return 1
+    print(result.status_line)
+    return 0
 
 
 def cmd_historical_replay(args: argparse.Namespace) -> int:
@@ -577,6 +588,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="control-socket home of the gateway serving this "
                         "profile; default probes the profile home then the "
                         "default home")
+    p.add_argument("--output", choices=("status", "brief"), default="status",
+                   help="stdout on success: the one machine status line, or "
+                        "the human daily brief (the status line then goes to "
+                        "stderr)")
     p.set_defaults(func=cmd_run)
 
     replay_description = (

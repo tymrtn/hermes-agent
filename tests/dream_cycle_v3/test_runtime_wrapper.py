@@ -1,8 +1,9 @@
 """Phase 4 no-agent wrapper script (scripts/dream_cycle_v3_run.sh).
 
-Thin, tracked, deterministic: env vars/arguments in, one concise line on
-success, nonzero with a concise safe message on failure. No LLM calls, no
-credentials, no gateway restart.
+Thin, tracked, deterministic: env vars/arguments in, the human daily brief on
+success (the machine status line on stderr, or alone on stdout with
+DC3_OUTPUT=status), nonzero with a concise safe message on failure. No LLM
+calls, no credentials, no gateway restart.
 """
 import os
 import shutil
@@ -72,8 +73,19 @@ def test_wrapper_is_tracked_and_executable():
     assert SCRIPT.stat().st_mode & stat.S_IXUSR
 
 
-def test_wrapper_success_prints_one_concise_line(wrapper_env):
+def test_wrapper_success_delivers_the_brief_not_run_metrics(wrapper_env):
+    """Default stdout is what a no-agent cron job sends to chat: orientation, never counters."""
     proc = run_wrapper(wrapper_env)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.startswith("🌙 **Nagatha-test · Dream Cycle**")
+    for machine in ("dream-cycle-v3 cycle", "sources=", "excluded=", "report=", "{"):
+        assert machine not in proc.stdout
+    assert "🗜️ **Compression** not requested by this job" in proc.stdout
+    assert proc.stderr.startswith("dream-cycle-v3 cycle ok mode=shadow ")
+
+
+def test_wrapper_status_output_prints_one_concise_line(wrapper_env):
+    proc = run_wrapper({**wrapper_env, "DC3_OUTPUT": "status"})
     assert proc.returncode == 0, proc.stderr
     assert proc.stdout.count("\n") == 1
     assert proc.stdout.startswith("dream-cycle-v3 cycle ok mode=shadow ")

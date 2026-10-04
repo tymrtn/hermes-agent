@@ -3526,6 +3526,7 @@ Use this exact structure:
 
 {_template_sections}"""
 
+        prompt += self._retained_tail_prompt_block()
         # Focus guidance goes last so it takes precedence.
         if focus_topic:
             prompt += f"""

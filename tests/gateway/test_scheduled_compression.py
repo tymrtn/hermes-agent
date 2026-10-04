@@ -402,6 +402,60 @@ def test_no_handoff_means_no_highlights():
     assert handoff_highlights(None) == {}
 
 
+def test_brief_sections_each_come_from_one_heading_plus_the_retained_final_reply():
+    summary = FIXTURE_SUMMARY.replace(
+        "- Waiting on the maintainer's review of the control verb",
+        "- **Active task:** Wire the brief into the nightly job\n- Branch: fix/brief",
+    ).replace(
+        "- Live activation still needs the owner's authority",
+        "- Mail tool cannot start without a token:\n  - probe exited 1\n- Disk keeps filling",
+    )
+    messages = [{"role": "user", "content": "hello"},
+                {"role": "assistant", "content": summary, "display_kind": "compaction_summary"},
+                {"role": "user", "content": "enable it"},
+                {"role": "assistant", "content": "Mail tool verified. Connector pending. Extra."},
+                {"role": "assistant", "content": "", "tool_calls": [{"id": "t1"}]}]
+    with patch("agent.context_compressor.is_compaction_summary_message",
+               side_effect=lambda m: isinstance(m, dict) and m.get("display_kind") == "compaction_summary"):
+        highlights = handoff_highlights(messages)
+
+    assert highlights["active_task"] == ["Wire the brief into the nightly job"]
+    # Top-level items only: the nested probe line is detail of the item above it.
+    assert highlights["open_items"] == ["Mail tool cannot start without a token", "Disk keeps filling"]
+    assert highlights["corrections"][0].startswith("Receipt claimed compression")
+    # The newest assistant TEXT after the handoff (a tool-call stub has none), two sentences.
+    assert highlights["latest_reply"] == ["Mail tool verified. Connector pending."]
+
+
+def test_scheduled_summary_sees_the_retained_tail_and_manual_compress_does_not(live):
+    """The tail keeps the final exchange verbatim and wins over the summary, so a nightly handoff
+    whose state sections never saw it reports blockers that exchange resolved. The scheduled run's
+    single summarizer call carries the tail as reference; a manual /compress is unchanged; the tail
+    itself stays verbatim either way."""
+    from agent.conversation_compression_manual import parse_compress_args
+
+    config, store, _home = live
+    history = _history()
+    history[-1] = {"role": "assistant", "content": "RESOLVED-IN-FINAL-EXCHANGE: token installed."}
+    nightly = _seed(store, _source(chat_id="nightly"), list(history))
+    manual = _seed(store, _source(chat_id="manual"), list(history))
+    runner = _runner(config, store)
+
+    with _real_compression(runner) as llm:
+        assert _run_cycle(runner, session_keys=[nightly.session_key])["counts"] == {"applied": 1}
+        nightly_prompt = llm.call_args.args[0]
+        asyncio.run(runner._run_manual_compression(manual.origin, manual, list(history),
+                                                   parse_compress_args("")))
+        manual_prompt = llm.call_args.args[0]
+
+    reference = nightly_prompt.split("NEWER TURNS KEPT VERBATIM AFTER THIS SUMMARY", 1)
+    assert len(reference) == 2 and "RESOLVED-IN-FINAL-EXCHANGE" in reference[1]
+    assert "NEWER TURNS KEPT VERBATIM" not in manual_prompt
+    assert "RESOLVED-IN-FINAL-EXCHANGE" not in manual_prompt
+    continuation = store.load_transcript(store.lookup_by_session_key(nightly.session_key).session_id)
+    assert continuation[-1]["content"] == "RESOLVED-IN-FINAL-EXCHANGE: token installed."
+
+
 # ---------------------------------------------------------------------------
 # The control-socket wire: the exact payload the nightly cycle sends
 # ---------------------------------------------------------------------------

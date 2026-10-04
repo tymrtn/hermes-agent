@@ -91,7 +91,12 @@ the routing entry's metadata for per-cycle idempotence; and it reports `applied`
 COMMIT (`_persist_manual_compression` returning True) plus before/after evidence — `compress_now`
 answering `compressed` covers a refused would-grow candidate and a rolled-back persistence failure,
 both of which must stay retryable. It binds scope through `_profile_scope_for_source` like every
-other standalone entry point (see § Profile scope).
+other standalone entry point (see § Profile scope). Its throwaway agent's summarizer also sees the
+verbatim tail as reference (`reconcile_handoff_with_tail`): the tail always holds the final exchange
+and wins over the summary, so without it the handoff's `## Blocked` — which the nightly brief reads
+— lists what that exchange already resolved. The returned highlights carry one-heading brief
+sections plus `latest_reply`; the cron job renders them deterministically (`dream_cycle_v3/
+daily_brief.py`), never through a second model pass.
 
 ## Background process notifications
 
