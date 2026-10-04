@@ -18,12 +18,15 @@ Follows `20261002-real-conversation-compression-activation.md`.
   its throwaway agent's compressor. The single summarizer call also receives the verbatim tail as
   reference, and the prompt tells it to write `## Active State` / `## Blocked` as of the end of
   that tail. There is no extra call and no change to manual `/compress` or auto-compression. The
-  tail stays verbatim. Highlights gain one-heading brief sections (`active_task`, `open_items`,
+  tail stays verbatim. The reference is delimited and capped at 40,000 characters, keeping the
+  newest end, and any echo of it is cut from the summary before it is persisted or reused. Highlights gain one-heading brief sections (`active_task`, `open_items`,
   `corrections`) plus `latest_reply`, the newest assistant text the handoff retained.
 - `dream_cycle_v3/daily_brief.py`: renders the brief from the cycle report and this attempt's
-  conversation record. It adds no model call, invents no thread IDs or priorities, and emits no
-  counters, paths or JSON. The compression line states only what the record proves (applied with
-  before/after figures, already applied, deferred with reason, unavailable, failed, not requested).
+  conversation record. It adds no model call and invents no thread IDs or priorities. Every recorded
+  string passes the shared sanitizers plus a presentation filter, so run counters, internal paths,
+  run/session identifiers and JSON stay out. The compression line states only what the record
+  proves: applied with before/after figures, already applied, deferred with reason, unavailable (no
+  gateway confirmed an outcome), failed, or not requested.
 - `dream_cycle_v3 run --output brief|status`. `scripts/dream_cycle_v3_run.sh` defaults to `brief`.
   The status line goes to stderr, and the JSON reports are unchanged. `DC3_OUTPUT=status` restores
   the old stdout.

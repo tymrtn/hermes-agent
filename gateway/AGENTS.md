@@ -94,7 +94,8 @@ both of which must stay retryable. It binds scope through `_profile_scope_for_so
 other standalone entry point (see § Profile scope). Its throwaway agent's summarizer also sees the
 verbatim tail as reference (`reconcile_handoff_with_tail`): the tail always holds the final exchange
 and wins over the summary, so without it the handoff's `## Blocked` — which the nightly brief reads
-— lists what that exchange already resolved. The returned highlights carry one-heading brief
+— lists what that exchange already resolved. The reference is delimited, capped on its own small
+budget (newest end kept), and any echo of it is cut before the handoff is stored. The returned highlights carry one-heading brief
 sections plus `latest_reply`; the cron job renders them deterministically (`dream_cycle_v3/
 daily_brief.py`), never through a second model pass.
 

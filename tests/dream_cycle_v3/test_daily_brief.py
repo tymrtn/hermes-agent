@@ -64,7 +64,7 @@ def test_applied_brief_is_orientation_not_machine_output():
     (None, "not requested by this job"),
     ({"enabled": False}, "not requested by this job"),
     ({"enabled": True, "claim": "unavailable", "reason": "no gateway answered"},
-     "unavailable — no gateway answered; nothing was rewritten"),
+     "unavailable — no gateway confirmed an outcome"),
     ({"enabled": True, "claim": "deferred",
       "sessions": [{"status": "deferred", "reason": "turn_running"}]},
      "deferred — a turn was running; nothing was rewritten"),
@@ -80,6 +80,7 @@ def test_receipt_claims_only_what_the_record_proves(conversation, expected):
     receipt = compression_receipt(conversation)
     assert expected in receipt
     assert "applied ·" not in receipt
+    assert "nothing was rewritten" not in receipt or conversation.get("claim") == "deferred"
 
 
 def test_handoff_sections_render_only_for_an_applied_compression():
@@ -123,3 +124,30 @@ def test_registered_thread_appears_only_when_its_state_changed():
     assert "`reg-thread-b` — active → stale (routed to review)" in brief
     assert "reg-thread-a" not in brief
     assert "reg-thread-a" not in render_daily_brief(_report(), {"enabled": False})
+
+
+def test_every_recorded_string_is_sanitized_and_machine_detail_stays_internal():
+    """Identifiers, handoff lines and reasons all cross the shared sanitizers at the render boundary;
+    paths, run/session handles, counters and JSON never reach the delivered brief."""
+    secret_id = "sk-" + "A1b2C3d4E5f6G7h8I9j0K1l2"
+    report = _report(profile="owner@example.com", cycle_date="not-a-date", carry_forward={"threads": [
+        {"thread_id": secret_id, "action": "stale_review", "state_before": "active",
+         "state_after": "stale"},
+        {"thread_id": "reg-thread-b", "action": "stale_review", "state_before": "active",
+         "state_after": "stale"}]})
+    brief = render_daily_brief(report, _applied({
+        "active_task": ["Ship the fix described in /Users/someone/.hermes/profiles/x/notes/plan.md"],
+        "open_items": ["Mail owner@example.com about the renewal",
+                       "dream-cycle-v3 cycle ok run=abc sources=0 excluded=107",
+                       "[1, 2, 3]",
+                       "Session 20261004_063224_9e4976 run 0123456789abcdef0123 stalled"],
+        "latest_reply": ["Docs are at https://example.com/a/b/c and the fix is verified."]}))
+
+    assert brief.splitlines()[0] == "🌙 **Dream Cycle**"
+    assert "Mail [email_redacted] about the renewal" in brief
+    assert "Ship the fix described in plan.md" in brief
+    assert "https://example.com/a/b/c" in brief
+    assert "`reg-thread-b` — active → stale" in brief
+    for leaked in ("owner@example.com", secret_id, "/Users/", "sources=", "excluded=", "[1, 2, 3]",
+                   "20261004_063224_9e4976", "0123456789abcdef0123", "not-a-date", "[privacy_withheld]"):
+        assert leaked not in brief

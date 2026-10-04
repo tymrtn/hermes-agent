@@ -456,6 +456,40 @@ def test_scheduled_summary_sees_the_retained_tail_and_manual_compress_does_not(l
     assert continuation[-1]["content"] == "RESOLVED-IN-FINAL-EXCHANGE: token installed."
 
 
+def test_an_echoed_tail_reference_never_reaches_the_persisted_handoff(live):
+    """The reference rides on top of the bounded middle with its own small budget, keeping the END
+    of the tail; a summarizer that echoes it back gets the echo cut before the handoff is persisted
+    or kept as the previous summary the next update builds on."""
+    import agent.context_compressor_summary as summary_mixin
+
+    config, store, _home = live
+    history = _history()
+    history[-2] = {"role": "user", "content": "EARLY-TAIL " + "x" * 2_000}
+    history[-1] = {"role": "assistant", "content": "RESOLVED-IN-FINAL-EXCHANGE: token installed."}
+    entry = _seed(store, _source(), list(history))
+    runner = _runner(config, store)
+    seen = {}
+
+    def _echoing_summarizer(prompt, *_a, **_k):
+        seen["prompt"] = prompt
+        echo = prompt[prompt.index("NEWER TURNS KEPT VERBATIM"):]
+        return FIXTURE_SUMMARY + "\n\n" + echo
+
+    with _real_compression(runner) as llm, patch.object(summary_mixin, "_RETAINED_TAIL_MAX_CHARS", 300):
+        llm.side_effect = _echoing_summarizer
+        assert _run_cycle(runner, session_keys=[entry.session_key])["counts"] == {"applied": 1}
+
+    reference = seen["prompt"].split("<retained-tail-reference>", 1)[1].split("</retained-tail-reference>")[0]
+    assert "RESOLVED-IN-FINAL-EXCHANGE" in reference and "EARLY-TAIL" not in reference
+    assert len(reference) < 300 + 100
+    continuation = store.load_transcript(store.lookup_by_session_key(entry.session_key).session_id)
+    handoff = "\n".join(str(m.get("content")) for m in continuation[:-2])
+    assert FIXTURE_SUMMARY.splitlines()[0] in handoff
+    assert "retained-tail-reference" not in handoff and "NEWER TURNS KEPT VERBATIM" not in handoff
+    assert "RESOLVED-IN-FINAL-EXCHANGE" not in handoff
+    assert continuation[-1]["content"] == "RESOLVED-IN-FINAL-EXCHANGE: token installed."
+
+
 # ---------------------------------------------------------------------------
 # The control-socket wire: the exact payload the nightly cycle sends
 # ---------------------------------------------------------------------------

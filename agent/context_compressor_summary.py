@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import re
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from agent.auxiliary_client import AuxiliaryExplicitCancellation
@@ -16,12 +17,36 @@ if TYPE_CHECKING:
 # sections lag exactly the exchange where work usually finishes, and a consumer reading them alone
 # reports blockers that exchange already resolved. The summarizer sees the tail as reference so
 # those sections reflect it; the tail itself is neither summarized nor removed.
+_RETAINED_TAIL_OPEN, _RETAINED_TAIL_CLOSE = "<retained-tail-reference>", "</retained-tail-reference>"
 _RETAINED_TAIL_BLOCK = """
 
 NEWER TURNS KEPT VERBATIM AFTER THIS SUMMARY (reference only; do not summarize or repeat them):
+""" + _RETAINED_TAIL_OPEN + """
 {tail}
+""" + _RETAINED_TAIL_CLOSE + """
 
 These turns are newer than everything above. Write "## Active State", "## Blocked" and any "## Active Task" as of the END of these turns: drop blockers they resolve and do not list as open anything they show as done."""
+# The reference rides on top of the already-bounded middle and previous summary, so it gets a small
+# budget of its own; the END of the tail is what the state sections must reflect.
+_RETAINED_TAIL_MAX_CHARS = 40_000
+# An echoed reference is a duplicate of the tail that would be persisted and fed into the next
+# iterative update, so it is cut from the summary before anything stores it.
+_RETAINED_TAIL_ECHO_RE = re.compile(
+    r"[^\n]*NEWER TURNS KEPT VERBATIM AFTER THIS SUMMARY[^\n]*\n?"
+    r"|" + re.escape(_RETAINED_TAIL_OPEN) + r".*?(?:" + re.escape(_RETAINED_TAIL_CLOSE) + r"|\Z)",
+    re.DOTALL)
+
+
+def _bound_retained_tail(text: str) -> str:
+    if len(text) <= _RETAINED_TAIL_MAX_CHARS:
+        return text
+    return "[earlier retained turns omitted]\n" + text[-_RETAINED_TAIL_MAX_CHARS:].lstrip()
+
+
+def _strip_retained_tail_echo(text: Optional[str]) -> Optional[str]:
+    if not text or (_RETAINED_TAIL_OPEN not in text and "NEWER TURNS KEPT VERBATIM" not in text):
+        return text
+    return _RETAINED_TAIL_ECHO_RE.sub("", text).strip()
 
 
 def _accepts_keyword_argument(callable_obj: Any, name: str) -> bool:
@@ -67,9 +92,13 @@ class SummaryDispatchMixin:
         # Held for the whole call so the main-model retry inside _generate_summary sees it too.
         retained_tail = messages[scan.tail_start:] if getattr(self, "reconcile_with_retained_tail", False) else []
         self._retained_tail_reference = (
-            self._bound_summary_input(self._serialize_for_summary(retained_tail)) if retained_tail else "")
+            _bound_retained_tail(self._serialize_for_summary(retained_tail)) if retained_tail else "")
         try:
-            return self._generate_summary(turns_to_summarize, **summary_kwargs)
+            summary = self._generate_summary(turns_to_summarize, **summary_kwargs)
+            if retained_tail:
+                summary = _strip_retained_tail_echo(summary)
+                self._previous_summary = _strip_retained_tail_echo(self._previous_summary)
+            return summary
         except AuxiliaryExplicitCancellation:
             # Cancellation is a true no-op: restore the scan's mutation before the exception escapes.
             self._previous_summary = scan.previous_summary_before
