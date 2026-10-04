@@ -71,11 +71,13 @@ Never reimplement it caller-side — an offline `state.db` rewrite desyncs the c
 **RESERVES** the conversation before reading its history — the pending-sentinel turn slot (the
 predicate `_is_session_running` the inbound admission gate reads), a fresh run generation and the
 per-session_id turn lease — so inbound waits behind it instead of running a turn against a
-transcript about to be rotated away. A reservation has no turn behind it, so it carries
+transcript about to be rotated away. A turn still holding its turn lease counts as running even
+after `_run_agent` freed its slot: the outer handler has not yet delivered and persisted the reply,
+and a claim there would make that turn drop its reply as stale. A reservation has no turn behind it, so it carries
 `turn.reservation`: inbound **parks its task** on that event (`_hm_park_on_turn_reservation`) rather
 than queueing into the adapter's pending slot, which nothing would drain and whose in-band drain
-re-dispatched the parked event in a tight loop; slash commands still dispatch, so `/stop` stays the
-escape hatch, and every slot release (`TurnState.clear`) sets the event. The SLOT release is
+re-dispatched the parked event in a tight loop; commands the registry resolves still dispatch, so
+`/stop` stays the escape hatch (skill and unknown slash prompts park like text), and every slot release (`TurnState.clear`) sets the event. The SLOT release is
 GENERATION-GUARDED (a `/stop` mid-flight plus a successor turn is the case an unconditional release
 broke, clearing a live turn's slot), but the MUTATION LEASE is not part of that handoff: its token
 is held privately on the reservation, outside `turn.lease_tokens`, because `_drop_turn_slot` sweeps

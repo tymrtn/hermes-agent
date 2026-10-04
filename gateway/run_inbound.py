@@ -715,7 +715,12 @@ class GatewayInboundMixin:
         by a RESERVATION instead of a turn parks the task (see ``_hm_park_on_turn_reservation``);
         slash commands still dispatch per their busy policy, so /stop stays the escape hatch."""
         from gateway.run import _AGENT_PENDING_SENTINEL
-        _reservation = self._hm_turn_reservation(_quick_key) if not event.get_command() else None
+        # Only commands the busy path dispatches itself skip the park; a skill or unknown slash
+        # prompt is a turn, and queueing it into a reservation-held slot loops the adapter's drain.
+        from hermes_cli.commands import resolve_command
+        _command = event.get_command()
+        _reservation = (None if _command and resolve_command(_command)
+                        else self._hm_turn_reservation(_quick_key))
         if _reservation is not None:
             return await self._hm_park_on_turn_reservation(_quick_key, _reservation)
         _handled, _result = await self._hm_busy_slash_or_photo(event, source, _quick_key)

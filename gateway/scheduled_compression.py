@@ -387,6 +387,13 @@ def _claim_turn_slot(runner: Any, session_key: str) -> Optional[_Reservation]:
 
     if runner._is_session_running(session_key):
         return None
+    # A turn frees its running slot when the agent returns, but holds its turn lease until the
+    # outer handler has shaped, delivered and persisted the reply. Claiming in that gap would bump
+    # the generation under it (the turn then drops its reply as stale) and the turn's unconditional
+    # cleanup would clear this reservation, so a held lease is a running turn here.
+    peeked = runner._peek_session_state(session_key)
+    if peeked is not None and peeked.turn.lease_tokens:
+        return None
     state = runner._session_state(session_key)
     state.turn.agent = _AGENT_PENDING_SENTINEL
     state.turn.started_ts = time.time()

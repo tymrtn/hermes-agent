@@ -789,7 +789,7 @@ class _NoTransportAdapter(BasePlatformAdapter):  # type: ignore[misc]
         return None
 
     async def send(self, *args, **kwargs):
-        self.sent.append(args[1] if len(args) > 1 else kwargs.get("text"))
+        self.sent.append(args[1] if len(args) > 1 else kwargs.get("content", kwargs.get("text")))
         return SendResult(success=True, message_id="m1")
 
 
@@ -1012,10 +1012,15 @@ def test_cancelling_the_cycle_holds_the_lease_until_the_worker_really_stops(tmp_
     assert any(is_compaction_summary_message(m) for m in continuation)
 
 
-def test_inbound_parks_on_the_reservation_instead_of_redispatching(live):
+@pytest.mark.parametrize("text, runs_turn", [("anything still open?", True),
+                                              ("/not-a-gateway-command keep going", False)])
+def test_inbound_parks_on_the_reservation_instead_of_redispatching(live, text, runs_turn):
     """One message arriving mid-reservation, through the REAL adapter dispatch. Queueing it was the
     defect: a reservation has no turn behind it, so the adapter's in-band drain re-dispatched the same
-    event in a tight loop. It must park once and then run exactly one turn."""
+    event in a tight loop. It must park once and then be handled exactly once. A slash prompt the
+    gateway does not register (a skill, a typo) is not a command the busy path dispatches, so it
+    parks like text and only afterwards gets its ordinary handling (an unknown one is answered with
+    the unknown-command notice); only commands the busy path dispatches itself skip the park."""
     config, store, _home = live
     entry = _seed(store, _source(), _history())
     runner = _runner(config, store)
@@ -1027,15 +1032,15 @@ def test_inbound_parks_on_the_reservation_instead_of_redispatching(live):
         task = asyncio.create_task(run_scheduled_compression(
             runner, profile=PROFILE, cycle_id=CYCLE))
         assert await asyncio.to_thread(started.wait, 20), "compression never reached the summarizer"
-        event = MessageEvent(text="anything still open?", message_type=MessageType.TEXT,
-                             source=_source())
+        event = MessageEvent(text=text, message_type=MessageType.TEXT, source=_source())
         assert adapter._start_session_processing(event, entry.session_key) is True
         await asyncio.sleep(0.25)  # long enough for a redispatch loop to show thousands of passes
         parked = {"dispatches": len(dispatches), "turns": list(turns),
                   "pending": dict(adapter._pending_messages)}
         release.set()
         result = await task
-        assert await _await_until(lambda: bool(turns)), "the parked message never ran its turn"
+        assert await _await_until(lambda: bool(turns) or bool(adapter.sent)), \
+            "the parked message was never handled"
         await asyncio.gather(*list(adapter._background_tasks), return_exceptions=True)
         return parked, result
 
@@ -1047,10 +1052,40 @@ def test_inbound_parks_on_the_reservation_instead_of_redispatching(live):
         f"the message was re-dispatched {parked['dispatches']} times during the reservation"
     assert parked["turns"] == [], "a turn ran against the transcript being compressed"
     assert parked["pending"] == {}, "the event was queued into a slot nothing would drain"
-    # Released: the same inbound task admits the message as one ordinary turn, nothing duplicated.
-    assert turns == ["anything still open?"]
-    assert dispatches == ["anything still open?"]
+    # Released: the same inbound task handles the message once, nothing duplicated.
+    assert dispatches == [text]
+    if runs_turn:
+        assert turns == [text]
+    else:
+        assert turns == [] and any("Unknown command" in str(sent) for sent in adapter.sent)
     assert result["counts"] == {"applied": 1}, result
+
+
+def test_a_finishing_turn_that_still_holds_its_lease_is_not_superseded(live):
+    """A turn frees its running slot when the agent returns (``_run_agent``'s guarded release) but
+    keeps its turn lease until the outer handler has shaped, delivered and persisted the reply. A
+    reservation claimed in that gap would bump the run generation, so the turn would discard its own
+    reply as stale, and the turn's unconditional cleanup would then clear the reservation's slot. A
+    held turn lease therefore means busy."""
+    config, store, _home = live
+    entry = _seed(store, _source(), _history())
+    runner = _runner(config, store)
+
+    async def _scenario():
+        generation = runner._begin_session_run_generation(entry.session_key)
+        token = await runner._turn_leases.acquire(
+            entry.session_id, owner_key=entry.session_key, generation=generation, timeout=1.0)
+        runner._session_state(entry.session_key).turn.lease_tokens[generation] = token
+        assert runner._is_session_running(entry.session_key) is False
+        return generation, await run_scheduled_compression(runner, profile=PROFILE, cycle_id=CYCLE)
+
+    with _real_compression(runner) as llm:
+        generation, result = asyncio.run(_scenario())
+    assert not llm.called, "the compression summarized a conversation whose turn was still finishing"
+    assert result["counts"] == {"deferred": 1}, result
+    assert result["sessions"][0]["reason"] == "turn_running"
+    assert runner._is_session_run_current(entry.session_key, generation), \
+        "the reservation superseded the finishing turn's generation"
 
 
 def test_stop_during_a_reservation_wakes_the_parked_inbound_at_once(live):
