@@ -26,6 +26,10 @@ EXECUTIONS_FILE: Optional[Path] = None
 MAX_TERMINAL_EXECUTIONS = 1000
 HANDOFF_ADOPTION_GRACE_SECONDS = 30.0
 _TERMINAL_STATES = ("completed", "failed", "unknown")
+# Set in an attached script's environment (``scheduler_script._run_job_script``): the id of the row
+# this run is recorded under, ``delivery_outcome`` included, so the script's next run can ask
+# whether its output reached anyone.
+EXECUTION_ID_ENV = "HERMES_CRON_EXECUTION_ID"
 _lock = threading.RLock()
 _PROCESS_ID = uuid.uuid4().hex
 

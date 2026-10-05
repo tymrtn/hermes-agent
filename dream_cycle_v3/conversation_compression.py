@@ -42,6 +42,8 @@ DEFAULT_TIMEOUT_SECONDS = 300.0
 DEFAULT_LIMIT = 1
 
 HIGHLIGHT_CHARS = 160
+# Room for link markup around a 4-10-word action (``gateway.scheduled_compression.MAX_ACTION_CHARS``).
+ACTION_CHARS = 600
 #: Per-key caps for the handoff projection the gateway returns. ``latest_reply`` is the retained
 #: final assistant text (two sentences), so it gets more room than a bullet.
 HIGHLIGHT_LIMITS = {"open_threads": 3, "learnings": 3, "active_task": 1, "open_items": 4,
@@ -123,7 +125,7 @@ def _thread(raw: Any) -> dict[str, Any] | None:
     if standing == INVALID:
         return None
     thread: dict[str, Any] = {"standing": standing, "state": _text(raw.get("state")),
-                              "next": _text(raw.get("next"))}
+                              "next": _text(raw.get("next"), ACTION_CHARS)}
     if standing == "uncoded":
         thread["title"] = _text(raw.get("title"), 80)
         if not thread["title"]:
@@ -137,7 +139,7 @@ def _thread(raw: Any) -> dict[str, Any] | None:
     dependency = raw.get("dependency")
     if isinstance(dependency, Mapping):
         kind = sanitize_enum(dependency.get("kind"), _DEPENDENCY_KINDS)
-        detail = _text(dependency.get("detail"))
+        detail = _text(dependency.get("detail"), ACTION_CHARS)
         if kind != INVALID and detail:
             thread["dependency"] = {"kind": kind, "detail": detail}
     return thread

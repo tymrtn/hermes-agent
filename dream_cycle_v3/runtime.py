@@ -34,20 +34,22 @@ from dataclasses import dataclass, field
 from datetime import date as date_type
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 from . import CONTRACT_SCHEMA_VERSION
 from .adapters import read_github_issues, read_kanban_board, read_todoist_tasks
 from .canonical import canonical_json, stable_id
 from .carry_forward import CarryForwardPolicy, run_carry_forward
-from .collect import CollectionBounds, collect_to_manifest
-from .context_gate import canonical_digest, decide, last_checkpoint, record_checkpoint
+from .collect import CollectionBounds, collect
+from .context_gate import (Delivery, Poll, canonical_digest, decide, decide_poll, delivery_state,
+                           last_checkpoint, record_checkpoint, record_pending, unresolved_pending)
 from .contracts import is_iso_date, is_iso_datetime, parse_iso_datetime
 from .conversation_compression import (conversation_compression_status,
                                        request_conversation_compression)
 from .daily_compression import compress_day
 from .errors import DreamCycleError, RootResolutionError, RuntimeLockError
 from .lookup import continuity_lookup
+from .manifest import write_manifest
 from .report import build_run_report, create_file_exclusive, write_report
 from .roots import CollectionRoots, prepare_output_root
 from .sanitize import sanitize_text
@@ -256,21 +258,24 @@ class RuntimeConfig:
 
 @dataclass(frozen=True)
 class CycleResult:
-    report: dict[str, Any]
-    report_path: Path
+    #: None when the poll answered and no substantive cycle ran.
+    report: dict[str, Any] | None
+    report_path: Path | None
     status_line: str
     ok: bool
     #: This attempt's own conversation-compression record. The cycle report is publish-once, so on a
     #: retry `report_path` carries the FIRST attempt's section and only this file carries THIS
     #: attempt's outcome. None when conversation compression was not requested.
     conversation_attempt_path: Path | None = None
-    #: The no-new-context gate (``context_gate``): ``new``, ``unchanged`` (nothing to deliver) or
-    #: ``unsettled`` (the conversation's state is unknown; deliver, never checkpoint).
+    #: The no-new-context gate (``context_gate``): ``new``, ``unchanged`` (nothing to deliver),
+    #: ``in_flight`` (the last output is still queued for delivery), ``redelivered`` (the last output
+    #: never arrived and nothing changed, so it was written again) or ``unsettled`` (the
+    #: conversation's state is unknown; deliver, never checkpoint).
     context: str = "new"
 
     @property
     def skipped(self) -> bool:
-        return self.context == "unchanged"
+        return self.context in ("unchanged", "in_flight")
 
 
 @dataclass(frozen=True)
@@ -503,7 +508,8 @@ def _registered_threads(store: ContinuityStore) -> dict[str, Any]:
 
 
 def _status_line(report: dict[str, Any], report_path: Path, ok: bool, *,
-                 conversation_attempt_path: Path | None = None, context: str = "new") -> str:
+                 conversation_attempt_path: Path | None = None, context: str = "new",
+                 trigger: str | None = None) -> str:
     if not ok:
         return (f"dream-cycle-v3 cycle FAIL reason=retrieval_smoke "
                 f"mode={report['mode']} profile={report['profile']} "
@@ -532,6 +538,7 @@ def _status_line(report: dict[str, Any], report_path: Path, ok: bool, *,
             f"receipts={report['invariants']['write_receipts']} "
             f"smoke={smoke_state} continuity={compression_state} "
             f"conversation={conversation_state} context={context} "
+            + (f"trigger={trigger} " if trigger else "")
             + (f"conversation_report={conversation_attempt_path} "
                if conversation_attempt_path is not None else "")
             + f"report={report_path}")
@@ -734,50 +741,82 @@ def _publish_cycle_report_once(store: ContinuityStore, report: dict[str, Any],
 # One daily cycle
 # ---------------------------------------------------------------------------
 
-def run_cycle(config: RuntimeConfig, *, deliver: Callable[[CycleResult], None] | None = None,
-              output: str = "brief") -> CycleResult:
+def run_cycle(config: RuntimeConfig, *, render: Callable[[CycleResult], str] | None = None,
+              emit: Callable[[str], None] | None = None, output: str = "brief",
+              execution_id: str | None = None) -> CycleResult:
     """Execute one deterministic Phase 4 cycle under the single-flight lock.
 
     Collection, store recording, registry/thread upserts, tracker
     snapshots, quarantine-first v2 migration, carry-forward, retrieval
     smoke, machine report. No destination promotion in any mode.
 
-    *deliver* writes out a successful cycle that has new context. It runs under the lock, and the
-    no-new-context checkpoint is recorded only after it returns, so a delivery that raises leaves
-    the next run free to deliver again. *output* names what *deliver* writes (``brief`` or
-    ``status``); each output keeps its own checkpoint.
+    With *emit* (what a cron run writes out) the cycle is gated (``context_gate``): a lightweight
+    poll answers first, and the substantive cycle runs only when something it consumes changed. An
+    unchanged night is silent, or resends the last output when cron never delivered it. *render*
+    turns a cycle into the text *emit* writes; *output* names it (``brief`` or ``status``), and each
+    output keeps its own checkpoint. *execution_id* is the cron run this is
+    (``cron.executions.EXECUTION_ID_ENV``): what is written is recorded as pending under it and
+    becomes the checkpoint only once the ledger says it was delivered. Without *emit* every call
+    runs the full cycle (replay, tests).
     """
     roots = CollectionRoots.resolve(config.profile, dict(config.read_roots))
     v3_root = _prepare_v3_root(config, roots)
 
     with runtime_lock(v3_root):
-        _real_subdir(v3_root, "manifests")
+        manifests_dir = _real_subdir(v3_root, "manifests")
         reports_dir = _real_subdir(v3_root, "reports")
-
-        manifest, manifest_path = collect_to_manifest(
-            roots, v3_root, window_start=config.window_start,
-            window_end=config.window_end, bounds=config.bounds,
-            generated_at=parse_iso_datetime(config.as_of))
-        run_id = manifest["run_id"]
+        deliveries_dir = _real_subdir(v3_root, "deliveries")
         now = config.as_of
 
         db_path = v3_root / "continuity.db"
         assert_store_confined(db_path, v3_root)
         with ContinuityStore(db_path) as store:
             store.migrate(now)
+            registry_entries = (_load_json_list(Path(config.registry_path), "project registry")
+                                if config.registry_path is not None else None)
+            thread_entries = (_load_json_list(Path(config.threads_path), "thread seed")
+                              if config.threads_path is not None else None)
+            trackers = _tracker_results(config)
+            # Read-only: the same selection the cycle ingests, so the poll and the cycle agree on
+            # what tonight's sources are. Written out as a manifest only if the cycle runs.
+            manifest = collect(roots, window_start=config.window_start,
+                               window_end=config.window_end, bounds=config.bounds,
+                               generated_at=parse_iso_datetime(now))
+            sources, fresh = consumed_sources(store, manifest, config.migrate_v2_roots)
+            canonical = canonical_digest(registry=registry_entries, threads=thread_entries,
+                                         trackers=trackers, sources=sources)
+            gate_key = {"profile": config.profile, "mode": config.mode, "output": output}
+
+            poll: Poll | None = None
+            if emit is not None:
+                poll, pending = _poll(config, store, canonical, fresh, gate_key)
+                if poll.action in ("silent", "wait"):
+                    return CycleResult(report=None, report_path=None, ok=True,
+                                       status_line=_poll_line(config, poll),
+                                       context="unchanged" if poll.action == "silent"
+                                       else "in_flight")
+                text = _kept_text(deliveries_dir, pending) if poll.action == "redeliver" else None
+                if text is not None:
+                    emit(text)
+                    if execution_id:
+                        record_pending(store, run_id=pending.run_id, cycle_date=pending.cycle_date,
+                                       fingerprint=pending.fingerprint, execution_id=execution_id,
+                                       text_sha256=pending.text_sha256, **gate_key)
+                    return CycleResult(report=None, report_path=None, ok=True,
+                                       status_line=_poll_line(config, poll), context="redelivered")
+                if poll.action == "redeliver":
+                    # The undelivered output is gone from disk: build it again.
+                    poll = Poll("cycle", "undelivered_missing", poll.fingerprint)
+
+            manifest_path = write_manifest(manifest, manifests_dir)
+            run_id = manifest["run_id"]
             store.record_run(manifest, str(manifest_path), now)
 
             registry_outcomes: dict[str, int] = {}
-            registry_entries = None
-            if config.registry_path is not None:
-                registry_entries = _load_json_list(Path(config.registry_path),
-                                                   "project registry")
-                for entry in registry_entries:
-                    _bump(registry_outcomes,
-                          store.upsert_project(entry, now, run_id=run_id))
+            for entry in registry_entries or ():
+                _bump(registry_outcomes, store.upsert_project(entry, now, run_id=run_id))
 
             tracker_rows = []
-            trackers = _tracker_results(config)
             for result in trackers:
                 store.record_adapter_snapshot(
                     run_id=run_id, adapter=result.adapter,
@@ -792,13 +831,8 @@ def run_cycle(config: RuntimeConfig, *, deliver: Callable[[CycleResult], None] |
                 })
 
             thread_outcomes: dict[str, int] = {"inserted": 0, "exists": 0}
-            thread_entries = None
-            if config.threads_path is not None:
-                thread_entries = _load_json_list(Path(config.threads_path),
-                                                 "thread seed")
-                for thread in thread_entries:
-                    _bump(thread_outcomes,
-                          store.open_thread(thread, now, run_id=run_id))
+            for thread in thread_entries or ():
+                _bump(thread_outcomes, store.open_thread(thread, now, run_id=run_id))
 
             migration_outcomes: dict[str, int] = {}
             for source in manifest["sources"]:
@@ -860,14 +894,14 @@ def run_cycle(config: RuntimeConfig, *, deliver: Callable[[CycleResult], None] |
             else:
                 conversation_report = {"enabled": False}
 
-            # Read-only, under the lock: has anything the brief reads changed since the last brief
-            # that went out? The store pass above still ran — collection is windowed, and skipping
-            # it would drop this window's sources — but it makes no model call.
-            gate = decide(conversation_report,
-                          canonical_digest(registry=registry_entries, threads=thread_entries,
-                                           trackers=trackers),
-                          last_checkpoint(store, profile=config.profile, mode=config.mode,
-                                          output=output))
+            # After the cycle: does its output carry anything a reader was not already sent? (The
+            # poll can say "cycle" on a conversation it could not pin down that turns out unchanged.)
+            # The sources as the store now holds them: one the cycle could not ingest is not news.
+            canonical = canonical_digest(
+                registry=registry_entries, threads=thread_entries, trackers=trackers,
+                sources=consumed_sources(store, {"sources": []}, config.migrate_v2_roots)[0])
+            gate = decide(conversation_report, canonical, last_checkpoint(store, **gate_key),
+                          undelivered=poll is not None and poll.reason == "undelivered_missing")
 
             if config.smoke_configured:
                 smoke = _retrieval_smoke(config, db_path)
@@ -970,18 +1004,87 @@ def run_cycle(config: RuntimeConfig, *, deliver: Callable[[CycleResult], None] |
                                  status_line=_status_line(
                                      report, report_path, ok,
                                      conversation_attempt_path=conversation_attempt_path,
-                                     context=gate.state),
+                                     context=gate.state,
+                                     trigger=poll.reason if poll is not None else None),
                                  ok=ok,
                                  conversation_attempt_path=conversation_attempt_path,
                                  context=gate.state)
-            if ok and not gate.skip and deliver is not None:
-                deliver(result)
-                if gate.settled:
-                    record_checkpoint(store, run_id=run_id, profile=config.profile,
-                                      mode=config.mode, output=output,
-                                      cycle_date=config.disposition_date,
-                                      fingerprint=gate.fingerprint)
+            if ok and not gate.skip and emit is not None and render is not None:
+                text = render(result)
+                emit(text)
+                if execution_id:
+                    record_pending(store, run_id=run_id, cycle_date=config.disposition_date,
+                                   fingerprint=gate.fingerprint, execution_id=execution_id,
+                                   text_sha256=_keep_text(deliveries_dir, text), **gate_key)
     return result
+
+
+def _poll(config: RuntimeConfig, store: ContinuityStore, canonical: str, fresh: int,
+          gate_key: dict[str, str]) -> tuple[Poll, Delivery | None]:
+    """The lightweight answer to "is there anything to do tonight?", before any substantive work.
+
+    Reads cron's ledger for the last output (recording the checkpoint once it was delivered) and
+    the gateway's read-only dry-run answer for the conversation; *canonical* already holds the
+    records and sources. Writes nothing else."""
+    pending = unresolved_pending(store, **gate_key)
+    state = delivery_state(pending.execution_id) if pending is not None else None
+    if pending is not None and state == "delivered":
+        record_checkpoint(store, pending, **gate_key)
+    conversation: Mapping[str, Any] = {"enabled": False}
+    if config.conversation_compression:
+        conversation = request_conversation_compression(
+            profile=config.profile, cycle_id=config.disposition_date,
+            limit=config.conversation_compression_limit, gateway_home=config.gateway_home,
+            dry_run=True)
+    poll = decide_poll(conversation, canonical, new_sources=fresh,
+                       checkpoint=last_checkpoint(store, **gate_key), pending=pending,
+                       pending_state=state)
+    return poll, pending
+
+
+def consumed_sources(store: ContinuityStore, manifest: dict[str, Any],
+                     migrate_roots: Iterable[str]) -> tuple[set[str], int]:
+    """The migrated sources the cycle has consumed, or would consume from *manifest*, as candidate
+    ids, and how many of *manifest*'s the store does not hold yet. Identity is source and content,
+    so a file rewritten with the same bytes (or only re-stamped) is not new."""
+    roots = set(migrate_roots)
+    tonight = {v2_migration_candidate(manifest, source)["candidate_id"]
+               for source in manifest["sources"] if source["root"] in roots}
+    held = {row["candidate_id"] for row in store._conn.execute(
+        "SELECT candidate_id FROM candidates WHERE classifier_version = ?",
+        (V2_MIGRATION_CLASSIFIER_VERSION,))}
+    return held | tonight, len(tonight - held)
+
+
+def _keep_text(deliveries_dir: Path, text: str) -> str:
+    """Keep an emitted output until cron confirms it went out; returns its digest (the file name)."""
+    data = text.encode("utf-8")
+    digest = hashlib.sha256(data).hexdigest()
+    path = deliveries_dir / f"{digest}.txt"
+    if not path.exists():
+        create_file_exclusive(path, data)
+    return digest
+
+
+def _kept_text(deliveries_dir: Path, pending: Delivery | None) -> str | None:
+    """The undelivered output exactly as it was written, or None when it cannot be proven to be."""
+    if pending is None or not pending.text_sha256:
+        return None
+    path = deliveries_dir / f"{pending.text_sha256}.txt"
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return None
+    if hashlib.sha256(data).hexdigest() != pending.text_sha256:
+        return None
+    return data.decode("utf-8")
+
+
+def _poll_line(config: RuntimeConfig, poll: Poll) -> str:
+    """The status line of a night the poll answered: no cycle ran, so there is no report."""
+    return (f"dream-cycle-v3 poll ok action={poll.action} reason={poll.reason} "
+            f"mode={config.mode} profile={config.profile} date={config.disposition_date} "
+            "cycle=not_run")
 
 
 # ---------------------------------------------------------------------------

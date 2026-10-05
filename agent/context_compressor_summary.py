@@ -7,7 +7,8 @@ import re
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from agent.auxiliary_client import AuxiliaryExplicitCancellation
-from agent.context_compressor_daily_threads import DAILY_THREADS_INSTRUCTIONS, verify_codes
+from agent.context_compressor_daily_threads import (DAILY_THREADS_INSTRUCTIONS, established_codes,
+                                                    verify_codes)
 
 if TYPE_CHECKING:
     from agent.context_compressor import _HandoffScan
@@ -95,17 +96,19 @@ class SummaryDispatchMixin:
         retained_tail = messages[scan.tail_start:] if getattr(self, "reconcile_with_retained_tail", False) else []
         self._retained_tail_reference = (
             _bound_retained_tail(self._serialize_for_summary(retained_tail)) if retained_tail else "")
-        previous_summary = self._previous_summary
         try:
             summary = self._generate_summary(turns_to_summarize, **summary_kwargs)
             if retained_tail:
                 summary = _strip_retained_tail_echo(summary)
                 self._previous_summary = _strip_retained_tail_echo(self._previous_summary)
-            # Before anything stores it: a Daily Threads code the user never wrote is a proposal. The
-            # scheduled path supplies the stored rows, where a mirrored brief is a row of its own.
-            evidence = getattr(self, "code_evidence_rows", None) or messages
-            summary = verify_codes(summary, evidence, previous_summary)
-            self._previous_summary = verify_codes(self._previous_summary, evidence, previous_summary)
+            # Scheduled path only, before anything stores it: a Daily Threads code the user never
+            # approved is a proposal. Its stored rows keep a mirrored brief a row of its own.
+            evidence = getattr(self, "code_evidence_rows", None)
+            if evidence is not None:
+                carried = getattr(self, "carried_codes", ())
+                summary = verify_codes(summary, evidence, carried)
+                self._previous_summary = verify_codes(self._previous_summary, evidence, carried)
+                self.verified_codes = established_codes(summary)
             return summary
         except AuxiliaryExplicitCancellation:
             # Cancellation is a true no-op: restore the scan's mutation before the exception escapes.

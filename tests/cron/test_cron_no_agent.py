@@ -107,6 +107,25 @@ def test_run_job_no_agent_success_returns_script_stdout(hermes_env):
     assert "RAM 92% on host" in doc
 
 
+def test_a_script_can_find_the_ledger_row_that_records_whether_its_output_was_delivered(hermes_env):
+    """A script whose output must not be lost (a daily brief) needs to know, on its next run, if
+    cron delivered the last one. The executions ledger records that per run; the script is told
+    which run it is."""
+    from cron import executions, scheduler
+    from cron.jobs import create_job
+
+    (hermes_env / "scripts" / "which_run.sh").write_text(
+        '#!/bin/bash\necho "run=${HERMES_CRON_EXECUTION_ID:-none}"\n')
+    job = create_job(prompt=None, schedule="every 1d", script="which_run.sh", no_agent=True,
+                     deliver="local")
+
+    scheduler.run_one_job(job)
+
+    row = executions.latest_execution(job["id"])
+    output = next((hermes_env / "cron" / "output" / job["id"]).glob("*.md")).read_text()
+    assert f"run={row['id']}" in output
+
+
 def test_run_job_no_agent_reloads_dotenv_before_script(hermes_env, monkeypatch):
     """Regression: a standalone cron tick process starts without home-channel
     vars in its environment, and the agent path's per-run dotenv reload never

@@ -127,7 +127,7 @@ DAILY_THREADS_HANDOFF = """## Active State
   - waiting externally: Madrid portal support reply, check Tue 7 Oct
 - P2-career/jobs/beta — applied last week; next: follow up with **the recruiter about the second round because the first call went well**
 - P0-career/jobs/acme — final interview booked; next: prepare the system design answers
-  - needs authorization: send the *reference list* to [Acme](https://acme.example/jobs)
+  - needs authorization: send the *reference list* to [Acme](https://acme.example/jobs/references/upload?candidate=fixture-0001&round=final&return=https%3A%2F%2Facme.example%2Fjobs%2Fstatus%3Fcandidate%3Dfixture-0001)
 - P3-career/network — met Ana at the meetup; next: call Ana
 - proposed P2-health/exercise — no plan yet; next: ask for a weekly slot
 - unassigned: Tax filing — forms gathered; next: [book the accountant call](https://cal.example/acct) this week https://cal.example/acct
@@ -158,19 +158,22 @@ def _through_the_pipeline(summary_text):
     return classify_conversation_compression(response, profile="nagatha", cycle_id="2026-10-04")
 
 
+UNRECORDED = "⚠️ No 4–10-word next step recorded"
+
+
 def test_daily_threads_travel_from_the_handoff_to_a_grouped_prioritized_brief():
-    """The agreed two-line layout, end to end: dot + established code, then the state symbol and a
-    next action of at most ten whole words; no state paragraph, no repeated title."""
+    """The agreed two-line layout, end to end: dot + established code, then the state symbol and the
+    4-10-word next action the summarizer wrote; no state paragraph, no repeated title. A recorded
+    action outside 4-10 words is shown as missing, never cut to fit or padded."""
     brief = render_daily_brief(_report(cycle_date="2026-10-04"),
                                _through_the_pipeline(DAILY_THREADS_HANDOFF))
     lines = brief.splitlines()
 
     # Plain text: emphasis and link markup are dropped, never left half open by a cut.
     assert "🔴 P0-career/jobs/acme\n🔐 Send the reference list to Acme\n" in brief
-    # Under four words is not padded with invented work.
-    assert "🔵 P3-career/network\n▶️ Call Ana (no further detail recorded)\n" in brief
-    # Shortened where a clause ends, and the bold the cut would have left open is dropped.
-    assert "🟡 P2-career/jobs/beta\n▶️ Follow up with the recruiter about the second round\n" in brief
+    # Under four words is not padded, over ten is not cut: either way the record holds no action.
+    assert f"🔵 P3-career/network\n{UNRECORDED}\n" in brief
+    assert f"🟡 P2-career/jobs/beta\n{UNRECORDED}\n" in brief
     assert "🟠 P1-startups/expatriator\n⏳ Madrid portal support reply, check Tue 7 Oct\n" in brief
     # One group's threads stay together, the group placed by its most urgent thread.
     assert (brief.index("P0-career/jobs/acme") < brief.index("P2-career/jobs/beta")
@@ -179,10 +182,10 @@ def test_daily_threads_travel_from_the_handoff_to_a_grouped_prioritized_brief():
     # Not agreed means not displayed as agreed: no colored dot, labelled, kept apart.
     assert ("**Proposed** · codes and priorities not agreed yet\n• P2-health/exercise\n"
             "▶️ Ask for a weekly slot\n") in brief
-    # A line opening with a link keeps its words; a bare link is not a next action, and an
-    # over-long first word is dropped whole, never cut.
+    # A line opening with a link keeps its words and a bare link is dropped; an over-long word is
+    # no action at all.
     assert "**No code yet**\n• Tax filing\n▶️ Book the accountant call this week\n" in brief
-    assert "🔵 P3-ops/tracker\n▶️ No next step recorded\n" in brief
+    assert f"🔵 P3-ops/tracker\n{UNRECORDED}\n" in brief
     assert "⚠️ 1 handoff thread line was not in the P#-group/task format" in brief
     assert "📝 **Corrections & fixes**" in brief
     assert brief.rstrip().endswith("🗜️ **Compression** applied · 147,037 → 42,738 tokens · "
@@ -195,12 +198,13 @@ def test_daily_threads_travel_from_the_handoff_to_a_grouped_prioritized_brief():
     assert len(heads) == 7
     said = set(re.findall(r"[\w'/-]+", DAILY_THREADS_HANDOFF.lower()))
     for i in heads:
+        assert lines[i + 2] == "", "a thread is exactly two lines"
+        if lines[i + 1] == UNRECORDED:
+            continue
         state, _, description = lines[i + 1].partition(" ")
         assert state in symbols and 4 <= len(description.split()) <= 10, lines[i + 1]
-        own = description.removesuffix(" (no further detail recorded)").replace(
-            "No next step recorded", "")
-        assert set(re.findall(r"[\w'/-]+", own.lower())) <= said, lines[i + 1]
-        assert lines[i + 2] == "", "a thread is exactly two lines"
+        assert set(re.findall(r"[\w'/-]+", description.lower())) <= said, lines[i + 1]
+        assert "…" not in description
     for line in lines:
         assert line.count("`") % 2 == 0 and line.count("**") % 2 == 0, line
 
@@ -226,7 +230,7 @@ def test_registered_threads_show_even_when_unchanged_and_say_what_metadata_is_mi
     assert "⚠️ No priorities, groups or codes" in brief
     assert not any(dot in brief for dot in "🔴🟠🟡🔵")
     assert "**Registered threads** · no priority recorded" in brief
-    assert "• reg-thread-a\n▶️ Keep going (no further detail recorded)\n" in brief
+    assert f"• reg-thread-a\n{UNRECORDED}\n" in brief
     assert "• phase4-shadow-runtime-t_98231477\n💤 Complete the bounded shadow gates\n" in brief
     assert "measurement returned no…" in brief
 
@@ -257,7 +261,9 @@ def test_every_recorded_string_is_sanitized_and_machine_detail_stays_internal():
     assert "Mail [email_redacted] about the renewal" in brief
     assert "Ship the fix described in plan.md" in brief
     assert "https://example.com/a/b/c" in brief
-    assert "• reg-thread-b\n💤 Stale, routed to review\n" in brief
+    # A report from before registered threads were projected records a state change, never an
+    # action: it is not dressed up as one.
+    assert f"• reg-thread-b\n💤 {UNRECORDED}\n" in brief
     for leaked in ("owner@example.com", secret_id, "/Users/", "sources=", "excluded=", "[1, 2, 3]",
                    "20261004_063224_9e4976", "0123456789abcdef0123", "not-a-date", "[privacy_withheld]"):
         assert leaked not in brief
@@ -273,7 +279,7 @@ def test_every_recorded_string_is_sanitized_and_machine_detail_stays_internal():
          "next_action": f"[x](https://{'a' * 1800}) rotate {key} today"},
         {"thread_id": "reg-thread-m", "project_name": "Keys", "state": "active",
          "next_action": "aKIAIOSFODNN7EXAMPLE stays in the vault"}]}), None)
-    assert "• reg-thread-k\n▶️ No next step recorded\n" in described
+    assert f"• reg-thread-k\n{UNRECORDED}\n" in described
     assert key not in described and key.replace("__", "")[:30] not in described
     assert "AKIAIOSFODNN7EXAMPLE" not in described  # capitalizing the line must not complete one
     titled = render_daily_brief(_report(profile="aKIAIOSFODNN7EXAMPLE"), None)

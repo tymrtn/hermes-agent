@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import tempfile
 from datetime import datetime, timezone
@@ -248,7 +249,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         gateway_home=args.gateway_home,
         **_cycle_source_kwargs(args),
     )
-    def deliver(result) -> None:
+
+    def render(result) -> str:
         if args.output == "brief":
             # THIS attempt's conversation record: on a retry the publish-once cycle report still
             # carries the first attempt's section.
@@ -256,22 +258,26 @@ def cmd_run(args: argparse.Namespace) -> int:
             if result.conversation_attempt_path is not None:
                 conversation = json.loads(
                     result.conversation_attempt_path.read_text(encoding="utf-8"))
-            text = render_daily_brief(result.report, conversation)
-        else:
-            text = result.status_line
-        # Flushed before run_cycle records the no-new-context checkpoint.
+            return render_daily_brief(result.report, conversation)
+        return result.status_line
+
+    def emit(text: str) -> None:
         sys.stdout.write(text + "\n")
         sys.stdout.flush()
 
-    result = run_cycle(config, deliver=deliver, output=args.output)
+    # Under cron, the run whose delivery the executions ledger will record; None run by hand.
+    from cron.executions import EXECUTION_ID_ENV
+
+    result = run_cycle(config, render=render, emit=emit, output=args.output,
+                       execution_id=os.environ.get(EXECUTION_ID_ENV) or None)
     if not result.ok:
         print(result.status_line, file=sys.stderr)
         return 1
     if result.skipped:
-        # Nothing new since the last delivered brief: the cron script contract's explicit silence
+        # Nothing new since the last delivered output: the cron script contract's explicit silence
         # (cron/scheduler_prompt.py::_parse_wake_gate), so no-agent and agent jobs both stay quiet.
         print(json.dumps({"wakeAgent": False}))
-    if result.skipped or args.output == "brief":
+    if result.report is None or args.output == "brief":
         print(result.status_line, file=sys.stderr)
     return 0
 

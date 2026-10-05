@@ -355,6 +355,27 @@ def test_a_later_cycle_never_resummarizes_a_conversation_with_nothing_new(live):
     assert llm.call_count == 2
 
 
+def test_a_dry_run_is_a_read_only_poll_that_never_holds_the_conversation(live):
+    """The nightly poll asks "anything new?" before deciding to run a cycle. Answering must not take
+    the conversation from the user: a dry run reports new talk even mid-turn, reports a quiet
+    conversation with the fingerprint the cycle gates on, and never calls the model."""
+    config, store, _home = live
+    entry = _seed(store, _source(), _history())
+    runner = _runner(config, store)
+
+    with _real_compression(runner) as llm:
+        _run_cycle(runner, cycle_id="2026-10-01")
+        quiet = _run_cycle(runner, cycle_id="2026-10-02", dry_run=True)["sessions"][0]
+        live_id = store.lookup_by_session_key(entry.session_key).session_id
+        store.append_to_transcript(live_id, {"role": "user", "content": "One more thing"})
+        runner._session_state(entry.session_key).turn.agent = MagicMock()  # a turn is running
+        busy = _run_cycle(runner, cycle_id="2026-10-02", dry_run=True)["sessions"][0]
+
+    assert quiet["status"] == "unchanged" and len(quiet["activity_fingerprint"]) == 64
+    assert busy["status"] == "eligible", busy
+    assert llm.call_count == 1
+
+
 def test_a_request_that_read_a_stale_marker_rechecks_once_it_holds_the_conversation(live):
     """Two requests for one conversation in one cycle: the second read the marker before the first
     stamped it. Holding the reservation, it must see that commit and not summarize again."""
@@ -379,14 +400,22 @@ def test_a_request_that_read_a_stale_marker_rechecks_once_it_holds_the_conversat
 
 
 def test_only_codes_the_user_stated_stay_established_in_the_persisted_handoff(live):
-    """The scheduled summarizer writes ``## Daily Threads``; a P#-group/task code it did not get from
-    the user's own words is rewritten as proposed before the handoff is persisted or highlighted.
+    """The scheduled summarizer writes ``## Daily Threads``; a P#-group/task code the user did not
+    approve in a sentence of their own is rewritten as proposed before the handoff is persisted or
+    highlighted. Writing the code is not approving it: a quoted example, a question or a refusal
+    names a code without agreeing to it.
 
     The mirrored brief is not the user's words even where replay merges it into the user rows around
     it, and the user's reply typed straight after the brief still is."""
     config, store, _home = live
     history = _history()
     history[-2:-1] = [
+        {"role": "user", "content": "Use exactly the agreed two-line format. Example only, not "
+                                    "assigned metadata:\n\n🟠 P1-integrations/envelope-grok\n"
+                                    "🔐 Approve authenticated remote access for Grok\n\n"
+                                    "Should P3-ops/backup be tracked? Don't use P2-ops/disk.\n"
+                                    "'Use P2-ops/logs.' was the old template's wording.\n"
+                                    "Please don’t track P3-ops/fonts."},
         {"role": "user", "content": "Track this as P1-startups/expatriator. " + "x " * 200},
         {"role": "user", "content": "[Cron delivery: dream-cycle-v3-live-nagatha]\n"
                                     "🌙 **Nagatha · Dream Cycle**\n\n**Proposed** · not agreed yet\n"
@@ -401,6 +430,11 @@ def test_only_codes_the_user_stated_stay_established_in_the_persisted_handoff(li
   - waiting externally: Madrid portal support reply, check 7 Oct
 - P0-career/jobs/invented — the summarizer made this up; next: nothing
 - P2-health/exercise — no plan yet; next: ask for a weekly slot
+- P1-integrations/envelope-grok — copied from the example; next: approve remote access
+- P3-ops/backup — asked about; next: decide whether to track it
+- P2-ops/disk — refused; next: measure the temp folders
+- P2-ops/logs — single-quoted example; next: rotate the logs
+- P3-ops/fonts — refused with a typographic apostrophe; next: prune the fonts
 - unassigned: Disk cleanup — 244 GiB free; next: measure the temp folders
 """
 
@@ -418,9 +452,48 @@ def test_only_codes_the_user_stated_stay_established_in_the_persisted_handoff(li
                 for t in row["highlights"]["daily_threads"]["threads"]}
     assert standing == {"P1-startups/expatriator": "established",
                         "P0-career/jobs/invented": "proposed",
-                        "P2-health/exercise": "established", "Disk cleanup": "uncoded"}
+                        "P2-health/exercise": "established",
+                        "P1-integrations/envelope-grok": "proposed", "P3-ops/backup": "proposed",
+                        "P2-ops/disk": "proposed", "P2-ops/logs": "proposed",
+                        "P3-ops/fonts": "proposed", "Disk cleanup": "uncoded"}
     waiting = row["highlights"]["daily_threads"]["threads"][0]["dependency"]
     assert waiting == {"kind": "waiting_externally", "detail": "Madrid portal support reply, check 7 Oct"}
+
+
+def test_a_handoff_the_scheduled_path_never_verified_establishes_no_code(live):
+    """A ``## Daily Threads`` heading is not provenance. A handoff written by a manual /compress, a
+    plugin engine or a cycle from before codes were verified can show codes as established; until the
+    user approves one, the brief gets it as proposed, whether the conversation is unchanged or the
+    next scheduled summary carries the section forward."""
+    from agent.context_compressor import LEGACY_SUMMARY_PREFIX
+    from gateway.scheduled_compression import activity_fingerprint
+
+    config, store, _home = live
+    carried = FIXTURE_SUMMARY + """
+## Daily Threads
+- P1-legacy/carried — written before verification; next: keep the old priority
+"""
+    # The handoff such a compression left behind, and the marker a cycle from before verification
+    # stamped beside it: applied and fingerprinted, with no record of verified codes.
+    entry = _seed(store, _source(),
+                  [{"role": "user", "content": f"{LEGACY_SUMMARY_PREFIX} {carried}"}] + _history())
+    store.set_session_metadata(entry.session_key, CYCLE_METADATA_KEY, {
+        "cycle_id": "2026-09-30", "status": "applied", "activity_fingerprint": activity_fingerprint(
+            store.load_transcript(entry.session_id, repair_alternation=False))})
+    runner = _runner(config, store)
+
+    with _real_compression(runner) as llm:
+        llm.return_value = carried
+        quiet = _run_cycle(runner, cycle_id="2026-10-01")["sessions"][0]
+        live_id = store.lookup_by_session_key(entry.session_key).session_id
+        for turn in _history(20):
+            store.append_to_transcript(live_id, turn)
+        recompressed = _run_cycle(runner, cycle_id="2026-10-02")["sessions"][0]
+
+    assert quiet["status"] == "unchanged", quiet
+    assert recompressed["status"] == "applied", recompressed
+    for row in (quiet, recompressed):
+        assert [t["standing"] for t in row["highlights"]["daily_threads"]["threads"]] == ["proposed"]
 
 
 def test_busy_conversation_defers_and_leaves_history_untouched(live):

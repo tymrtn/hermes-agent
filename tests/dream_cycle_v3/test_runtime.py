@@ -492,11 +492,8 @@ def test_cli_run_retry_without_pinned_as_of_is_byte_identical(env, capsys):
         dump_before = store.dump_canonical()
 
     rc = main(args)                      # the retry
-    retry = capsys.readouterr()
+    out2 = capsys.readouterr().out
     assert rc == 0, "retry must not abort on manifest conflict"
-    # Nothing new since the delivered run: the retry stays silent and reports on stderr.
-    assert retry.out == '{"wakeAgent": false}\n'
-    out2 = retry.err
     # same deterministic run id and report path, byte-identical manifest,
     # zero durable delta — the retry adds nothing and rewrites nothing
     run_token = next(t for t in out1.split() if t.startswith("run="))

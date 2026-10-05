@@ -29,9 +29,18 @@ auto-compression are unchanged.
 - Next actions and dependency lines are asked for as 4–10-word imperatives, with reasons and
   consequences kept in the state.
 - `verify_codes` (`agent/context_compressor_daily_threads.py`) runs before the summary is stored.
-  It rewrites a code line as `proposed` unless the user wrote that exact code, or the previous
-  stored handoff already carried it as established. The summarizer's own text, compaction
-  handoffs and mirrored `[Cron delivery:` rows do not count as the user. `P?` is always proposed.
+  It rewrites a code line as `proposed` unless the user agreed to that exact code, or the code is
+  in the verified set the last applied marker recorded. Agreeing means a user sentence that names
+  the code with an approving word ("use", "track", "agreed", "yes", ...) and nothing that asks,
+  refuses, hedges or gives an example. Quoted text (code spans, quotation marks, `>` lines) is
+  dropped first, so a code pasted as an example is not approval. The summarizer's own text,
+  compaction handoffs and mirrored `[Cron delivery:` rows do not count as the user. `P?` is always
+  proposed.
+- Provenance: the routing entry's marker records the codes that came out of verification as
+  `daily_threads: {version: 1, established: [...]}`. That set, and nothing read from the handoff's
+  text, is what carries to the next pass and what the gateway reports as established. A handoff
+  with no such record (written before this change, or by a plugin context engine) establishes no
+  code until the user agrees to it again.
 - Replay repair merges a mirrored brief into the user rows around it. The scheduled path therefore
   verifies against the stored, unmerged rows (`reconcile_handoff_with_tail(compressor,
   stored_rows)`), so the brief's own codes never read as the user's and a reply typed straight
@@ -53,15 +62,13 @@ Each thread is exactly two lines, with a blank line between threads:
 - Line 2 is the state symbol and the next action. The symbols are ⛔ blocked, 🙋 needs help,
   🔐 needs authorization and ⏳ waiting externally, each showing the dependency line. ▶️ means no
   dependency and shows the `next:` action. Registered threads use 💤 for `stale`.
-- `describe` (`dream_cycle_v3/daily_brief.py`) enforces both bounds without a model call. The
-  secret scan reads the text as recorded and again as finally displayed (capitalized, with any
-  suffix), and a hit at either point leaves the line empty. Between the two scans the text becomes
-  plain: link text is kept, bare URLs are dropped, and emphasis and code marks are removed, so no
-  cut can leave Markdown open. Parenthetical asides are dropped. A longer text keeps its longest run of
-  leading clauses, ending at `;`, `:`, `,`, a spaced dash, "so that", "because", "which", "while",
-  "unless", "whereas" or "in order to", provided that run is at least four words. Otherwise it
-  keeps ten whole words, drops a trailing connective and ends with `…`. A text under four words is
-  not padded with invented work; it gets " (no further detail recorded)".
+- The words are the summarizer's: the existing scheduled pass is asked for each `next:` and
+  dependency line as one 4–10-word imperative. `describe` (`dream_cycle_v3/daily_brief.py`) only
+  validates, with no model call and no rewriting: the secret scan reads the text as recorded and as
+  displayed, the text becomes plain (link text kept, bare URLs, emphasis and code marks removed),
+  and it must then be 4–10 whole words. A text that fails any check is not clipped or padded; the
+  line reads "⚠️ No 4–10-word next step recorded" (after the state symbol when there is one). That
+  is what older handoffs and registry rows without a usable next action show.
 - Threads of one group are listed together. Groups are ordered by their most urgent thread. There
   are no group headings, since the group is already the code's first segment.
 - The state text is kept in the handoff and is not displayed.
@@ -104,28 +111,52 @@ contract has no priority or group field, so the brief labels these threads "no p
 
 ## The gate
 
-There are two places where the run stops early.
+Each night starts with a lightweight poll (`context_gate.decide_poll`, `runtime._poll`). It writes
+no manifest, report or store row other than delivery bookkeeping, and makes no model call. Only its
+`cycle` answer runs the substantive cycle (manifest, store pass, compression, report, brief).
 
-1. **Gateway, before any reservation or model call.** `compress-session` fingerprints the stored
-   rows (raw, no alternation repair), excluding compaction handoffs and mirrored cron deliveries.
-   If the routing entry's last `applied` marker carries the same fingerprint, the answer is
-   `unchanged`. The marker's fingerprint is taken from the rows actually persisted after the
-   compression. A same-cycle retry answers `already_applied` with the fingerprint of the rows as
-   they stand now, so anything said since that compression is still new context. Both answers are
-   checked again once the conversation is reserved, so a request that read the marker before a
-   concurrent one stamped it does not summarize a second time.
-2. **Runtime, before delivery.** `context_gate.decide` hashes the conversation fingerprint together
-   with a content digest of the registry, the thread seed and the tracker snapshots. If that equals
-   the last `runtime_context_checkpoint` for the profile and mode, and no compression ran this time,
-   the run is skipped. `dream_cycle_v3 run` then prints `{"wakeAgent": false}` to stdout and the
-   status line to stderr. Cron reads that last line as silence (`cron/scheduler_prompt.py::
-   _parse_wake_gate`) for no-agent and agent jobs alike.
+What the poll reads, i.e. what counts as new context:
 
-The checkpoint is recorded under the runtime lock only after the brief was written and flushed, and
-only when the conversation state was settled. Checkpoints are kept per profile, mode and output, so
-a status line that went out (`--output status`) never silences the first brief. A failed, deferred, pending or unavailable run is
-always delivered and never checkpointed, so the next run compares against the last brief that went
-out.
+- **Conversation.** A `compress-session` dry run, answered by the gateway from a read-only pass:
+  the fingerprint of the stored rows (raw, no alternation repair), excluding compaction handoffs
+  and mirrored cron deliveries, so the brief's own echo in the transcript is not new. If the last
+  applied marker carries the same fingerprint the answer is `unchanged`; otherwise `eligible`.
+  Anything that does not pin the state (no gateway, pending, deferred, failed) is unsettled and
+  runs a cycle.
+- **Canonical records.** A content digest of the registry, the thread seed and the tracker
+  snapshots. A file rewritten with the same entries digests the same.
+- **Consumed sources.** The migrated roots' (`--migrate-v2-root`) candidates the store holds, plus
+  tonight's window of them collected read-only with the cycle's own selection
+  (`runtime.consumed_sources`), as ids in the content digest. Identity is the source path plus its
+  content fingerprint, so a file re-stamped or rewritten with the same bytes is not new. A source
+  a cycle ingested but never delivered a brief for (the cycle failed after ingesting) still differs
+  from the last delivered state, so the next night runs again. Roots that are only recorded (the
+  sessions root, which is the conversation) are not counted, and neither are the cycle's own
+  reports, manifests and store rows. A cycle that ran for sources says so: "📥 N new source
+  file(s) quarantined for review".
+
+Delivery is acknowledged by cron, never assumed. Writing to stdout is not delivery: the scheduler
+sends after the script exits. A cron run carries `HERMES_CRON_EXECUTION_ID` (its row in the
+executions ledger). The emitted text is kept under `v3_root/deliveries/<sha256>.txt` and recorded
+as `runtime_delivery_pending` with that id. The next poll reads the row's `delivery_outcome`
+(`queued` follows the delivery queue's row):
+
+| ledger says | poll does |
+|---|---|
+| `delivered` | records `runtime_context_checkpoint`; an unchanged night is then silent |
+| still running or queued | an unchanged night waits (silent) |
+| `failed`, `suppressed`, `not_configured`, unknown | an unchanged night writes the kept text again, unchanged, under the new execution id; no cycle, no compression |
+| anything | changed context runs a new cycle, whose brief supersedes the pending one |
+
+Silence is `{"wakeAgent": false}` on stdout with the status (or poll) line on stderr; cron reads it
+as silence for no-agent and agent jobs alike (`cron/scheduler_prompt.py::_parse_wake_gate`).
+Checkpoints are kept per profile, mode and output. A run by hand has no execution id, so it records
+nothing and silences nothing. Programmatic `run_cycle` calls without `emit` (replay, tests) always
+run the full cycle.
+
+The gateway keeps its own early stop as well: a non-dry `compress-session` on an `unchanged`
+conversation answers without a reservation or a model call, and both `unchanged` and
+`already_applied` are re-checked once the conversation is reserved.
 
 ## Fallbacks
 
@@ -139,34 +170,32 @@ out.
 
 ## Activation
 
-- The renderer, runtime gate and CLI load per cron run. They take effect on the next run, with no
-  restart.
-- The gateway side (`Daily Threads`, `verify_codes`, the `unchanged` answer) needs that profile's
-  gateway restarted. Until then the gateway never answers `unchanged`, the conversation stays
-  unsettled, and every night delivers, as it does today.
-- The first night after the restart compresses once more to record a fingerprint. Repeat nights are
-  silent from then on.
+- The renderer, poll and CLI load per cron run, so they take effect on the next run.
+- Everything else needs that profile's gateway restarted, since the gateway also runs the cron
+  ticker: the read-only dry run, `unchanged`, Daily Threads with provenance, and the
+  `HERMES_CRON_EXECUTION_ID` export. Until then a cron run has no execution id, so nothing is
+  checkpointed and every night runs a cycle and delivers, as it does today. No night is lost.
+- The first night after the restart compresses once more to record a fingerprint and a verified
+  code set. A carried handoff's codes show as proposed until the user agrees to them.
 - The schedule does not change.
 
 ## Limits
 
-- Collected read-root sources are not part of the gate. They are ingested every night but never
-  rendered in the brief.
 - Time-driven carry-forward (a thread going stale with nothing said) does not trigger a brief.
-- Telegram delivery happens after the script exits. If cron cannot send, the checkpoint already
-  exists, and the next run is silent unless something new arrives.
+- A resent brief is the original night's brief, its date included: it is the one that never
+  arrived. When the kept text is gone or fails its digest, the cycle runs again instead.
+- When the context changed since an undelivered brief, the new cycle's brief replaces it. The
+  undelivered one is not sent separately.
 - A compression the gateway refuses because it would grow the context stays retryable, so it is
   attempted again every night.
-- A priority change only counts as established when the user writes the full new code.
+- Approval is lexical. An approving word with no question, refusal, hedge or example word in the
+  same sentence counts. Wording outside those lists errs towards `proposed`.
+- A priority change only counts as established when the user agrees to the full new code.
 - Outside the scheduled path, a code the user writes in a reply merged after a mirrored brief is
   not counted until it appears in a row of its own.
 - A conversation too short to compress (`deferred`, `too_short`) counts as settled. The gateway
-  stamps no marker for it and checks it again every night. Only a delivery with identical content
-  is silenced.
-- `verify_codes` trusts codes that the previous stored handoff carried as established. Every
-  handoff written since this change was verified before it was stored. Codes from a handoff written
-  by a plugin context engine, or one with a `## Daily Threads` section from before this change,
-  would be trusted without that check. No provenance record exists to tell them apart. Nagatha's
-  2026-10-04 handoff has no such section.
+  stamps no marker for it and checks it again every night.
+- The registry contract has no priority or group field, so registered threads stay "no priority
+  recorded" until it does.
 - The ▶️ and 💤 symbols are this implementation's choice. The skill names symbols only for the four
   dependency states.

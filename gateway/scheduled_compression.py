@@ -82,6 +82,9 @@ _OPEN_THREAD_HEADINGS = ("Blocked", "Active Task", "Active State", "Historical T
 _LEARNING_HEADINGS = ("Key Decisions", "Errors & Fixes", "Constraints & Preferences")
 MAX_HIGHLIGHTS = 3
 MAX_HIGHLIGHT_CHARS = 160
+#: A next action or dependency is 4-10 words, but may carry link markup the brief strips before
+#: counting them; cutting it at the highlight width would turn a valid action into a missing one.
+MAX_ACTION_CHARS = 600
 #: Brief sections, each read from ONE handoff heading so a consumer knows what a line is: an open
 #: item is something the handoff lists as blocked, never an Active State fact relabelled.
 MAX_OPEN_ITEMS = 4
@@ -121,6 +124,9 @@ class ManualCompressionOutcome:
     #: whenever ``status`` is ``compressed`` but the commit was a no-op — a refused would-grow
     #: candidate, or a persistence failure the compressor caught and rolled back (#44794).
     committed: bool = False
+    #: Daily Threads codes the built-in compressor verified for this summary (scheduled path only);
+    #: None when nothing verified them (any other path, a plugin engine, no summary written).
+    verified_codes: Optional[List[str]] = None
 
     @property
     def rotated(self) -> bool:
@@ -258,11 +264,13 @@ def _daily_threads(sections: Dict[str, str]) -> Optional[Dict[str, Any]]:
         return None
     threads, unformatted = parse_daily_threads(body)
     for thread in threads:
-        for name in ("title", "state", "next"):
+        for name in ("title", "state"):
             if name in thread:
                 thread[name] = _clip(thread[name], MAX_HIGHLIGHT_CHARS)
+        if "next" in thread:
+            thread["next"] = _clip(thread["next"], MAX_ACTION_CHARS)
         if "dependency" in thread:
-            thread["dependency"]["detail"] = _clip(thread["dependency"]["detail"], MAX_HIGHLIGHT_CHARS)
+            thread["dependency"]["detail"] = _clip(thread["dependency"]["detail"], MAX_ACTION_CHARS)
     return {"threads": threads[:MAX_DAILY_THREADS],
             "unformatted": [_clip(line, MAX_HIGHLIGHT_CHARS)
                             for line in unformatted[:MAX_UNFORMATTED_THREAD_LINES]],
@@ -327,7 +335,32 @@ def activity_fingerprint(messages: Any) -> str:
                           .encode("utf-8")).hexdigest()
 
 
-def reconcile_handoff_with_tail(compressor: Any, stored_rows: List[Dict[str, Any]]) -> bool:
+def verified_codes(marker: Any) -> Optional[List[str]]:
+    """The codes the scheduled path verified for the handoff it stored last, from the conversation's
+    compression marker; None when no such record exists (the handoff came from a manual or plugin
+    compression, or a cycle from before codes were verified)."""
+    from agent.context_compressor_daily_threads import PROVENANCE_VERSION
+
+    record = marker.get("daily_threads") if isinstance(marker, dict) else None
+    if not isinstance(record, dict) or record.get("version") != PROVENANCE_VERSION \
+            or not isinstance(record.get("established"), list):
+        return None
+    return [str(code) for code in record["established"]]
+
+
+def with_provenance(highlights: Dict[str, Any], verified: Optional[List[str]]) -> Dict[str, Any]:
+    """*highlights* with every established code the scheduled path did not verify shown as
+    proposed. A ``## Daily Threads`` heading is not provenance; only the marker's record is."""
+    daily = highlights.get("daily_threads") if isinstance(highlights, dict) else None
+    trusted = {code.lower() for code in verified or ()}
+    for thread in (daily or {}).get("threads", ()):
+        if thread.get("standing") == "established" and thread["code"].lower() not in trusted:
+            thread["standing"] = "proposed"
+    return highlights
+
+
+def reconcile_handoff_with_tail(compressor: Any, stored_rows: List[Dict[str, Any]],
+                                carried_codes: List[str]) -> bool:
     """Let *compressor*'s summarizer see the verbatim tail so the handoff's state sections reflect
     it; False if it is not the built-in ``ContextCompressor`` (a plugin context engine keeps its own
     summary policy).
@@ -336,7 +369,9 @@ def reconcile_handoff_with_tail(compressor: Any, stored_rows: List[Dict[str, Any
     compression changes. Same single summarizer call; the tail is added to its input, not summarized.
     Daily Threads codes are verified against *stored_rows*, the conversation as stored: replay
     merges a mirrored brief into the user rows around it, which would make the brief's own codes
-    read as the user's, or the user's reply to it as the brief.
+    read as the user's, or the user's reply to it as the brief. *carried_codes* stay established
+    without new approval (``verified_codes`` of the marker); the compressor leaves what it verified
+    in ``verified_codes``.
     """
     from agent.context_compressor import ContextCompressor
 
@@ -344,6 +379,8 @@ def reconcile_handoff_with_tail(compressor: Any, stored_rows: List[Dict[str, Any
         return False
     compressor.reconcile_with_retained_tail = True
     compressor.code_evidence_rows = stored_rows
+    compressor.carried_codes = list(carried_codes)
+    compressor.verified_codes = None
     return True
 
 
@@ -425,7 +462,7 @@ def _settled_without_compressing(row: Dict[str, Any], marker: Any, cycle_id: str
         return None
     if include_highlights:
         # A retry whose first attempt never delivered still needs the handoff it would have shown.
-        out["highlights"] = handoff_highlights(current)
+        out["highlights"] = with_provenance(handoff_highlights(current), verified_codes(marker))
     return out
 
 
@@ -630,6 +667,10 @@ async def _compress_one_entry(runner: Any, entry: Any, *, cycle_id: str, dry_run
     settled = _settled_without_compressing(row, marker, cycle_id, current, include_highlights)
     if settled is not None:
         return settled
+    if dry_run:
+        # A poll ("anything new?"), not a compression: answered from the same read-only read, so
+        # asking never takes the conversation from a user mid-turn.
+        return await _would_compress(store, entry, row, current)
 
     # Reserve the conversation BEFORE reading its history: everything from here to the commit must
     # be serialized against inbound turns, or an arriving message runs a turn whose parent session
@@ -654,7 +695,7 @@ async def _compress_one_entry(runner: Any, entry: Any, *, cycle_id: str, dry_run
         # allowed to reach the lease release while that thread can still write — it unwinds only after
         # the worker has truly stopped.
         worker = asyncio.ensure_future(_compress_reserved_entry(
-            runner, entry, row, cycle_id=cycle_id, dry_run=dry_run,
+            runner, entry, row, cycle_id=cycle_id,
             include_highlights=include_highlights, reservation=reservation))
         try:
             return await asyncio.shield(worker)
@@ -680,8 +721,25 @@ async def _compress_one_entry(runner: Any, entry: Any, *, cycle_id: str, dry_run
         reservation.released.set()
 
 
+async def _would_compress(store: Any, entry: Any, row: Dict[str, Any],
+                          stored: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """The dry-run answer for a conversation with something new: what a real request would do."""
+    from agent.conversation_compression_manual import MIN_MESSAGES
+    from gateway.session_transcript import TranscriptReadError
+
+    try:
+        history = await store.load_transcript(entry.session_id)
+    except TranscriptReadError as exc:
+        return {**row, "status": "failed", "reason": f"transcript_unreadable: {exc}"}
+    if not history or len(history) < MIN_MESSAGES:
+        return {**row, "status": "deferred", "reason": "too_short",
+                "before_messages": len(history or []),
+                "activity_fingerprint": activity_fingerprint(stored)}
+    return {**row, "status": "eligible", "before_messages": len(history)}
+
+
 async def _compress_reserved_entry(runner: Any, entry: Any, row: Dict[str, Any], *, cycle_id: str,
-                                   dry_run: bool, include_highlights: bool,
+                                   include_highlights: bool,
                                    reservation: _Reservation) -> Dict[str, Any]:
     """Read, compress and commit one RESERVED conversation (slot + turn lease already held)."""
     from agent.conversation_compression_manual import MIN_MESSAGES, parse_compress_args
@@ -696,9 +754,8 @@ async def _compress_reserved_entry(runner: Any, entry: Any, row: Dict[str, Any],
         return {**row, "status": "failed", "reason": f"transcript_unreadable: {exc}"}
     # Read again now that the conversation is ours: a concurrent request may have compressed it
     # between this request's unreserved read and its reservation.
-    settled = _settled_without_compressing(
-        row, await store.get_session_metadata(session_key, CYCLE_METADATA_KEY), cycle_id, stored,
-        include_highlights)
+    previous = await store.get_session_metadata(session_key, CYCLE_METADATA_KEY)
+    settled = _settled_without_compressing(row, previous, cycle_id, stored, include_highlights)
     if settled is not None:
         return settled
     if not history or len(history) < MIN_MESSAGES:
@@ -706,12 +763,11 @@ async def _compress_reserved_entry(runner: Any, entry: Any, row: Dict[str, Any],
         return {**row, "status": "deferred", "reason": "too_short",
                 "before_messages": len(history or []),
                 "activity_fingerprint": activity_fingerprint(stored)}
-    if dry_run:
-        return {**row, "status": "eligible", "before_messages": len(history)}
 
     with runner._profile_scope_for_source(entry.origin):
         outcome = await runner._run_manual_compression(
-            entry.origin, entry, history, parse_compress_args(""), reconcile_rows=stored)
+            entry.origin, entry, history, parse_compress_args(""), reconcile_rows=stored,
+            carried_codes=verified_codes(previous) or [])
     # ``compress_now`` answering ``compressed`` is NOT proof of a rewrite: the compressor refuses a
     # candidate that would GROW the transcript, and a caught persistence failure restores the
     # original — both leave the id unrotated with nothing committed (#44794). Only an explicit
@@ -732,7 +788,7 @@ async def _compress_reserved_entry(runner: Any, entry: Any, row: Dict[str, Any],
     if status != _STATUS_APPLIED:
         result["reason"] = ("rewrite_not_committed" if outcome.compressed else outcome.status)
     if include_highlights and outcome.highlights:
-        result["highlights"] = outcome.highlights
+        result["highlights"] = with_provenance(outcome.highlights, outcome.verified_codes)
     # The rotated id is the new serialization target for whatever runs next; follow it with the held
     # lease before the caller releases, exactly as a real turn does. The registry rebinds only on the
     # token's own identity (holder check), so a rotation racing a /stop + successor can never pull the
@@ -744,6 +800,12 @@ async def _compress_reserved_entry(runner: Any, entry: Any, row: Dict[str, Any],
                 registry.rebind(reservation.token, outcome.new_session_id)
     marker = {"cycle_id": cycle_id, "status": status, "detail": outcome.status, "at": int(time.time()),
               "before_tokens": outcome.before_tokens, "after_tokens": outcome.after_tokens}
+    # Provenance of the handoff that is stored now: this compression's verification if it committed,
+    # otherwise the record for the handoff it left in place.
+    codes = outcome.verified_codes if status == _STATUS_APPLIED else verified_codes(previous)
+    if codes is not None:
+        from agent.context_compressor_daily_threads import PROVENANCE_VERSION
+        marker["daily_threads"] = {"version": PROVENANCE_VERSION, "established": codes}
     if status == _STATUS_APPLIED:
         # Fingerprint what was PERSISTED, read back the way the next cycle will read it. Unreadable
         # means no fingerprint: the next cycle compresses again instead of trusting a guess.

@@ -7,11 +7,12 @@ reply that handoff retained verbatim, an open registered thread, or the compress
 
 Daily threads use the agreed two-line layout: the priority dot (🔴 P0, 🟠 P1, 🟡 P2, 🔵 P3) and the
 established ``P#-group/task`` code, then the state symbol (⛔ blocked, 🙋 needs help, 🔐 needs
-authorization, ⏳ waiting externally, ▶️ next step in hand) and a next action of at most ten words.
-Threads of one group sit together, groups ordered by their most urgent thread. Only a code the user
-stated is shown as established (``agent/context_compressor_daily_threads.py`` verifies that before
-the handoff is stored); proposed codes and uncoded threads are listed apart and undotted. Nothing is
-inferred, classified or prioritized here. Where the records carry no priority, group or code (a
+authorization, ⏳ waiting externally, ▶️ next step in hand) and the next action of four to ten words
+the summarizer wrote. A record without one says so (⚠️); nothing is cut to fit or padded. Threads of
+one group sit together, groups ordered by their most urgent thread. Only a code the user approved is
+shown as established (``agent/context_compressor_daily_threads.py`` verifies that before the handoff
+is stored, the gateway's marker records it); proposed codes and uncoded threads are listed apart and
+undotted. Nothing is inferred, classified or prioritized here. Where the records carry no priority, group or code (a
 handoff without the section, the registry contract), the brief says so instead of formatting old
 bullets as if they were prioritized threads.
 
@@ -52,11 +53,6 @@ _REASONS = {
     "rewrite_not_committed": "the rewrite did not commit",
 }
 
-_THREAD_ACTIONS = {
-    "close_done": "its task reports completion",
-    "stale_review": "routed to review",
-    "continue": "follow-up window elapsed",
-}
 
 _PRIORITY_DOTS = {"P0": "🔴", "P1": "🟠", "P2": "🟡", "P3": "🔵"}
 _PRIORITY_RANK = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
@@ -67,20 +63,13 @@ _IN_HAND = "▶️"
 #: Registered threads record a state, not a dependency kind.
 _REGISTERED_STATE_SYMBOLS = {"blocked": "⛔", "waiting": "⏳", "stale": "💤"}
 _DESCRIPTION_MIN_WORDS, _DESCRIPTION_MAX_WORDS = 4, 10
-_DESCRIPTION_SOURCE_CHARS = 1200
-# Where a long description can stop and still say one whole thing.
-_CLAUSE_END = re.compile(r"\s*(?:[;:,]|\s[—–-]\s)"
-                         r"|\s+(?=(?:so that|because|which|while|unless|whereas|in order to)\s)",
-                         re.IGNORECASE)
-# Descriptions are plain text: a Markdown mark a cut could leave open is dropped before cutting.
+#: Line two when the record holds no next action of four to ten words.
+_UNRECORDED = "⚠️ No 4–10-word next step recorded"
+# Next actions are shown as plain text: link text without its target, no emphasis or code marks.
 _MD_LINK = re.compile(r"\[([^\]]+)\]\([^)\s]+\)")
 _MD_EMPHASIS = re.compile(r"\*\*|__|`|(?<!\w)[*_](?=\S)|(?<=\S)[*_](?!\w)")
-# Links belong in the task a thread points at, not in its ten words.
+# Links belong in the task a thread points at, not in its next action.
 _URL = re.compile(r"https?://\S*")
-_TOO_SHORT = " (no further detail recorded)"
-# A description cut between clauses never ends on a word that needs the next one.
-_DANGLING = frozenset("a an the and or but to of for with in on at by from before after then so if "
-                      "until via into that which who when while because as than".split())
 
 
 def _day(cycle_date: str) -> str:
@@ -183,50 +172,40 @@ def compression_receipt(conversation: Mapping[str, Any] | None) -> str:
     return f"{head} failed — {reason or 'no reason recorded'}; nothing reported as applied"
 
 
-def describe(value: object) -> str:
-    """*value* as a thread's second line: four to ten whole words of plain text.
+def describe(value: object) -> str | None:
+    """The recorded next action as a thread's second line, or None when there is none to show.
 
-    The summarizer is asked for four to ten words; this enforces both bounds without a model call.
-    A longer text keeps its longest run of leading clauses that fits, when that is four words or
-    more. Otherwise it keeps the first ten words, drops a dangling connective, and says it was cut
-    (…). A shorter one is not padded with invented work: it says that is all the record holds."""
-    # Only the whole words of a bounded window can reach ten words, and all of it is scanned as
-    # recorded: dropping Markdown marks first could shorten a credential below the scanner's
-    # pattern, or pull one from past the scanned window into view.
-    raw = clip_words(str(value if value is not None else ""), _DESCRIPTION_SOURCE_CHARS)
+    The summarizer is asked for one plain imperative of four to ten words
+    (``DAILY_THREADS_INSTRUCTIONS``); this checks what it wrote and never repairs it. A longer text
+    is not cut and a shorter one is not padded, since neither would be an action anyone agreed to.
+    Only the presentation changes first: link and emphasis marks and bare URLs are dropped."""
+    # Scanned as recorded: dropping a Markdown mark could shorten a credential below its pattern.
+    raw = str(value if value is not None else "")
     if scan_content(raw):
-        return ""
-    # Markdown before the presentation filter: a line opening with a link is not machine output.
-    plain = _MD_EMPHASIS.sub("", _MD_LINK.sub(r"\1", raw))
-    text = " ".join(_URL.sub("", _presentable(plain, 300)).split())
-    text = re.sub(r"\s*\([^)]*\)", "", text).strip(" .;:,—–-")
-    if not text.strip("…"):
-        return ""
-    words = text.split()
-    if len(words) > _DESCRIPTION_MAX_WORDS:
-        ends = [m.start() for m in _CLAUSE_END.finditer(text) if _DESCRIPTION_MIN_WORDS
-                <= len(text[:m.start()].split()) <= _DESCRIPTION_MAX_WORDS]
-        if ends:
-            text = text[:ends[-1]]
-        else:
-            words = words[:_DESCRIPTION_MAX_WORDS]
-            while len(words) > 1 and words[-1].lower().strip(",;:") in _DANGLING:
-                words.pop()
-            text = " ".join(words).rstrip(",;:") + "…"
-    if len(text.split()) < _DESCRIPTION_MIN_WORDS:
-        text += _TOO_SHORT
+        return None
+    plain = " ".join(_URL.sub("", _MD_EMPHASIS.sub("", _MD_LINK.sub(r"\1", raw))).split())
+    text = _presentable(plain, 300).rstrip(".")
+    if not text or text.endswith("…") or not (
+            _DESCRIPTION_MIN_WORDS <= len(text.split()) <= _DESCRIPTION_MAX_WORDS):
+        return None
     text = text[:1].upper() + text[1:]
-    return "" if _reveals(text) else text
+    return None if _reveals(text) else text
+
+
+def _second_line(symbol: str, text: object) -> str:
+    """The state symbol and the next action, or the state symbol and the honest gap."""
+    action = describe(text)
+    if action:
+        return f"{symbol} {action}"
+    return _UNRECORDED if symbol == _IN_HAND else f"{symbol} {_UNRECORDED}"
 
 
 def _thread_block(head: str, thread: Mapping[str, Any]) -> list[str]:
     """The agreed two lines: *head*, then the state symbol and what happens next."""
     dependency = thread.get("dependency") if isinstance(thread.get("dependency"), Mapping) else {}
     if dependency.get("kind") in _STATE_SYMBOLS:
-        symbol, text = _STATE_SYMBOLS[dependency["kind"]], describe(dependency.get("detail"))
-    else:
-        symbol, text = _IN_HAND, describe(thread.get("next"))
-    return [head, f"{symbol} {text or 'No next step recorded'}", ""]
+        return [head, _second_line(_STATE_SYMBOLS[dependency["kind"]], dependency.get("detail")), ""]
+    return [head, _second_line(_IN_HAND, thread.get("next")), ""]
 
 
 def _daily_thread_lines(daily: Mapping[str, Any]) -> list[str]:
@@ -316,8 +295,7 @@ def _changes(report: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
 
 
 def _registered_block(thread_id: str, state: str, text: object) -> list[str]:
-    symbol = _REGISTERED_STATE_SYMBOLS.get(state, _IN_HAND)
-    return [f"• {thread_id}", f"{symbol} {describe(text) or 'No next step recorded'}", ""]
+    return [f"• {thread_id}", _second_line(_REGISTERED_STATE_SYMBOLS.get(state, _IN_HAND), text), ""]
 
 
 def _registered_lines(report: Mapping[str, Any]) -> list[str]:
@@ -341,13 +319,12 @@ def _registered_lines(report: Mapping[str, Any]) -> list[str]:
             lines += [f"**{project}**", *entries]
     else:
         # A report from before the projection existed: the carry-forward rows are all there is, and
-        # they record a state change, not a next action.
+        # they record a state change, not a next action, so none is shown as one.
         for thread_id, change in changes.items():
             state = _ident(change.get("state_after"))
             if change.get("action") != "close_done" and state:
-                why = _THREAD_ACTIONS.get(change.get("action"))
-                lines += _registered_block(thread_id, state, f"{state}, {why}" if why else state)
-    lines += [f"✅ {thread_id} done ({_THREAD_ACTIONS['close_done']})"
+                lines += _registered_block(thread_id, state, None)
+    lines += [f"✅ {thread_id} done (its task reports completion)"
               for thread_id, change in changes.items() if change.get("action") == "close_done"]
     if lines and lines[-1] != "":
         lines.append("")
@@ -372,5 +349,10 @@ def render_daily_brief(report: Mapping[str, Any],
     lines += _handoff_lines(highlights) or ["No fresh handoff this cycle.", ""]
     lines += _registered_lines(report)
     lines += _section("📝 **Corrections & fixes**", _items(highlights, "corrections"))
+    # The collected input this cycle consumed: on a night with no new conversation, why it ran.
+    ingested = (report.get("v2_migration") or {}).get("candidates_new")
+    if isinstance(ingested, int) and not isinstance(ingested, bool) and ingested > 0:
+        lines.append(f"📥 {ingested} new source file{'s' if ingested != 1 else ''} "
+                     "quarantined for review")
     lines.append(compression_receipt(conversation))
     return "\n".join(lines)

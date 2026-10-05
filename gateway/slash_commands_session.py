@@ -528,14 +528,16 @@ class GatewaySessionCommandsMixin:
             return t("gateway.compress.failed", error=e)
 
     async def _run_manual_compression(self, source, session_entry, history: list, request, *,
-                                      reconcile_rows: Optional[list] = None) -> "ManualCompressionOutcome":
+                                      reconcile_rows: Optional[list] = None,
+                                      carried_codes: Optional[list] = None) -> "ManualCompressionOutcome":
         """Build a temporary agent, run the shared compress core, persist, and describe the outcome.
 
         Returns the structured outcome (``.reply`` is the surface text ``/compress`` prints); the
         scheduled-compression control verb reads the same before/after evidence off it rather than
         re-deriving token counts or parsing the reply. ``reconcile_rows`` (scheduled path only: the
         conversation's stored, unmerged rows) lets the temporary agent's summarizer see the verbatim
-        tail so the handoff's state sections reflect it, and verify Daily Threads codes against them.
+        tail so the handoff's state sections reflect it, and verify Daily Threads codes against them;
+        ``carried_codes`` are the codes verified for the handoff the scheduled path stored last.
         """
         from agent.conversation_compression import finalize_context_engine_compression_notification
         from agent.conversation_compression_manual import compress_now, render_compress_result
@@ -569,8 +571,8 @@ class GatewaySessionCommandsMixin:
 
         original_session_id = session_entry.session_id
         tmp_agent = await self._build_manual_compression_agent(session_entry.session_id, model, runtime_kwargs)
-        if reconcile_rows is not None:
-            reconcile_handoff_with_tail(tmp_agent.context_compressor, reconcile_rows)
+        verifying = reconcile_rows is not None and reconcile_handoff_with_tail(
+            tmp_agent.context_compressor, reconcile_rows, carried_codes or [])
         try:
             # Not a bare run_in_executor: the profile secret scope is a contextvar the default
             # executor hop would drop, failing aux-client credential resolution closed.
@@ -599,7 +601,8 @@ class GatewaySessionCommandsMixin:
             status=result.status, before_tokens=result.before_tokens, after_tokens=result.after_tokens,
             before_messages=len(result.before_messages), after_messages=len(result.after_messages),
             session_id=original_session_id, new_session_id=session_entry.session_id,
-            committed=committed, highlights=handoff_highlights(result.after_messages))
+            committed=committed, highlights=handoff_highlights(result.after_messages),
+            verified_codes=getattr(compressor, "verified_codes", None) if verifying else None)
 
     async def _build_manual_compression_agent(self, session_id: str, model, runtime_kwargs: dict):
         """Build the throwaway AIAgent that performs a manual /compress rewrite of *session_id*."""

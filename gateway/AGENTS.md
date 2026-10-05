@@ -100,12 +100,17 @@ and wins over the summary, so without it the handoff's `## Blocked` — which th
 budget (newest end kept), and any echo of it is cut before the handoff is stored. The returned highlights carry one-heading brief
 sections plus `latest_reply`; the cron job renders them deterministically (`dream_cycle_v3/
 daily_brief.py`), never through a second model pass. The same pass asks for `## Daily Threads`
-(`agent/context_compressor_daily_threads.py`); a code the user never wrote is rewritten `proposed`
-before the handoff is stored. Before reserving, it fingerprints the RAW stored rows (no alternation
-repair; compaction handoffs and mirrored `[Cron delivery:` rows excluded): equal to the fingerprint
-the last applied marker recorded means `unchanged`, answered with no reservation and no model call.
-Both that answer and `already_applied` are re-checked under the reservation (a concurrent request
-may have committed in between), and the scheduled path verifies codes against those stored rows.
+(`agent/context_compressor_daily_threads.py`); a code the user never agreed to (only named in a
+quote, a question, a refusal or an example) is rewritten `proposed` before the handoff is stored.
+The marker records the codes that pass verified (`daily_threads: {version, established}`), and only
+those carry to the next pass: a handoff without that record (legacy, plugin engine) establishes no
+code. Before reserving, it fingerprints the RAW stored rows (no alternation repair; compaction
+handoffs and mirrored `[Cron delivery:` rows excluded): equal to the fingerprint the last applied
+marker recorded means `unchanged`, answered with no reservation and no model call. Both that answer
+and `already_applied` are re-checked under the reservation (a concurrent request may have committed
+in between), and the scheduled path verifies codes against those stored rows. `dry_run` is a poll
+answered from the same read-only pass; it never reserves, so asking never takes the conversation
+from a user mid-turn.
 
 ## Background process notifications
 

@@ -322,7 +322,7 @@ def _script_argv(path: Path) -> tuple[Optional[list[str]], dict[str, str], Optio
 
 def _run_job_script(
     script_path: str, workdir: Optional[str] = None,
-    cancel_event: Optional[_CancelEventLike] = None,
+    cancel_event: Optional[_CancelEventLike] = None, execution_id: Optional[str] = None,
 ) -> tuple[bool, str]:
     """Execute a cron job's script and return ``(success, output)``; on failure *output* is the
     error message for the LLM to report. Env goes through ``build_subprocess_env`` (SECURITY.md
@@ -332,7 +332,8 @@ def _run_job_script(
     Args: script_path: Path to the script. Relative paths are resolved against HERMES_HOME/scripts/.
     Absolute and ~-prefixed paths are also validated to ensure they stay within the scripts dir. workdir:
     Optional absolute path to use as the script's cwd. When set, the subprocess runs in this directory
-    instead of the scripts-dir parent. See #69396.
+    instead of the scripts-dir parent. See #69396. execution_id: the cron run this script belongs
+    to, exported as ``cron.executions.EXECUTION_ID_ENV``.
     """
     path, err = _resolve_script_path(script_path)
     if path is None:
@@ -357,6 +358,9 @@ def _run_job_script(
                 "errors": "replace"}
         env = build_subprocess_env()
         env.update(env_overlay)
+        if execution_id:
+            from cron.executions import EXECUTION_ID_ENV
+            env[EXECUTION_ID_ENV] = execution_id
         # Subprocess cwd only (default: scripts-dir parent). NEVER os.chdir() the process.
         # Use the job's workdir as the subprocess cwd when configured, otherwise default to the scripts-dir
         # parent (back-compat). NEVER mutate the Python process cwd — that would leak into concurrent
@@ -438,8 +442,10 @@ def _run_job_script_with_claim_heartbeat(
     schedule = job.get("schedule")
     claim = job.get("run_claim")
     owner = str(claim.get("by") or "") if isinstance(claim, dict) else ""
+    execution_id = str(job.get("execution_id") or "") or None
     if not (isinstance(schedule, dict) and schedule.get("kind") == "once" and owner):
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
+        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event,
+                               execution_id=execution_id)
 
     job_id = str(job.get("id") or "")
     stop = threading.Event()
@@ -457,10 +463,12 @@ def _run_job_script_with_claim_heartbeat(
             "Job '%s': could not start script run_claim heartbeat", job_id, exc_info=True),
     )
     if heartbeat_thread is None:
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
+        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event,
+                               execution_id=execution_id)
 
     try:
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
+        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event,
+                               execution_id=execution_id)
     finally:
         stop.set()
         # Bounded join: the heartbeat may be blocked on another process's jobs-file lock.
