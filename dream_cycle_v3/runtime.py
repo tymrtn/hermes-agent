@@ -34,13 +34,14 @@ from dataclasses import dataclass, field
 from datetime import date as date_type
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from . import CONTRACT_SCHEMA_VERSION
 from .adapters import read_github_issues, read_kanban_board, read_todoist_tasks
 from .canonical import canonical_json, stable_id
 from .carry_forward import CarryForwardPolicy, run_carry_forward
 from .collect import CollectionBounds, collect_to_manifest
+from .context_gate import canonical_digest, decide, last_checkpoint, record_checkpoint
 from .contracts import is_iso_date, is_iso_datetime, parse_iso_datetime
 from .conversation_compression import (conversation_compression_status,
                                        request_conversation_compression)
@@ -78,6 +79,8 @@ REPLAY_LABEL = ("historical replay: seven contiguous one-day windows "
                 "NOT seven elapsed daily operational cycles")
 # per-thread detail cap for cycle reports; totals are always exact
 REPORT_THREADS_CAP = 100
+# open registered threads carried into the report for the delivered brief
+REGISTERED_THREADS_CAP = 12
 # The negative retrieval probe: a resolver that activates a project on this
 # no-evidence message is over-eager and must fail the smoke. The odd token
 # keeps real registries from colliding with it accidentally.
@@ -261,6 +264,13 @@ class CycleResult:
     #: retry `report_path` carries the FIRST attempt's section and only this file carries THIS
     #: attempt's outcome. None when conversation compression was not requested.
     conversation_attempt_path: Path | None = None
+    #: The no-new-context gate (``context_gate``): ``new``, ``unchanged`` (nothing to deliver) or
+    #: ``unsettled`` (the conversation's state is unknown; deliver, never checkpoint).
+    context: str = "new"
+
+    @property
+    def skipped(self) -> bool:
+        return self.context == "unchanged"
 
 
 @dataclass(frozen=True)
@@ -475,8 +485,25 @@ def _hot_memory_task_leakage(store: ContinuityStore) -> dict[str, int]:
             "promoted_candidates": promoted}
 
 
+def _registered_threads(store: ContinuityStore) -> dict[str, Any]:
+    """Every open registered thread as the delivered brief lists it, changed tonight or not. The
+    registry contract records no priority or group, so none is invented here."""
+    rows = sorted(store.select_nonterminal_threads(), key=lambda row: row["thread_id"])
+    names: dict[str, str] = {}
+    threads = []
+    for row in rows[:REGISTERED_THREADS_CAP]:
+        if row["project_id"] not in names:
+            project = store.get_project(row["project_id"])
+            names[row["project_id"]] = project["canonical_name"] if project else row["project_id"]
+        threads.append({"thread_id": row["thread_id"], "project_name": names[row["project_id"]],
+                        "title": row["title"], "state": row["state"],
+                        "next_action": row["normalized_next_action"],
+                        "blocked_by": row["blocked_by"], "follow_up_after": row["follow_up_after"]})
+    return {"threads": threads, "total": len(rows)}
+
+
 def _status_line(report: dict[str, Any], report_path: Path, ok: bool, *,
-                 conversation_attempt_path: Path | None = None) -> str:
+                 conversation_attempt_path: Path | None = None, context: str = "new") -> str:
     if not ok:
         return (f"dream-cycle-v3 cycle FAIL reason=retrieval_smoke "
                 f"mode={report['mode']} profile={report['profile']} "
@@ -504,7 +531,7 @@ def _status_line(report: dict[str, Any], report_path: Path, ok: bool, *,
             f"dispositions={dispositioned}/{carry['selected']} "
             f"receipts={report['invariants']['write_receipts']} "
             f"smoke={smoke_state} continuity={compression_state} "
-            f"conversation={conversation_state} "
+            f"conversation={conversation_state} context={context} "
             + (f"conversation_report={conversation_attempt_path} "
                if conversation_attempt_path is not None else "")
             + f"report={report_path}")
@@ -707,12 +734,18 @@ def _publish_cycle_report_once(store: ContinuityStore, report: dict[str, Any],
 # One daily cycle
 # ---------------------------------------------------------------------------
 
-def run_cycle(config: RuntimeConfig) -> CycleResult:
+def run_cycle(config: RuntimeConfig, *, deliver: Callable[[CycleResult], None] | None = None,
+              output: str = "brief") -> CycleResult:
     """Execute one deterministic Phase 4 cycle under the single-flight lock.
 
     Collection, store recording, registry/thread upserts, tracker
     snapshots, quarantine-first v2 migration, carry-forward, retrieval
     smoke, machine report. No destination promotion in any mode.
+
+    *deliver* writes out a successful cycle that has new context. It runs under the lock, and the
+    no-new-context checkpoint is recorded only after it returns, so a delivery that raises leaves
+    the next run free to deliver again. *output* names what *deliver* writes (``brief`` or
+    ``status``); each output keeps its own checkpoint.
     """
     roots = CollectionRoots.resolve(config.profile, dict(config.read_roots))
     v3_root = _prepare_v3_root(config, roots)
@@ -735,14 +768,17 @@ def run_cycle(config: RuntimeConfig) -> CycleResult:
             store.record_run(manifest, str(manifest_path), now)
 
             registry_outcomes: dict[str, int] = {}
+            registry_entries = None
             if config.registry_path is not None:
-                for entry in _load_json_list(Path(config.registry_path),
-                                             "project registry"):
+                registry_entries = _load_json_list(Path(config.registry_path),
+                                                   "project registry")
+                for entry in registry_entries:
                     _bump(registry_outcomes,
                           store.upsert_project(entry, now, run_id=run_id))
 
             tracker_rows = []
-            for result in _tracker_results(config):
+            trackers = _tracker_results(config)
+            for result in trackers:
                 store.record_adapter_snapshot(
                     run_id=run_id, adapter=result.adapter,
                     source_locator=result.source_locator,
@@ -756,9 +792,11 @@ def run_cycle(config: RuntimeConfig) -> CycleResult:
                 })
 
             thread_outcomes: dict[str, int] = {"inserted": 0, "exists": 0}
+            thread_entries = None
             if config.threads_path is not None:
-                for thread in _load_json_list(Path(config.threads_path),
-                                              "thread seed"):
+                thread_entries = _load_json_list(Path(config.threads_path),
+                                                 "thread seed")
+                for thread in thread_entries:
                     _bump(thread_outcomes,
                           store.open_thread(thread, now, run_id=run_id))
 
@@ -822,6 +860,15 @@ def run_cycle(config: RuntimeConfig) -> CycleResult:
             else:
                 conversation_report = {"enabled": False}
 
+            # Read-only, under the lock: has anything the brief reads changed since the last brief
+            # that went out? The store pass above still ran — collection is windowed, and skipping
+            # it would drop this window's sources — but it makes no model call.
+            gate = decide(conversation_report,
+                          canonical_digest(registry=registry_entries, threads=thread_entries,
+                                           trackers=trackers),
+                          last_checkpoint(store, profile=config.profile, mode=config.mode,
+                                          output=output))
+
             if config.smoke_configured:
                 smoke = _retrieval_smoke(config, db_path)
             else:
@@ -879,6 +926,7 @@ def run_cycle(config: RuntimeConfig) -> CycleResult:
                     "quarantined_total": quarantined_total,
                 },
                 "carry_forward": carry_bounded,
+                "registered_threads": _registered_threads(store),
                 "daily_compression": compression_report,
                 "conversation_compression": conversation_report,
                 "retrieval_smoke": smoke,
@@ -918,12 +966,22 @@ def run_cycle(config: RuntimeConfig) -> CycleResult:
                     "report_sha256": report_sha256,
                 })
 
-    return CycleResult(report=report, report_path=report_path,
-                       status_line=_status_line(
-                           report, report_path, ok,
-                           conversation_attempt_path=conversation_attempt_path),
-                       ok=ok,
-                       conversation_attempt_path=conversation_attempt_path)
+            result = CycleResult(report=report, report_path=report_path,
+                                 status_line=_status_line(
+                                     report, report_path, ok,
+                                     conversation_attempt_path=conversation_attempt_path,
+                                     context=gate.state),
+                                 ok=ok,
+                                 conversation_attempt_path=conversation_attempt_path,
+                                 context=gate.state)
+            if ok and not gate.skip and deliver is not None:
+                deliver(result)
+                if gate.settled:
+                    record_checkpoint(store, run_id=run_id, profile=config.profile,
+                                      mode=config.mode, output=output,
+                                      cycle_date=config.disposition_date,
+                                      fingerprint=gate.fingerprint)
+    return result
 
 
 # ---------------------------------------------------------------------------

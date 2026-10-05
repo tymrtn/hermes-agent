@@ -14,17 +14,25 @@ therefore request + honest accounting:
   from per-session `applied` rows carrying before/after evidence — never from the fact a request
   was sent, and never from a previously stored request.
 - Highlights are the bounded sections of the handoff the compressor itself wrote, passed through
-  the shared sanitizers (secretguard + PII redaction + caps) like every other emitted string.
+  the shared sanitizers (secretguard + PII redaction + caps) like every other emitted string, cut on
+  word boundaries. ``daily_threads`` stays structured: codes cross the identifier sanitizer, every
+  free-text field the text sanitizer, and standing/priority/dependency are closed enums.
+- ``activity`` says whether the conversation's state is KNOWN (``settled``) and its fingerprint, so
+  the cycle can tell "nothing new" from "could not tell". Only the gateway reads transcripts; this
+  side only forwards the digests it reported.
 - Nothing from here enters the continuity store. It belongs to the run report, whose job is
   operational evidence, not durable continuity.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import os
+import re
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
-from .sanitize import sanitize_identifier, sanitize_text
+from .sanitize import INVALID, WITHHELD, clip_words, sanitize_enum, sanitize_identifier, sanitize_text
 
 CONVERSATION_COMPRESSION_SCHEMA_VERSION = 1
 
@@ -46,15 +54,24 @@ CLAIM_APPLIED = "applied"          # at least one conversation was really compre
 CLAIM_DEFERRED = "deferred"        # the gateway answered and deliberately left every session alone
 CLAIM_ALREADY = "already_applied"  # this cycle had already compressed them (idempotent rerun)
 CLAIM_NOTHING_ELIGIBLE = "nothing_eligible"
+CLAIM_UNCHANGED = "unchanged"      # nothing said since the last committed compression; not redone
 CLAIM_UNAVAILABLE = "unavailable"  # no gateway answered; nothing was attempted
 CLAIM_FAILED = "failed"
 
-_STATUS_KEYS = ("applied", "already_applied", "deferred", "eligible", "failed")
+_STATUS_KEYS = ("applied", "already_applied", "unchanged", "deferred", "eligible", "failed")
+#: Row outcomes whose conversation state is known and final for this cycle.
+_SETTLED_STATUSES = ("applied", "already_applied", "unchanged")
+_FINGERPRINT_RE = re.compile(r"[0-9a-f]{64}")
+
+MAX_DAILY_THREADS = 12
+_THREAD_STANDINGS = frozenset({"established", "proposed", "uncoded"})
+_PRIORITIES = frozenset({"P0", "P1", "P2", "P3", "P?"})
+_DEPENDENCY_KINDS = frozenset({"blocked", "needs_help", "needs_authorization", "waiting_externally"})
 
 __all__ = [
     "CONVERSATION_COMPRESSION_SCHEMA_VERSION", "DEFAULT_TIMEOUT_SECONDS", "DEFAULT_LIMIT",
     "CLAIM_APPLIED", "CLAIM_DEFERRED", "CLAIM_ALREADY", "CLAIM_NOTHING_ELIGIBLE",
-    "CLAIM_UNAVAILABLE", "CLAIM_FAILED", "control_home_candidates",
+    "CLAIM_UNCHANGED", "CLAIM_UNAVAILABLE", "CLAIM_FAILED", "control_home_candidates",
     "classify_conversation_compression", "request_conversation_compression",
     "conversation_compression_status",
 ]
@@ -88,23 +105,117 @@ def control_home_candidates(profile: str, *, gateway_home: str | os.PathLike | N
     return seen
 
 
-def _highlights(rows: Sequence[Mapping[str, Any]]) -> dict[str, list[str]]:
-    """Merge the applied sessions' handoff bullets, sanitized and bounded."""
-    merged: dict[str, list[str]] = {}
+def _text(value: Any, limit: int = HIGHLIGHT_CHARS) -> str:
+    """One handoff string: sanitized over its full length, then cut on a word boundary."""
+    return clip_words(sanitize_text(value, 4 * limit), limit)
+
+
+def _code(value: Any) -> str:
+    text = sanitize_identifier(value, 80)
+    return "" if text in (INVALID, WITHHELD) else text
+
+
+def _thread(raw: Any) -> dict[str, Any] | None:
+    """One structured daily thread, every field sanitized; None when its identity does not survive."""
+    if not isinstance(raw, Mapping):
+        return None
+    standing = sanitize_enum(raw.get("standing"), _THREAD_STANDINGS)
+    if standing == INVALID:
+        return None
+    thread: dict[str, Any] = {"standing": standing, "state": _text(raw.get("state")),
+                              "next": _text(raw.get("next"))}
+    if standing == "uncoded":
+        thread["title"] = _text(raw.get("title"), 80)
+        if not thread["title"]:
+            return None
+    else:
+        code, key, group = _code(raw.get("code")), _code(raw.get("key")), _code(raw.get("group"))
+        priority = sanitize_enum(raw.get("priority"), _PRIORITIES)
+        if not (code and key and group) or priority == INVALID or code != f"{priority}-{key}":
+            return None
+        thread.update(code=code, key=key, group=group, priority=priority)
+    dependency = raw.get("dependency")
+    if isinstance(dependency, Mapping):
+        kind = sanitize_enum(dependency.get("kind"), _DEPENDENCY_KINDS)
+        detail = _text(dependency.get("detail"))
+        if kind != INVALID and detail:
+            thread["dependency"] = {"kind": kind, "detail": detail}
+    return thread
+
+
+def _daily_threads(raw: Any, merged: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(raw, Mapping):
+        return merged
+    merged = merged or {"threads": [], "unformatted": [], "unformatted_total": 0}
+    for value in raw.get("threads") or []:
+        thread = _thread(value)
+        if thread is not None and len(merged["threads"]) < MAX_DAILY_THREADS:
+            merged["threads"].append(thread)
+    for value in raw.get("unformatted") or []:
+        text = _text(value)
+        if text and len(merged["unformatted"]) < 3:
+            merged["unformatted"].append(text)
+    merged["unformatted_total"] += _int(raw.get("unformatted_total"))
+    return merged
+
+
+def _highlights(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Merge the sessions' handoff projection, sanitized and bounded. Next to sessions with a
+    daily-thread section, the open items of those without one are kept apart (``unthreaded``) so
+    the brief can say they carry no priority instead of dropping them."""
+    merged: dict[str, Any] = {}
+    daily_threads = None
+    unthreaded: dict[str, Any] = {"conversations": 0, "items": []}
     for row in rows:
         raw = row.get("highlights")
         if not isinstance(raw, Mapping):
             continue
+        daily_threads = _daily_threads(raw.get("daily_threads"), daily_threads)
+        if not isinstance(raw.get("daily_threads"), Mapping):
+            unthreaded["conversations"] += 1
+            for name in ("open_items", "open_threads"):
+                for value in raw.get(name) if isinstance(raw.get(name), list) else ():
+                    text = _text(value)
+                    if text and text not in unthreaded["items"] \
+                            and len(unthreaded["items"]) < HIGHLIGHT_LIMITS["open_items"]:
+                        unthreaded["items"].append(text)
         for name, limit in HIGHLIGHT_LIMITS.items():
             values = raw.get(name)
             if not isinstance(values, list):
                 continue
             bucket = merged.setdefault(name, [])
             for value in values:
-                text = sanitize_text(value, HIGHLIGHT_CHAR_LIMITS.get(name, HIGHLIGHT_CHARS))
+                text = _text(value, HIGHLIGHT_CHAR_LIMITS.get(name, HIGHLIGHT_CHARS))
                 if text and text not in bucket and len(bucket) < limit:
                     bucket.append(text)
-    return {k: v for k, v in merged.items() if v}
+    merged = {k: v for k, v in merged.items() if v}
+    if daily_threads is not None:
+        merged["daily_threads"] = daily_threads
+        if unthreaded["conversations"]:
+            merged["unthreaded"] = unthreaded
+    return merged
+
+
+def _settled(row: Mapping[str, Any]) -> bool:
+    """The gateway knows this conversation's state and nothing about it is left pending."""
+    if not _FINGERPRINT_RE.fullmatch(str(row.get("activity_fingerprint") or "")):
+        return False
+    status = row.get("status")
+    if status == "applied":
+        return _has_evidence(row)
+    return status in _SETTLED_STATUSES or (status == "deferred" and row.get("reason") == "too_short")
+
+
+def _activity(rows: Sequence[Mapping[str, Any]], *, answered: bool) -> dict[str, Any]:
+    """Whether this answer pins the conversation's state, and the digest of it when it does.
+
+    Unknown is never "unchanged": no answer, a pending answer, a deferral for a running turn or any
+    failure leaves ``settled`` false, so the cycle neither goes quiet nor checkpoints on it."""
+    if not answered or not all(_settled(row) for row in rows):
+        return {"settled": False, "fingerprint": None}
+    pairs = sorted([str(row.get("session_ref") or ""), row["activity_fingerprint"]] for row in rows)
+    digest = hashlib.sha256(json.dumps(pairs, separators=(",", ":")).encode("utf-8")).hexdigest()
+    return {"settled": True, "fingerprint": digest}
 
 
 def _int(value: Any) -> int:
@@ -153,15 +264,16 @@ def classify_conversation_compression(response: Mapping[str, Any] | None, *, pro
         "evidence_source": "gateway_control_socket",
         "gateway_answered": response is not None,
     }
+    unknown = {"settled": False, "fingerprint": None}
     if response is None:
         return {**section, "claim": CLAIM_UNAVAILABLE, "counts": {},
                 "reason": sanitize_text(unavailable_reason or "no gateway answered "
                                         "'compress-session' for this profile", 160),
-                "sessions": [], "highlights": {}}
+                "sessions": [], "highlights": {}, "activity": unknown}
     if response.get("ok") is False:
         return {**section, "claim": CLAIM_FAILED, "counts": {},
                 "reason": sanitize_text(response.get("error") or "gateway refused the request", 160),
-                "sessions": [], "highlights": {}}
+                "sessions": [], "highlights": {}, "activity": unknown}
 
     raw_rows = [r for r in (response.get("sessions") or []) if isinstance(r, Mapping)]
     applied = [r for r in raw_rows if r.get("status") == "applied" and _has_evidence(r)]
@@ -179,8 +291,16 @@ def classify_conversation_compression(response: Mapping[str, Any] | None, *, pro
         claim = CLAIM_ALREADY
     elif any(r.get("status") == "deferred" for r in raw_rows) or response.get("pending"):
         claim = CLAIM_DEFERRED
+    elif any(r.get("status") == "unchanged" for r in raw_rows):
+        claim = CLAIM_UNCHANGED
     else:
         claim = CLAIM_NOTHING_ELIGIBLE
+    # The standing handoff travels with an unchanged or already-applied answer too: the brief may
+    # still go out because other context changed, or because the attempt that compressed never
+    # delivered, and one conversation compressed tonight does not close another's open threads. A
+    # deferral or failure carries none; nothing was settled there.
+    handoff_rows = applied + [r for r in raw_rows
+                              if r.get("status") in ("unchanged", "already_applied")]
 
     section.update({
         "claim": claim,
@@ -196,7 +316,8 @@ def classify_conversation_compression(response: Mapping[str, Any] | None, *, pro
             "after": sum(_int(r.get("after_messages")) for r in applied),
         },
         "sessions": [_session_row(r) for r in raw_rows[:MAX_SESSION_ROWS]],
-        "highlights": _highlights(applied),
+        "highlights": _highlights(handoff_rows),
+        "activity": _activity(raw_rows, answered=not response.get("pending")),
     })
     if response.get("pending"):
         section["reason"] = ("gateway still compressing when the client stopped waiting; "

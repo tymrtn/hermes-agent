@@ -36,6 +36,14 @@ over the gateway's own control socket. Consequences that are the whole point:
   those sections, so the scheduled run lets its one summarizer call see the retained tail as
   reference (``reconcile_handoff_with_tail``); otherwise the brief reports a blocker the final
   exchange already resolved. The tail stays verbatim; its last assistant text is ``latest_reply``.
+  The same call writes ``## Daily Threads`` (``agent/context_compressor_daily_threads.py``), the
+  structured thread lines the brief groups by priority.
+- Nothing new, nothing summarized. A new cycle id is a new date, not new conversation. A commit stamps
+  the ACTIVITY FINGERPRINT of the persisted transcript, and a later cycle whose transcript still has
+  it answers ``unchanged`` before reserving anything and without a model call; re-summarizing an
+  unchanged handoff only paraphrases it. The fingerprint skips compaction handoffs and synthetic user
+  rows, the mirrored cron brief among them, so the cycle's own rewrite and its own delivered brief
+  never count as new conversation.
 """
 
 from __future__ import annotations
@@ -43,6 +51,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import json
 import logging
 import os
 import re
@@ -78,11 +87,14 @@ MAX_HIGHLIGHT_CHARS = 160
 MAX_OPEN_ITEMS = 4
 MAX_CORRECTIONS = 3
 MAX_LATEST_REPLY_CHARS = 280
+MAX_DAILY_THREADS = 12
+MAX_UNFORMATTED_THREAD_LINES = 3
 _ACTIVE_TASK_RE = re.compile(r"^\*{0,2}active task:?\*{0,2}:?\s*", re.IGNORECASE)
 
 
 _STATUS_APPLIED = "applied"
 _STATUS_ALREADY = "already_applied"
+_STATUS_UNCHANGED = "unchanged"
 _HEADING_RE = re.compile(r"^##\s+(.+?)\s*$", re.MULTILINE)
 
 
@@ -104,7 +116,7 @@ class ManualCompressionOutcome:
     after_messages: int = 0
     session_id: str = ""
     new_session_id: str = ""
-    highlights: Dict[str, List[str]] = field(default_factory=dict)
+    highlights: Dict[str, Any] = field(default_factory=dict)
     #: The rewrite really COMMITTED (rotation persisted + repointed, or in-place archive). False
     #: whenever ``status`` is ``compressed`` but the commit was a no-op — a refused would-grow
     #: candidate, or a persistence failure the compressor caught and rolled back (#44794).
@@ -156,12 +168,16 @@ def _last_summary_index(messages: Any) -> Optional[int]:
 
 
 def _clip(text: str, limit: int) -> str:
-    """*text* cut at a word boundary to at most *limit* characters, with an ellipsis when cut."""
+    """*text* cut at a word boundary to at most *limit* characters, with an ellipsis when cut. A
+    first word longer than *limit* leaves only the ellipsis, never part of the word."""
     text = " ".join(text.split())
     if len(text) <= limit:
         return text
-    cut = text[:limit - 1].rsplit(" ", 1)[0]
-    return cut.rstrip(" ,;:-") + "…"
+    cut = text[:limit - 1]
+    if text[len(cut)] != " ":
+        cut = cut.rsplit(" ", 1)[0] if " " in cut else ""
+    # Not "-": a credential's last character, and the client's secret scan still has to see it.
+    return cut.rstrip(" ,;:") + "…"
 
 
 def _latest_reply(messages: Any, after: int) -> str:
@@ -195,7 +211,7 @@ def _bullets(body: str) -> List[str]:
         line = re.sub(r"^\d+[.)]\s*", "", line)
         if not line or line.lower() in {"none", "n/a", "none.", "(none)"} or line.startswith("["):
             continue
-        lines.append(line[:MAX_HIGHLIGHT_CHARS])
+        lines.append(_clip(line, MAX_HIGHLIGHT_CHARS))
         if len(lines) >= MAX_HIGHLIGHTS:
             break
     return lines
@@ -230,7 +246,30 @@ def _active_task(sections: Dict[str, str]) -> str:
     return ""
 
 
-def handoff_highlights(messages: Any) -> Dict[str, List[str]]:
+def _daily_threads(sections: Dict[str, str]) -> Optional[Dict[str, Any]]:
+    """The ``## Daily Threads`` lines as structured threads (clipped, bounded), or None when the
+    handoff has no such section — a handoff written before it existed, which the brief must call
+    out rather than dress up as prioritized threads."""
+    from agent.context_compressor_daily_threads import DAILY_THREADS_HEADING, parse_daily_threads
+
+    body = next((text for heading, text in sections.items()
+                 if heading.lower() == DAILY_THREADS_HEADING.lower()), None)
+    if body is None:
+        return None
+    threads, unformatted = parse_daily_threads(body)
+    for thread in threads:
+        for name in ("title", "state", "next"):
+            if name in thread:
+                thread[name] = _clip(thread[name], MAX_HIGHLIGHT_CHARS)
+        if "dependency" in thread:
+            thread["dependency"]["detail"] = _clip(thread["dependency"]["detail"], MAX_HIGHLIGHT_CHARS)
+    return {"threads": threads[:MAX_DAILY_THREADS],
+            "unformatted": [_clip(line, MAX_HIGHLIGHT_CHARS)
+                            for line in unformatted[:MAX_UNFORMATTED_THREAD_LINES]],
+            "unformatted_total": len(unformatted)}
+
+
+def handoff_highlights(messages: Any) -> Dict[str, Any]:
     """Bounded projection of the handoff the compressor wrote, plus the retained final reply.
 
     ``open_threads``/``learnings``: the first heading in each group that actually has content wins,
@@ -257,22 +296,54 @@ def handoff_highlights(messages: Any) -> Dict[str, List[str]]:
         "latest_reply": [t for t in (_latest_reply(messages, index),) if t],
     }
     out.update({name: items for name, items in brief.items() if items})
+    daily_threads = _daily_threads(sections)
+    if daily_threads is not None:
+        out["daily_threads"] = daily_threads
     return out
 
 
-def reconcile_handoff_with_tail(compressor: Any) -> bool:
+def activity_fingerprint(messages: Any) -> str:
+    """Digest of the conversation's own turns: every user/assistant/tool row in order, minus
+    compaction handoffs and synthetic user rows (runtime scaffolding and the mirrored cron brief).
+
+    Read it from STORED rows (``load_transcript(..., repair_alternation=False)``): the replay repair
+    merges a mirrored brief into the next real user turn, and a merged row can be neither skipped
+    nor kept without losing one of them. A rewrite that only replaced old turns with a handoff, or a
+    cron delivery appended to the chat, leaves it unchanged; any new exchange changes it."""
+    from agent.context_compressor import (ContextCompressor, _synthetic_user_row,
+                                          is_compaction_summary_message)
+
+    turns = []
+    for message in messages if isinstance(messages, list) else ():
+        role = message.get("role") if isinstance(message, dict) else None
+        if role not in ("user", "assistant", "tool") or is_compaction_summary_message(message):
+            continue
+        text = _message_text(message)
+        if role == "user" and (_synthetic_user_row(text)
+                               or ContextCompressor._is_synthetic_compression_user_turn(message)):
+            continue
+        turns.append([role, text])
+    return hashlib.sha256(json.dumps(turns, ensure_ascii=False, separators=(",", ":"))
+                          .encode("utf-8")).hexdigest()
+
+
+def reconcile_handoff_with_tail(compressor: Any, stored_rows: List[Dict[str, Any]]) -> bool:
     """Let *compressor*'s summarizer see the verbatim tail so the handoff's state sections reflect
     it; False if it is not the built-in ``ContextCompressor`` (a plugin context engine keeps its own
     summary policy).
 
     Only ever applied to the throwaway agent a scheduled compression builds, so no live agent's
     compression changes. Same single summarizer call; the tail is added to its input, not summarized.
+    Daily Threads codes are verified against *stored_rows*, the conversation as stored: replay
+    merges a mirrored brief into the user rows around it, which would make the brief's own codes
+    read as the user's, or the user's reply to it as the brief.
     """
     from agent.context_compressor import ContextCompressor
 
     if not isinstance(compressor, ContextCompressor):
         return False
     compressor.reconcile_with_retained_tail = True
+    compressor.code_evidence_rows = stored_rows
     return True
 
 
@@ -322,6 +393,40 @@ def _already_done(marker: Any, cycle_id: str) -> bool:
     """True when this cycle already settled this conversation (idempotence)."""
     return (isinstance(marker, dict) and marker.get("cycle_id") == cycle_id
             and marker.get("status") == _STATUS_APPLIED)
+
+
+def _unchanged_since_compression(marker: Any, fingerprint: str) -> bool:
+    """True when the last scheduled compression COMMITTED and nothing was said since. A marker
+    from before fingerprints existed, or from a failed or deferred attempt, never matches: those
+    conversations stay eligible."""
+    return (isinstance(marker, dict) and marker.get("status") == _STATUS_APPLIED
+            and marker.get("activity_fingerprint") == fingerprint)
+
+
+async def _stored_rows(store: Any, session_id: str) -> List[Dict[str, Any]]:
+    return await store.load_transcript(session_id, repair_alternation=False)
+
+
+def _settled_without_compressing(row: Dict[str, Any], marker: Any, cycle_id: str,
+                                 current: List[Dict[str, Any]],
+                                 include_highlights: bool) -> Optional[Dict[str, Any]]:
+    """The answer for a conversation this cycle must not compress, or None when it should.
+
+    Already compressed in this cycle, or nothing said since the last committed compression. The
+    fingerprint is always the conversation as it stands now: anything said since this cycle's
+    compression is new context for the brief, though it is not compressed twice."""
+    fingerprint = activity_fingerprint(current)
+    if _already_done(marker, cycle_id):
+        out = {**row, "status": _STATUS_ALREADY, "activity_fingerprint": fingerprint,
+               "previous": {k: marker.get(k) for k in ("status", "at", "after_tokens")}}
+    elif _unchanged_since_compression(marker, fingerprint):
+        out = {**row, "status": _STATUS_UNCHANGED, "activity_fingerprint": fingerprint}
+    else:
+        return None
+    if include_highlights:
+        # A retry whose first attempt never delivered still needs the handoff it would have shown.
+        out["highlights"] = handoff_highlights(current)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -494,10 +599,17 @@ async def _compress_one_entry(runner: Any, entry: Any, *, cycle_id: str, dry_run
         "session_id": entry.session_id,
     }
 
+    from gateway.session_transcript import TranscriptReadError
+
     marker = await store.get_session_metadata(session_key, CYCLE_METADATA_KEY)
     if _already_done(marker, cycle_id):
-        return {**row, "status": _STATUS_ALREADY,
-                "previous": {k: marker.get(k) for k in ("status", "at", "after_tokens")}}
+        try:
+            current = await _stored_rows(store, entry.session_id)
+        except TranscriptReadError:
+            # No fingerprint, so the cycle cannot go quiet on a conversation it could not read.
+            return {**row, "status": _STATUS_ALREADY,
+                    "previous": {k: marker.get(k) for k in ("status", "at", "after_tokens")}}
+        return _settled_without_compressing(row, marker, cycle_id, current, include_highlights)
 
     # Fail closed on a key the persisted origin no longer reproduces: the compression lock, the
     # agent-cache eviction and the topic re-bind all key off the SOURCE, so a mismatch would
@@ -508,6 +620,16 @@ async def _compress_one_entry(runner: Any, entry: Any, *, cycle_id: str, dry_run
         return {**row, "status": "failed", "reason": f"origin_unusable: {type(exc).__name__}: {exc}"}
     if derived != session_key:
         return {**row, "status": "failed", "reason": "origin_key_mismatch"}
+
+    # Nothing said since the last committed compression: answer before reserving the conversation
+    # and before any model call. Read-only; a turn that lands after this read is tomorrow's news.
+    try:
+        current = await _stored_rows(store, entry.session_id)
+    except TranscriptReadError as exc:
+        return {**row, "status": "failed", "reason": f"transcript_unreadable: {exc}"}
+    settled = _settled_without_compressing(row, marker, cycle_id, current, include_highlights)
+    if settled is not None:
+        return settled
 
     # Reserve the conversation BEFORE reading its history: everything from here to the commit must
     # be serialized against inbound turns, or an arriving message runs a turn whose parent session
@@ -569,17 +691,27 @@ async def _compress_reserved_entry(runner: Any, entry: Any, row: Dict[str, Any],
     store = runner.async_session_store
     try:
         history = await store.load_transcript(entry.session_id)
+        stored = await _stored_rows(store, entry.session_id)
     except TranscriptReadError as exc:
         return {**row, "status": "failed", "reason": f"transcript_unreadable: {exc}"}
+    # Read again now that the conversation is ours: a concurrent request may have compressed it
+    # between this request's unreserved read and its reservation.
+    settled = _settled_without_compressing(
+        row, await store.get_session_metadata(session_key, CYCLE_METADATA_KEY), cycle_id, stored,
+        include_highlights)
+    if settled is not None:
+        return settled
     if not history or len(history) < MIN_MESSAGES:
+        # Settled, not pending: the same short transcript tomorrow is still nothing new.
         return {**row, "status": "deferred", "reason": "too_short",
-                "before_messages": len(history or [])}
+                "before_messages": len(history or []),
+                "activity_fingerprint": activity_fingerprint(stored)}
     if dry_run:
         return {**row, "status": "eligible", "before_messages": len(history)}
 
     with runner._profile_scope_for_source(entry.origin):
         outcome = await runner._run_manual_compression(
-            entry.origin, entry, history, parse_compress_args(""), reconcile=True)
+            entry.origin, entry, history, parse_compress_args(""), reconcile_rows=stored)
     # ``compress_now`` answering ``compressed`` is NOT proof of a rewrite: the compressor refuses a
     # candidate that would GROW the transcript, and a caught persistence failure restores the
     # original — both leave the id unrotated with nothing committed (#44794). Only an explicit
@@ -610,11 +742,16 @@ async def _compress_reserved_entry(runner: Any, entry: Any, row: Dict[str, Any],
         if registry is not None:
             with contextlib.suppress(Exception):
                 registry.rebind(reservation.token, outcome.new_session_id)
+    marker = {"cycle_id": cycle_id, "status": status, "detail": outcome.status, "at": int(time.time()),
+              "before_tokens": outcome.before_tokens, "after_tokens": outcome.after_tokens}
+    if status == _STATUS_APPLIED:
+        # Fingerprint what was PERSISTED, read back the way the next cycle will read it. Unreadable
+        # means no fingerprint: the next cycle compresses again instead of trusting a guess.
+        with contextlib.suppress(TranscriptReadError):
+            marker["activity_fingerprint"] = result["activity_fingerprint"] = activity_fingerprint(
+                await _stored_rows(store, outcome.new_session_id or entry.session_id))
     # Stamp AFTER the rewrite persisted, so a crash mid-compression leaves the cycle retryable.
-    await store.set_session_metadata(session_key, CYCLE_METADATA_KEY, {
-        "cycle_id": cycle_id, "status": status, "detail": outcome.status, "at": int(time.time()),
-        "before_tokens": outcome.before_tokens, "after_tokens": outcome.after_tokens,
-    })
+    await store.set_session_metadata(session_key, CYCLE_METADATA_KEY, marker)
     return result
 
 

@@ -795,6 +795,8 @@ def _lean_recovery_stub(tool_name: str, content_len: int, session_id: str) -> st
 _SYNTHETIC_USER_ROW_PREFIXES = (
     "[System:", "[CONTEXT", "[PRIOR CONTEXT", "[IMPORTANT: Background", "[Your active task list",
     "[Planning state preserved", "[ASYNC DELEGATION", "[OUT-OF-BAND", "Cronjob Response:",
+    # cron/scheduler_delivery.py::_cron_mirror_message: a delivered cron brief mirrored into the chat.
+    "[Cron delivery:",
 )
 
 

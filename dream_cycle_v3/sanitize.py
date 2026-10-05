@@ -96,6 +96,20 @@ def sanitize_text(value: object, limit: int = FIELD_CHARS) -> str:
         return WITHHELD
 
 
+def clip_words(text: str, limit: int) -> str:
+    """*text* cut to at most *limit* characters at a word boundary, with an ellipsis when cut.
+
+    For already-sanitized text a reader will see: a hard cut mid-word reads as a typo, not a clip.
+    A first word longer than *limit* leaves only the ellipsis, never part of the word."""
+    text = " ".join(str(text or "").split())
+    if len(text) <= limit:
+        return text
+    head = text[:max(limit - 1, 1)]
+    if text[len(head)] != " ":
+        head = head.rsplit(" ", 1)[0] if " " in head else ""
+    return head.rstrip(" ,;:-—–") + "…"
+
+
 def sanitize_identifier(value: object, limit: int = IDENTIFIER_CHARS) -> str:
     """Structural identifier field: bounded charset, no spaces, secret scan."""
     try:

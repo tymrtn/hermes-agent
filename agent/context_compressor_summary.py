@@ -7,6 +7,7 @@ import re
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from agent.auxiliary_client import AuxiliaryExplicitCancellation
+from agent.context_compressor_daily_threads import DAILY_THREADS_INSTRUCTIONS, verify_codes
 
 if TYPE_CHECKING:
     from agent.context_compressor import _HandoffScan
@@ -16,7 +17,8 @@ if TYPE_CHECKING:
 # everything after it verbatim, and by contract wins over the summary — so the handoff's state
 # sections lag exactly the exchange where work usually finishes, and a consumer reading them alone
 # reports blockers that exchange already resolved. The summarizer sees the tail as reference so
-# those sections reflect it; the tail itself is neither summarized nor removed.
+# those sections reflect it; the tail itself is neither summarized nor removed. The same block asks
+# for the ``## Daily Threads`` section the brief groups by code (``context_compressor_daily_threads``).
 _RETAINED_TAIL_OPEN, _RETAINED_TAIL_CLOSE = "<retained-tail-reference>", "</retained-tail-reference>"
 _RETAINED_TAIL_BLOCK = """
 
@@ -25,7 +27,7 @@ NEWER TURNS KEPT VERBATIM AFTER THIS SUMMARY (reference only; do not summarize o
 {tail}
 """ + _RETAINED_TAIL_CLOSE + """
 
-These turns are newer than everything above. Write "## Active State", "## Blocked" and any "## Active Task" as of the END of these turns: drop blockers they resolve and do not list as open anything they show as done."""
+These turns are newer than everything above. Write "## Active State", "## Blocked" and any "## Active Task" as of the END of these turns: drop blockers they resolve and do not list as open anything they show as done.""" + DAILY_THREADS_INSTRUCTIONS
 # The reference rides on top of the already-bounded middle and previous summary, so it gets a small
 # budget of its own; the END of the tail is what the state sections must reflect.
 _RETAINED_TAIL_MAX_CHARS = 40_000
@@ -93,11 +95,17 @@ class SummaryDispatchMixin:
         retained_tail = messages[scan.tail_start:] if getattr(self, "reconcile_with_retained_tail", False) else []
         self._retained_tail_reference = (
             _bound_retained_tail(self._serialize_for_summary(retained_tail)) if retained_tail else "")
+        previous_summary = self._previous_summary
         try:
             summary = self._generate_summary(turns_to_summarize, **summary_kwargs)
             if retained_tail:
                 summary = _strip_retained_tail_echo(summary)
                 self._previous_summary = _strip_retained_tail_echo(self._previous_summary)
+            # Before anything stores it: a Daily Threads code the user never wrote is a proposal. The
+            # scheduled path supplies the stored rows, where a mirrored brief is a row of its own.
+            evidence = getattr(self, "code_evidence_rows", None) or messages
+            summary = verify_codes(summary, evidence, previous_summary)
+            self._previous_summary = verify_codes(self._previous_summary, evidence, previous_summary)
             return summary
         except AuxiliaryExplicitCancellation:
             # Cancellation is a true no-op: restore the scan's mutation before the exception escapes.

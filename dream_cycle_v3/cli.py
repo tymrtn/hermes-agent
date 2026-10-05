@@ -248,21 +248,31 @@ def cmd_run(args: argparse.Namespace) -> int:
         gateway_home=args.gateway_home,
         **_cycle_source_kwargs(args),
     )
-    result = run_cycle(config)
+    def deliver(result) -> None:
+        if args.output == "brief":
+            # THIS attempt's conversation record: on a retry the publish-once cycle report still
+            # carries the first attempt's section.
+            conversation = result.report.get("conversation_compression")
+            if result.conversation_attempt_path is not None:
+                conversation = json.loads(
+                    result.conversation_attempt_path.read_text(encoding="utf-8"))
+            text = render_daily_brief(result.report, conversation)
+        else:
+            text = result.status_line
+        # Flushed before run_cycle records the no-new-context checkpoint.
+        sys.stdout.write(text + "\n")
+        sys.stdout.flush()
+
+    result = run_cycle(config, deliver=deliver, output=args.output)
     if not result.ok:
         print(result.status_line, file=sys.stderr)
         return 1
-    if args.output == "brief":
-        # THIS attempt's conversation record: on a retry the publish-once cycle report still
-        # carries the first attempt's section.
-        conversation = result.report.get("conversation_compression")
-        if result.conversation_attempt_path is not None:
-            conversation = json.loads(
-                result.conversation_attempt_path.read_text(encoding="utf-8"))
-        print(render_daily_brief(result.report, conversation))
+    if result.skipped:
+        # Nothing new since the last delivered brief: the cron script contract's explicit silence
+        # (cron/scheduler_prompt.py::_parse_wake_gate), so no-agent and agent jobs both stay quiet.
+        print(json.dumps({"wakeAgent": False}))
+    if result.skipped or args.output == "brief":
         print(result.status_line, file=sys.stderr)
-        return 0
-    print(result.status_line)
     return 0
 
 

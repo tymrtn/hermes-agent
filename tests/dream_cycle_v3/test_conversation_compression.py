@@ -163,6 +163,38 @@ def test_brief_sections_are_sanitized_and_bounded_like_every_highlight():
     assert 160 < len(highlights["latest_reply"][0]) <= 280
 
 
+def test_a_conversation_with_nothing_new_keeps_its_threads_beside_one_just_compressed():
+    """Conversations compressed tonight, unchanged since, or from before the daily-thread section:
+    every settled one's open threads still belong in the brief, and one without the section is
+    labelled as carrying no priority rather than dropped."""
+    from dream_cycle_v3.daily_brief import render_daily_brief
+
+    def _threads(code):
+        return {"threads": [{"standing": "established", "code": code, "priority": code[:2],
+                             "key": code[3:], "group": code[3:].split("/")[0],
+                             "state": "open", "next": "keep going"}],
+                "unformatted": [], "unformatted_total": 0}
+
+    applied = _applied_row(activity_fingerprint="a" * 64,
+                           highlights={"daily_threads": _threads("P1-startups/expatriator")})
+    unchanged = {"session_ref": "f6e5d4c3b2a1", "platform": "telegram", "chat_type": "dm",
+                 "status": "unchanged", "activity_fingerprint": "b" * 64,
+                 "highlights": {"daily_threads": _threads("P0-career/jobs/acme")}}
+    legacy = {"session_ref": "0a1b2c3d4e5f", "platform": "telegram", "chat_type": "group",
+              "status": "unchanged", "activity_fingerprint": "c" * 64,
+              "highlights": {"open_threads": ["Renew the studio lease before November"]}}
+
+    section = classify_conversation_compression(_answer(applied, unchanged, legacy), profile=PROFILE,
+                                                cycle_id=DATE)
+
+    assert section["claim"] == CLAIM_APPLIED
+    assert {t["code"] for t in section["highlights"]["daily_threads"]["threads"]} == {
+        "P1-startups/expatriator", "P0-career/jobs/acme"}
+    brief = render_daily_brief({"profile": PROFILE, "cycle_date": DATE}, section)
+    assert ("⚠️ 1 conversation had no daily-thread section, so its items are unprioritized:\n"
+            "• Renew the studio lease before November\n") in brief
+
+
 # -- client plumbing ---------------------------------------------------------
 
 def test_candidate_homes_try_the_profile_home_before_the_multiplexer():

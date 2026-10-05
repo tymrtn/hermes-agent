@@ -318,6 +318,111 @@ def test_rerun_in_the_same_cycle_does_not_compress_twice(live):
     assert store.lookup_by_session_key(entry.session_key).session_id == second_id
 
 
+def test_a_later_cycle_never_resummarizes_a_conversation_with_nothing_new(live):
+    """A new date is not new conversation. A later cycle makes no model call while nothing new was
+    said, even after the cycle's own brief came back through the real cron delivery mirror and its
+    own rewrite replaced the history; a genuine new exchange reopens it."""
+    from cron.scheduler_delivery import _maybe_mirror_cron_delivery
+
+    config, store, _home = live
+    entry = _seed(store, _source(), _history())
+    runner = _runner(config, store)
+    job = {"id": "dc3", "name": "dream-cycle-v3-live-nagatha"}
+
+    with _real_compression(runner) as llm:
+        first = _run_cycle(runner, cycle_id="2026-10-01")
+        _maybe_mirror_cron_delivery(job, "telegram", "c1", "🌙 **Nagatha · Dream Cycle**\n\nbrief",
+                                    user_id="u1", enabled=True)
+        second = _run_cycle(runner, cycle_id="2026-10-02")
+        live_id = store.lookup_by_session_key(entry.session_key).session_id
+        assert any("[Cron delivery:" in str(m.get("content")) for m in store.load_transcript(live_id))
+        store.append_to_transcript(live_id, {"role": "user", "content": "New ask: " + "draft " * 150})
+        store.append_to_transcript(live_id, {"role": "assistant", "content": "Done: " + "text " * 150})
+        # A retry of the cycle that already compressed: not compressed again, but what was said since
+        # is new context, so it must not answer with the fingerprint its marker recorded.
+        retry = _run_cycle(runner, cycle_id="2026-10-01")
+        third = _run_cycle(runner, cycle_id="2026-10-03")
+
+    assert first["counts"] == {"applied": 1}, first
+    assert second["counts"] == {"unchanged": 1}, second
+    unchanged = second["sessions"][0]
+    assert unchanged["activity_fingerprint"] == first["sessions"][0]["activity_fingerprint"]
+    assert unchanged["highlights"]["open_items"]  # the standing handoff still travels
+    assert retry["counts"] == {"already_applied": 1}, retry
+    assert retry["sessions"][0]["activity_fingerprint"] != unchanged["activity_fingerprint"]
+    assert third["sessions"][0]["status"] == "applied", third
+    assert third["sessions"][0]["activity_fingerprint"] != unchanged["activity_fingerprint"]
+    assert llm.call_count == 2
+
+
+def test_a_request_that_read_a_stale_marker_rechecks_once_it_holds_the_conversation(live):
+    """Two requests for one conversation in one cycle: the second read the marker before the first
+    stamped it. Holding the reservation, it must see that commit and not summarize again."""
+    config, store, _home = live
+    _seed(store, _source(), _history())
+    runner = _runner(config, store)
+    real = runner.async_session_store.get_session_metadata
+    reads = []
+
+    async def stale_first_read(*args, **kwargs):
+        reads.append(args)
+        return None if len(reads) == 1 else await real(*args, **kwargs)
+
+    with _real_compression(runner) as llm:
+        first = _run_cycle(runner)
+        with patch.object(runner.async_session_store, "get_session_metadata", stale_first_read):
+            second = _run_cycle(runner)
+
+    assert first["counts"] == {"applied": 1}, first
+    assert second["counts"] == {"already_applied": 1}, second
+    assert llm.call_count == 1
+
+
+def test_only_codes_the_user_stated_stay_established_in_the_persisted_handoff(live):
+    """The scheduled summarizer writes ``## Daily Threads``; a P#-group/task code it did not get from
+    the user's own words is rewritten as proposed before the handoff is persisted or highlighted.
+
+    The mirrored brief is not the user's words even where replay merges it into the user rows around
+    it, and the user's reply typed straight after the brief still is."""
+    config, store, _home = live
+    history = _history()
+    history[-2:-1] = [
+        {"role": "user", "content": "Track this as P1-startups/expatriator. " + "x " * 200},
+        {"role": "user", "content": "[Cron delivery: dream-cycle-v3-live-nagatha]\n"
+                                    "🌙 **Nagatha · Dream Cycle**\n\n**Proposed** · not agreed yet\n"
+                                    "• P0-career/jobs/invented\n▶️ Prepare the interview answers"},
+        {"role": "user", "content": "Agreed: P2-health/exercise. " + "y " * 50},
+    ]
+    entry = _seed(store, _source(), history)
+    runner = _runner(config, store)
+    summary = FIXTURE_SUMMARY + """
+## Daily Threads
+- P1-startups/expatriator — Portal API live; next: fix the onboarding gap
+  - waiting externally: Madrid portal support reply, check 7 Oct
+- P0-career/jobs/invented — the summarizer made this up; next: nothing
+- P2-health/exercise — no plan yet; next: ask for a weekly slot
+- unassigned: Disk cleanup — 244 GiB free; next: measure the temp folders
+"""
+
+    with _real_compression(runner) as llm:
+        llm.return_value = summary
+        row = _run_cycle(runner)["sessions"][0]
+
+    assert "## Daily Threads" in llm.call_args.args[0]
+    handoff = "\n".join(str(m.get("content")) for m in
+                        store.load_transcript(store.lookup_by_session_key(entry.session_key).session_id)
+                        if is_compaction_summary_message(m))
+    assert "- P1-startups/expatriator — Portal API live" in handoff
+    assert "- proposed P0-career/jobs/invented —" in handoff
+    standing = {t.get("code") or t.get("title"): t["standing"]
+                for t in row["highlights"]["daily_threads"]["threads"]}
+    assert standing == {"P1-startups/expatriator": "established",
+                        "P0-career/jobs/invented": "proposed",
+                        "P2-health/exercise": "established", "Disk cleanup": "uncoded"}
+    waiting = row["highlights"]["daily_threads"]["threads"][0]["dependency"]
+    assert waiting == {"kind": "waiting_externally", "detail": "Madrid portal support reply, check 7 Oct"}
+
+
 def test_busy_conversation_defers_and_leaves_history_untouched(live):
     config, store, _home = live
     history = _history()
