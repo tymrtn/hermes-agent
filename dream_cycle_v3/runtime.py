@@ -41,8 +41,9 @@ from .adapters import read_github_issues, read_kanban_board, read_todoist_tasks
 from .canonical import canonical_json, stable_id
 from .carry_forward import CarryForwardPolicy, run_carry_forward
 from .collect import CollectionBounds, collect
-from .context_gate import (Delivery, Poll, canonical_digest, decide, decide_poll, delivery_state,
-                           last_checkpoint, record_checkpoint, record_pending, unresolved_pending)
+from .context_gate import (Delivery, Poll, baseline_sessions, canonical_digest, checkpoint_sessions,
+                           decide, decide_poll, delivery_state, last_checkpoint, record_checkpoint,
+                           record_pending, unresolved_pending)
 from .contracts import is_iso_date, is_iso_datetime, parse_iso_datetime
 from .conversation_compression import (conversation_compression_status,
                                        request_conversation_compression)
@@ -788,6 +789,7 @@ def run_cycle(config: RuntimeConfig, *, render: Callable[[CycleResult], str] | N
             gate_key = {"profile": config.profile, "mode": config.mode, "output": output}
 
             poll: Poll | None = None
+            pending: Delivery | None = None
             if emit is not None:
                 poll, pending = _poll(config, store, canonical, fresh, gate_key)
                 if poll.action in ("silent", "wait"):
@@ -799,14 +801,17 @@ def run_cycle(config: RuntimeConfig, *, render: Callable[[CycleResult], str] | N
                 if text is not None:
                     emit(text)
                     if execution_id:
+                        # The same output, so the same membership: a resend that dropped it would
+                        # checkpoint a narrower conversation set than the brief was built from.
                         record_pending(store, run_id=pending.run_id, cycle_date=pending.cycle_date,
                                        fingerprint=pending.fingerprint, execution_id=execution_id,
-                                       text_sha256=pending.text_sha256, **gate_key)
+                                       text_sha256=pending.text_sha256,
+                                       sessions=pending.sessions, **gate_key)
                     return CycleResult(report=None, report_path=None, ok=True,
                                        status_line=_poll_line(config, poll), context="redelivered")
                 if poll.action == "redeliver":
                     # The undelivered output is gone from disk: build it again.
-                    poll = Poll("cycle", "undelivered_missing", poll.fingerprint)
+                    poll = Poll("cycle", "undelivered_missing", poll.fingerprint, poll.sessions)
 
             manifest_path = write_manifest(manifest, manifests_dir)
             run_id = manifest["run_id"]
@@ -900,8 +905,13 @@ def run_cycle(config: RuntimeConfig, *, render: Callable[[CycleResult], str] | N
             canonical = canonical_digest(
                 registry=registry_entries, threads=thread_entries, trackers=trackers,
                 sources=consumed_sources(store, {"sources": []}, config.migrate_v2_roots)[0])
+            # An output cron never delivered is still unread, so this cycle's brief must supersede
+            # it even when the context has come back to what the last DELIVERED one carried:
+            # otherwise the pending row never resolves and every later night runs a silent cycle.
             gate = decide(conversation_report, canonical, last_checkpoint(store, **gate_key),
-                          undelivered=poll is not None and poll.reason == "undelivered_missing")
+                          undelivered=pending is not None
+                          or (poll is not None and poll.reason == "undelivered_missing"),
+                          known=baseline_sessions(store, pending, **gate_key))
 
             if config.smoke_configured:
                 smoke = _retrieval_smoke(config, db_path)
@@ -1015,7 +1025,8 @@ def run_cycle(config: RuntimeConfig, *, render: Callable[[CycleResult], str] | N
                 if execution_id:
                     record_pending(store, run_id=run_id, cycle_date=config.disposition_date,
                                    fingerprint=gate.fingerprint, execution_id=execution_id,
-                                   text_sha256=_keep_text(deliveries_dir, text), **gate_key)
+                                   text_sha256=_keep_text(deliveries_dir, text),
+                                   sessions=gate.sessions, **gate_key)
     return result
 
 
@@ -1030,6 +1041,8 @@ def _poll(config: RuntimeConfig, store: ContinuityStore, canonical: str, fresh: 
     state = delivery_state(pending.execution_id) if pending is not None else None
     if pending is not None and state == "delivered":
         record_checkpoint(store, pending, **gate_key)
+        # Acknowledged: it is the checkpoint now, not an output still owed to a reader.
+        pending, state = None, None
     conversation: Mapping[str, Any] = {"enabled": False}
     if config.conversation_compression:
         conversation = request_conversation_compression(
@@ -1038,7 +1051,9 @@ def _poll(config: RuntimeConfig, store: ContinuityStore, canonical: str, fresh: 
             dry_run=True)
     poll = decide_poll(conversation, canonical, new_sources=fresh,
                        checkpoint=last_checkpoint(store, **gate_key), pending=pending,
-                       pending_state=state)
+                       pending_state=state, known=checkpoint_sessions(store, **gate_key))
+    # decide_poll compares an unresolved output against ITS OWN membership; `known` only serves the
+    # no-pending case.
     return poll, pending
 
 

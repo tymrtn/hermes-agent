@@ -542,8 +542,9 @@ class GatewaySessionCommandsMixin:
         from agent.conversation_compression import finalize_context_engine_compression_notification
         from agent.conversation_compression_manual import compress_now, render_compress_result
         from gateway.run import _platform_config_key
-        from gateway.scheduled_compression import (ManualCompressionOutcome, handoff_highlights,
-                                                   reconcile_handoff_with_tail)
+        from gateway.scheduled_compression import (ManualCompressionOutcome,
+                                                   carry_fingerprint_across_rewrite,
+                                                   handoff_highlights, reconcile_handoff_with_tail)
 
         session_key = self._session_key_for_source(source)
         # Platform + stable gateway session key bind this agent (for external context engines) to
@@ -570,6 +571,13 @@ class GatewaySessionCommandsMixin:
         runtime_kwargs["gateway_session_key"] = session_key
 
         original_session_id = session_entry.session_id
+        # The transcript as the cycle fingerprints it, BEFORE this rewrite. A manual rewrite that
+        # folds old turns into a handoff is not a new exchange, so the cycle's fingerprint follows
+        # it (``carry_fingerprint_across_rewrite``) rather than reading the rewrite as new context.
+        # The scheduled path stamps its own marker and needs no carry.
+        rows_before = (None if reconcile_rows is not None
+                       else await self.async_session_store.load_transcript(
+                           original_session_id, repair_alternation=False))
         tmp_agent = await self._build_manual_compression_agent(session_entry.session_id, model, runtime_kwargs)
         verifying = reconcile_rows is not None and reconcile_handoff_with_tail(
             tmp_agent.context_compressor, reconcile_rows, carried_codes or [])
@@ -588,6 +596,12 @@ class GatewaySessionCommandsMixin:
                     after_messages=len(result.after_messages), session_id=original_session_id)
             committed = await self._persist_manual_compression(
                 tmp_agent, session_entry, source, result.after_messages)
+            if committed and rows_before is not None:
+                with contextlib.suppress(Exception):
+                    await carry_fingerprint_across_rewrite(
+                        self.async_session_store, session_key, rows_before,
+                        await self.async_session_store.load_transcript(
+                            session_entry.session_id, repair_alternation=False))
             finalize_context_engine_compression_notification(tmp_agent, committed=committed)
             compressor = tmp_agent.context_compressor
             summary = result.summary

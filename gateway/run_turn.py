@@ -838,7 +838,8 @@ class GatewayTurnMixin:
         )
         _record_hygiene_cooldown(self, session_id, _hyg_cooldown, reason)
 
-    async def _hmwa_hygiene_on_turn_hold(self, attempt, hs, session_entry, session_key, source):
+    async def _hmwa_hygiene_on_turn_hold(self, attempt, hs, session_entry, session_key, source,
+                                         rows_before=None):
         """``except HygieneTurnHoldExceeded`` body: keep or cancel the worker's commit admission,
         notify the user, and re-raise; returns the compressed transcript only when the worker
         was already committing.
@@ -860,6 +861,7 @@ class GatewayTurnMixin:
             # comes from the durable compression lock. The done-callback records the flat retry-after
             # ONLY if the worker ends without committing anything.
             _sid, _skey, _agent = session_entry.session_id, session_key, attempt.agent
+            _loop, _entry, _rows_before = asyncio.get_running_loop(), session_entry, rows_before
 
             def _hyg_adopt_or_space_retry(_fut, _gw=self, _sid=_sid, _skey=_skey, _agent=_agent):
                 try:
@@ -881,6 +883,12 @@ class GatewayTurnMixin:
                         _reset_hygiene_failure_streak(_gw, _skey)
                     except Exception as _rs_err:
                         logger.debug("hygiene streak reset after deferred adoption failed: %s", _rs_err)
+                    # This commit is an automatic rewrite like any other: it stamps no cycle marker,
+                    # so the Dream Cycle fingerprint must follow it or the nightly brief goes out for
+                    # the rewrite alone. The callback runs on the loop, so the async carry is a task;
+                    # the carry itself refuses to move over a turn this commit cloned into its tail.
+                    _gw._hmwa_hygiene_track_carry(_loop.create_task(
+                        _gw._hmwa_hygiene_carry_cycle_fingerprint(_skey, _entry, _rows_before)))
                 else:
                     # Nothing to adopt (summary failed / fence refused / superseded): flat spacing so
                     # sustained traffic doesn't spawn and abandon a compressor every turn.
@@ -998,8 +1006,39 @@ class GatewayTurnMixin:
             except Exception as _cd_err:
                 logger.debug("hygiene unwind cooldown record failed: %s", _cd_err)
 
+    def _hmwa_hygiene_track_carry(self, task):
+        """Hold a strong reference to a detached carry until it finishes: a task created from a
+        done-callback and dropped on the floor may be garbage-collected mid-flight."""
+        tasks = getattr(self, "_hygiene_carry_tasks", None)
+        if tasks is None:
+            tasks = set()
+            self._hygiene_carry_tasks = tasks
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+        return task
+
+    async def _hmwa_hygiene_carry_cycle_fingerprint(self, session_key, session_entry, rows_before):
+        """Move the Dream Cycle marker's activity fingerprint across an automatic rewrite.
+
+        Automatic compression stamps no cycle marker, so the handoff it leaves behind would read as a
+        new exchange and send a nightly brief for the rewrite alone — and hygiene runs BEFORE inbound
+        preprocessing, which may refuse the arriving message without ever persisting a turn. The
+        fingerprint is read back from the session the ROUTING entry points at, because that is the
+        transcript the cycle will read. ``carry_fingerprint_across_rewrite`` refuses a transcript that
+        moved before the rewrite or gained a turn across it, so real activity is never swallowed.
+        """
+        from gateway.scheduled_compression import carry_fingerprint_across_rewrite
+        if rows_before is None:
+            return
+        with suppress(Exception):
+            await carry_fingerprint_across_rewrite(
+                self.async_session_store, session_key, rows_before,
+                await self.async_session_store.load_transcript(
+                    session_entry.session_id, repair_alternation=False))
+
     async def _hmwa_hygiene_adopt_transcript(
-        self, attempt, _compressed, history, plan, *, session_entry, source, _quick_key, run_generation,
+        self, attempt, _compressed, history, plan, *, session_entry, session_key, source,
+        _quick_key, run_generation, rows_before=None,
     ):
         """Adopt a finished compression (rotation / in-place / refused); publishes the transcript to
         continue with on ``attempt.history``. Returns ``(rotated, in_place, new_count, new_tokens)``.
@@ -1059,6 +1098,14 @@ class GatewayTurnMixin:
                 )
 
         if _hyg_rotated or _hyg_in_place:
+            # A rewrite is not an exchange. Automatic compression stamps no Dream Cycle marker, so
+            # without this carry the handoff it leaves behind reads as new conversation and the
+            # nightly brief goes out for the rewrite alone — and hygiene runs BEFORE inbound
+            # preprocessing, which may refuse the message without ever persisting a turn, so there
+            # may be no new talk at all. The carry moves only when the PRE-rewrite stored rows still
+            # matched the marker exactly, so genuine appended activity keeps its stale fingerprint
+            # and stays eligible (``carry_fingerprint_across_rewrite``).
+            await self._hmwa_hygiene_carry_cycle_fingerprint(session_key, session_entry, rows_before)
             # Rewritten (rotation) or persisted by archive_and_compact() (in-place): reset token count.
             session_entry.last_prompt_tokens = 0
             attempt.history = _compressed
@@ -1084,14 +1131,15 @@ class GatewayTurnMixin:
 
     async def _hmwa_hygiene_apply_result(
         self, attempt, hs, _compressed, history, plan, *,
-        session_entry, session_key, source, _quick_key, run_generation,
+        session_entry, session_key, source, _quick_key, run_generation, rows_before=None,
     ):
         """Adopt a finished hygiene compression, rebind the session + turn lease, record
         streak/cooldown, and warn the user on abort."""
         from gateway.run import _reset_hygiene_failure_streak, hygiene_compaction_recovered
         _hyg_rotated, _hyg_in_place, _new_count, _new_tokens = await self._hmwa_hygiene_adopt_transcript(
-            attempt, _compressed, history, plan, session_entry=session_entry, source=source,
-            _quick_key=_quick_key, run_generation=run_generation,
+            attempt, _compressed, history, plan, session_entry=session_entry,
+            session_key=session_key, source=source, _quick_key=_quick_key,
+            run_generation=run_generation, rows_before=rows_before,
         )
         # Summary failure aborts the compressor (nothing dropped). Warn the user visibly — agent.log
         # is invisible on TG/Discord — so they know the chat is "frozen" and can /compress or /reset.
@@ -1210,6 +1258,13 @@ class GatewayTurnMixin:
         from agent.conversation_compression import CompressionCommitFence
         _hyg_agent, _hyg_session_db = await self._hmwa_hygiene_build_agent(_hyg_model, _hyg_runtime, session_entry)
         attempt.agent = _hyg_agent
+        # The transcript as the Dream Cycle fingerprints it, read BEFORE the compressor runs:
+        # in-place compaction archives and replaces the rows inside _compress_context, so there is
+        # no later point at which the pre-rewrite state is still readable.
+        rows_before = None
+        with suppress(Exception):
+            rows_before = await self.async_session_store.load_transcript(
+                session_entry.session_id, repair_alternation=False)
         try:
             # Hygiene owns the session binding, so prefer in-place compaction over minting a
             # continuation child. Without a SessionDB this stays False.
@@ -1242,7 +1297,8 @@ class GatewayTurnMixin:
             try:
                 _compressed = await self._hmwa_hygiene_wait_for_summary(attempt, hs, session_entry)
             except HygieneTurnHoldExceeded:
-                _compressed = await self._hmwa_hygiene_on_turn_hold(attempt, hs, session_entry, session_key, source)
+                _compressed = await self._hmwa_hygiene_on_turn_hold(
+                    attempt, hs, session_entry, session_key, source, rows_before)
             except asyncio.TimeoutError:
                 _compressed = await self._hmwa_hygiene_on_timeout(attempt, hs, session_entry, session_key, source)
             except BaseException:
@@ -1252,7 +1308,7 @@ class GatewayTurnMixin:
             await self._hmwa_hygiene_apply_result(
                 attempt, hs, _compressed, history, plan, session_entry=session_entry,
                 session_key=session_key, source=source, _quick_key=_quick_key,
-                run_generation=run_generation,
+                run_generation=run_generation, rows_before=rows_before,
             )
         finally:
             # Evict the cached agent so the next turn rebuilds its system prompt.

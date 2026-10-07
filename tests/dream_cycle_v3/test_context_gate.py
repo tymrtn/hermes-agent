@@ -45,6 +45,12 @@ HANDOFF = {{"daily_threads": {{"threads": [
 def compress_gateway_session(home, *, profile, cycle_id, dry_run=False, **_kwargs):
     state = json.loads(STATE.read_text())
     state["polls" if dry_run else "requests"] += 1
+    if state["drop"]:
+        # The gateway lists no conversation at all: aged out of its activity window, past the
+        # retention cap, or its routing entry swept by housekeeping.
+        STATE.write_text(json.dumps(state))
+        return {{"ok": True, "profile": profile, "cycle_id": cycle_id, "eligible": 0,
+                 "counts": {{}}, "sessions": []}}
     row = {{"session_ref": "a1b2c3d4e5f6", "platform": "telegram", "chat_type": "dm"}}
     if state["marker"] == state["conversation"]:
         row.update(status="unchanged", activity_fingerprint=state["conversation"],
@@ -104,7 +110,7 @@ class Nightly:
         _put(self.v2_state / "wake-up.md", "## Wake\n- carry the thread forward\n", 0)
         _put(self.sessions / "chat.md", "user: the portal API is live\n", 0)
         self.state = {"conversation": "1" * 64, "marker": None, "polls": 0, "requests": 0,
-                      "compressions": 0, "argv": [], "fail": None}
+                      "compressions": 0, "argv": [], "fail": None, "drop": False}
         (root / "scripts" / "dc3_fixture.py").write_text(FIXTURE_SCRIPT.format(
             worktree=str(Path(__file__).resolve().parents[2]), state=str(self.state_path)))
 
@@ -229,3 +235,87 @@ def test_a_changed_consumed_source_runs_a_cycle_and_the_cycles_own_echo_does_not
     nightly.run(5)
     assert len(nightly.sent) == 4 and nightly.cycles() == 4
     assert nightly.state["compressions"] == 1
+
+
+def test_a_brief_cron_never_delivered_still_goes_out_when_the_context_comes_back(nightly):
+    """An undelivered brief is unread, so the next cycle's brief supersedes it even when the
+    context has returned to exactly what the last DELIVERED brief carried. Otherwise the pending
+    row never resolves and every later night runs a cycle that delivers nothing."""
+    threads = nightly.home / "threads.json"
+    original = threads.read_text(encoding="utf-8")
+
+    nightly.run(0, send={"success": True})
+    assert len(nightly.sent) == 1 and nightly.cycles() == 1
+
+    # A canonical record changed: a cycle runs and writes a brief cron fails to deliver.
+    entries = json.loads(original)
+    entries[0]["title"] = "renamed while the brief was owed"
+    threads.write_text(json.dumps(entries), encoding="utf-8")
+    failed = nightly.run(1, send={"error": "telegram unreachable"})
+    assert failed["delivery_outcome"] == "failed"
+    assert nightly.cycles() == 2 and len(nightly.sent) == 2
+
+    # The record is reverted to the bytes the DELIVERED brief was built from. Nothing is owed to
+    # the checkpoint, but the night-1 brief still never arrived, so tonight's goes out.
+    threads.write_text(original, encoding="utf-8")
+    resent = nightly.run(2, send={"success": True})
+    assert resent["delivery_outcome"] == "delivered"
+    assert len(nightly.sent) == 3 and BRIEF_LINES in nightly.sent[2]
+
+    # Acknowledged: the pending row is resolved, so an unchanged night is silent again.
+    nightly.run(3)
+    assert len(nightly.sent) == 3 and nightly.cycles() == 3
+
+
+def test_a_conversation_the_gateway_stops_reporting_on_keeps_its_last_known_state(nightly):
+    """Membership is durable, not reconstructed each night. The gateway's answer covers whichever
+    conversations its activity window, retention cap and routing table happen to list, and an absent
+    conversation is not a conversation that changed — so the gate carries each one's last delivered
+    fingerprint forward instead of digesting the set it was handed. Otherwise a selected session
+    ageing out, or housekeeping sweeping an idle routing entry, sends a brief for time alone."""
+    nightly.run(0, send={"success": True})
+    assert len(nightly.sent) == 1 and nightly.cycles() == 1
+
+    # The conversation drops out of the gateway's answer entirely, three nights running. Silence:
+    # no cycle, no brief, no compression — and the state it was last known in is still the baseline.
+    nightly.state["drop"] = True
+    for day in (1, 2, 3):
+        nightly.run(day)
+    assert len(nightly.sent) == 1 and nightly.cycles() == 1
+    assert nightly.state["compressions"] == 1 and nightly.state["polls"] >= 4
+
+    # It comes back having really moved: that IS new context, so the cycle runs and the brief goes
+    # out. Carrying membership forward silences absence, never talk.
+    nightly.state["drop"] = False
+    nightly.state["conversation"] = "2" * 64
+    nightly.run(4, send={"success": True})
+    assert nightly.cycles() == 2 and len(nightly.sent) == 2 and BRIEF_LINES in nightly.sent[1]
+    assert nightly.state["compressions"] == 2
+
+
+def test_an_undelivered_brief_is_judged_against_its_own_membership(nightly):
+    """An output still owed to a reader is compared against the membership IT was built from, not
+    the last DELIVERED checkpoint's. Otherwise a conversation dropping out of the gateway's answer
+    makes tonight's state differ from the pending brief's, and the poll rebuilds a cycle instead of
+    resending the brief that never arrived — the pending row then never resolves. Being the baseline
+    is not being acknowledged: the brief stays pending until cron says otherwise."""
+    nightly.run(0, send={"success": True})
+    assert len(nightly.sent) == 1 and nightly.cycles() == 1
+
+    # Night 1: the conversation moved, a cycle runs, and cron fails to deliver the brief it wrote.
+    nightly.state["conversation"] = "2" * 64
+    failed = nightly.run(1, send={"error": "telegram unreachable"})
+    assert failed["delivery_outcome"] == "failed"
+    assert nightly.cycles() == 2 and len(nightly.sent) == 2
+
+    # Night 2: that conversation is gone from the gateway's answer. Nothing a reader has not been
+    # offered has changed, so the owed brief is resent verbatim — no cycle, no compression.
+    nightly.state["drop"] = True
+    resent = nightly.run(2, send={"success": True})
+    assert resent["delivery_outcome"] == "delivered"
+    assert nightly.cycles() == 2 and nightly.sent[2] == nightly.sent[1]
+    assert nightly.state["compressions"] == 2
+
+    # Acknowledged now, and the carried membership came with it: still silent.
+    nightly.run(3)
+    assert len(nightly.sent) == 3 and nightly.cycles() == 2

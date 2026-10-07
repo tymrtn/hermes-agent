@@ -17,9 +17,11 @@ therefore request + honest accounting:
   the shared sanitizers (secretguard + PII redaction + caps) like every other emitted string, cut on
   word boundaries. ``daily_threads`` stays structured: codes cross the identifier sanitizer, every
   free-text field the text sanitizer, and standing/priority/dependency are closed enums.
-- ``activity`` says whether the conversation's state is KNOWN (``settled``) and its fingerprint, so
-  the cycle can tell "nothing new" from "could not tell". Only the gateway reads transcripts; this
-  side only forwards the digests it reported.
+- ``activity`` says whether the conversation's state is KNOWN (``settled``) and, when it is, the
+  activity fingerprint of every conversation the answer covers, so the cycle can tell "nothing new"
+  from "could not tell". Only the gateway reads transcripts; this side only forwards the digests it
+  reported, and never decides membership — a conversation this answer omits is not a conversation
+  that changed (`context_gate`).
 - Nothing from here enters the continuity store. It belongs to the run report, whose job is
   operational evidence, not durable continuity.
 """
@@ -209,15 +211,22 @@ def _settled(row: Mapping[str, Any]) -> bool:
 
 
 def _activity(rows: Sequence[Mapping[str, Any]], *, answered: bool) -> dict[str, Any]:
-    """Whether this answer pins the conversation's state, and the digest of it when it does.
+    """Whether this answer pins the conversation's state, and what it pins it to.
 
     Unknown is never "unchanged": no answer, a pending answer, a deferral for a running turn or any
-    failure leaves ``settled`` false, so the cycle neither goes quiet nor checkpoints on it."""
+    failure leaves ``settled`` false, so the cycle neither goes quiet nor checkpoints on it.
+
+    ``sessions`` is the per-conversation evidence — one activity fingerprint per ``session_ref``
+    this answer really covers. The gate, not this module, decides what to compare: it merges these
+    over the membership its last delivered brief was built from, so a conversation THIS answer is
+    silent about (aged out of the gateway's activity window, past the retention cap, or its routing
+    entry swept) keeps the state it was last known in instead of vanishing from the digest
+    (``context_gate.conversation_state``). ``fingerprint`` is this answer alone, for the report."""
     if not answered or not all(_settled(row) for row in rows):
-        return {"settled": False, "fingerprint": None}
+        return {"settled": False, "fingerprint": None, "sessions": {}}
     pairs = sorted([str(row.get("session_ref") or ""), row["activity_fingerprint"]] for row in rows)
     digest = hashlib.sha256(json.dumps(pairs, separators=(",", ":")).encode("utf-8")).hexdigest()
-    return {"settled": True, "fingerprint": digest}
+    return {"settled": True, "fingerprint": digest, "sessions": dict(pairs)}
 
 
 def _int(value: Any) -> int:
@@ -266,7 +275,7 @@ def classify_conversation_compression(response: Mapping[str, Any] | None, *, pro
         "evidence_source": "gateway_control_socket",
         "gateway_answered": response is not None,
     }
-    unknown = {"settled": False, "fingerprint": None}
+    unknown = {"settled": False, "fingerprint": None, "sessions": {}}
     if response is None:
         return {**section, "claim": CLAIM_UNAVAILABLE, "counts": {},
                 "reason": sanitize_text(unavailable_reason or "no gateway answered "

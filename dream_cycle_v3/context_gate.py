@@ -6,7 +6,13 @@ New context is what the cycle consumes:
 - the conversation, as the gateway's activity fingerprint (the conversation's own rows, minus
   compaction handoffs and the mirrored cron brief; ``gateway/scheduled_compression.py``). A new date
   or cycle id is not new conversation. An answer that does not pin the conversation's state (no
-  gateway, a pending or deferred attempt, any failure) is never read as "unchanged";
+  gateway, a pending or deferred attempt, any failure) is never read as "unchanged". Membership is
+  DURABLE, not reconstructed each night: the checkpoint carries one fingerprint per conversation and
+  tonight's answer is merged over it, so a conversation the gateway stops reporting on — aged out of
+  its activity window, past its retention cap, or its routing entry swept by housekeeping — keeps
+  the state it was last known in. Only an answer that really moved moves the digest. The cost is
+  that a conversation deleted for good holds its last fingerprint in the checkpoint forever; it
+  silences nothing, because a replacement conversation is a new ``session_ref``;
 - the canonical records it reads: the operator registry, the thread seed and the tracker snapshots,
   as content digests;
 - the collected sources it ingests: the migrated roots' candidates the store holds plus tonight's
@@ -34,7 +40,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping
 
@@ -50,6 +56,8 @@ class ContextGate:
     #: ``new`` (deliver), ``unchanged`` (stay silent), or ``unsettled`` (deliver; never checkpoint).
     state: str
     fingerprint: str | None = None
+    #: The conversation membership this answer is built on, to be carried into the next checkpoint.
+    sessions: Mapping[str, str] | None = None
 
     @property
     def skip(self) -> bool:
@@ -65,6 +73,8 @@ class Delivery:
     fingerprint: str | None
     execution_id: str | None
     text_sha256: str | None
+    #: Per-conversation activity fingerprints this output was built from (``{session_ref: digest}``).
+    sessions: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -76,6 +86,8 @@ class Poll:
     #: ``conversation``, ``changed`` or ``first``.
     reason: str
     fingerprint: str | None = None
+    #: The conversation membership this answer is built on, to be carried into the next checkpoint.
+    sessions: Mapping[str, str] | None = None
 
 
 def canonical_digest(*, registry: Iterable[Mapping[str, Any]] | None,
@@ -94,14 +106,30 @@ def canonical_digest(*, registry: Iterable[Mapping[str, Any]] | None,
     return hashlib.sha256(canonical_json(body).encode("utf-8")).hexdigest()
 
 
-def _conversation_state(conversation: Mapping[str, Any]) -> str | None:
-    """The conversation's settled fingerprint, ``off`` when the job does not compress, or None."""
+def _sessions_digest(sessions: Mapping[str, str]) -> str:
+    """The conversation state of a MEMBERSHIP: one activity fingerprint per conversation."""
+    pairs = sorted([str(ref), str(digest)] for ref, digest in sessions.items())
+    return hashlib.sha256(json.dumps(pairs, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def conversation_state(conversation: Mapping[str, Any],
+                       known: Mapping[str, str] | None) -> tuple[str | None, Mapping[str, str]]:
+    """The conversation's settled state and the membership it stands for.
+
+    ``off`` when the job does not compress, None when tonight's answer does not pin the state.
+    Otherwise the digest of *known* (the membership the last delivered brief was built from) updated
+    by the conversations tonight's answer really covers: one the gateway no longer lists is not one
+    that changed, so the passage of time, a retention cap and routing housekeeping cannot move the
+    digest on their own. Only talk can."""
     if not conversation.get("enabled"):
-        return "off"
+        return "off", {}
     activity = conversation.get("activity")
     if not isinstance(activity, Mapping) or not activity.get("settled"):
-        return None
-    return activity.get("fingerprint")
+        return None, {}
+    tonight = activity.get("sessions")
+    merged = {str(k): str(v) for k, v in (known or {}).items()}
+    merged.update({str(k): str(v) for k, v in (tonight or {}).items()})
+    return _sessions_digest(merged), merged
 
 
 def _fingerprint(conversation_state: str, canonical: str) -> str:
@@ -110,38 +138,47 @@ def _fingerprint(conversation_state: str, canonical: str) -> str:
 
 
 def decide(conversation: Mapping[str, Any], canonical: str, last: str | None, *,
-           undelivered: bool = False) -> ContextGate:
+           undelivered: bool = False, known: Mapping[str, str] | None = None) -> ContextGate:
     """After a cycle ran: whether its output has anything a reader has not already been sent.
-    *undelivered*: the cycle rebuilt an output cron never delivered, so it goes out regardless."""
-    state = _conversation_state(conversation)
+    *undelivered*: the cycle rebuilt an output cron never delivered, so it goes out regardless.
+    *known*: the conversation membership the last delivered output was built from."""
+    state, sessions = conversation_state(conversation, known)
     if state is None:
         return ContextGate("unsettled")
     fingerprint = _fingerprint(state, canonical)
     # A compression that really ran is new by construction: its handoff has not been delivered.
     if conversation.get("claim") != "applied" and not undelivered and fingerprint == last:
-        return ContextGate("unchanged", fingerprint)
-    return ContextGate("new", fingerprint)
+        return ContextGate("unchanged", fingerprint, sessions)
+    return ContextGate("new", fingerprint, sessions)
 
 
 def decide_poll(conversation: Mapping[str, Any], canonical: str, *, new_sources: int,
-                checkpoint: str | None, pending: Delivery | None,
-                pending_state: str | None) -> Poll:
+                checkpoint: str | None, pending: Delivery | None, pending_state: str | None,
+                known: Mapping[str, str] | None = None) -> Poll:
     """Before any substantive work: run a cycle, stay silent, or resend what never arrived.
-    *new_sources* (tonight's sources the store does not hold yet) only names why a cycle runs."""
-    state = _conversation_state(conversation)
+    *new_sources* (tonight's sources the store does not hold yet) only names why a cycle runs.
+    *known*: the conversation membership the last delivered output was built from."""
+    unresolved = pending if (pending is not None and pending_state != "delivered") else None
+    # An output still owed to a reader is compared against the membership IT was built from, never
+    # against the last DELIVERED checkpoint's: the question there is "is this still the right brief",
+    # and a conversation that has since dropped out of the gateway's answer must not make tonight's
+    # state differ from the pending brief's. Being the baseline is not being acknowledged — the
+    # pending row stays pending, and only cron's ledger can resolve it.
+    state, sessions = conversation_state(conversation,
+                                         unresolved.sessions if unresolved is not None else known)
     if state is None:
         return Poll("cycle", "conversation")
     fingerprint = _fingerprint(state, canonical)
     changed = "sources" if new_sources else "changed"
-    if pending is not None and pending_state != "delivered":
+    if unresolved is not None:
         if pending.fingerprint != fingerprint:
-            return Poll("cycle", changed, fingerprint)
+            return Poll("cycle", changed, fingerprint, sessions)
         if pending_state == "in_flight":
-            return Poll("wait", "in_flight", fingerprint)
-        return Poll("redeliver", "undelivered", fingerprint)
+            return Poll("wait", "in_flight", fingerprint, sessions)
+        return Poll("redeliver", "undelivered", fingerprint, sessions)
     if fingerprint == checkpoint:
-        return Poll("silent", "unchanged", fingerprint)
-    return Poll("cycle", "first" if checkpoint is None else changed, fingerprint)
+        return Poll("silent", "unchanged", fingerprint, sessions)
+    return Poll("cycle", "first" if checkpoint is None else changed, fingerprint, sessions)
 
 
 def _latest(store: ContinuityStore, event_type: str, *, profile: str, mode: str,
@@ -154,11 +191,14 @@ def _latest(store: ContinuityStore, event_type: str, *, profile: str, mode: str,
         payload = json.loads(row["payload"])
         if (payload.get("profile"), payload.get("mode"), payload.get("output")) == (profile, mode,
                                                                                     output):
+            raw = payload.get("conversation_sessions")
             return Delivery(seq=row["seq"], run_id=row["run_id"],
                             cycle_date=payload.get("cycle_date") or "",
                             fingerprint=payload.get("context_fingerprint"),
                             execution_id=payload.get("execution_id"),
-                            text_sha256=payload.get("text_sha256"))
+                            text_sha256=payload.get("text_sha256"),
+                            sessions={str(k): str(v) for k, v in raw.items()}
+                            if isinstance(raw, Mapping) else {})
     return None
 
 
@@ -167,6 +207,29 @@ def last_checkpoint(store: ContinuityStore, *, profile: str, mode: str, output: 
     Kept per output: a status line that went out is not the brief going out."""
     checkpoint = _latest(store, CHECKPOINT_EVENT_TYPE, profile=profile, mode=mode, output=output)
     return checkpoint.fingerprint if checkpoint else None
+
+
+def checkpoint_sessions(store: ContinuityStore, *, profile: str, mode: str,
+                        output: str) -> Mapping[str, str]:
+    """The conversation membership the last acknowledged delivery was built from.
+
+    Empty before the first acknowledged delivery, which is the honest answer: there is nothing to
+    carry forward and the first night is ``first`` regardless."""
+    checkpoint = _latest(store, CHECKPOINT_EVENT_TYPE, profile=profile, mode=mode, output=output)
+    return checkpoint.sessions if checkpoint else {}
+
+
+def baseline_sessions(store: ContinuityStore, pending: Delivery | None, *, profile: str, mode: str,
+                      output: str) -> Mapping[str, str]:
+    """The membership the most recent output a reader is owed, or has been sent, was built from.
+
+    An unresolved *pending* output supersedes the checkpoint as the baseline WITHOUT being treated as
+    delivered: it is the newest statement of what is known about each conversation (it was itself
+    built by merging over the checkpoint), and a rebuild that fell back to the older checkpoint would
+    drop a conversation the pending brief covered."""
+    if pending is not None:
+        return pending.sessions
+    return checkpoint_sessions(store, profile=profile, mode=mode, output=output)
 
 
 def unresolved_pending(store: ContinuityStore, *, profile: str, mode: str,
@@ -206,8 +269,8 @@ def delivery_state(execution_id: str | None) -> str:
 
 
 def record_pending(store: ContinuityStore, *, run_id: str, profile: str, mode: str, output: str,
-                   cycle_date: str, fingerprint: str | None, execution_id: str,
-                   text_sha256: str) -> None:
+                   cycle_date: str, fingerprint: str | None, execution_id: str, text_sha256: str,
+                   sessions: Mapping[str, str] | None = None) -> None:
     emitted_at = datetime.now(timezone.utc).isoformat()
     with store.transaction() as conn:
         store._emit_event(conn, entity_type="run", entity_id=run_id,
@@ -215,6 +278,7 @@ def record_pending(store: ContinuityStore, *, run_id: str, profile: str, mode: s
                           payload={"profile": profile, "mode": mode, "output": output,
                                    "cycle_date": cycle_date, "context_fingerprint": fingerprint,
                                    "execution_id": execution_id, "text_sha256": text_sha256,
+                                   "conversation_sessions": dict(sessions or {}),
                                    "emitted_at": emitted_at},
                           run_id=run_id, now=emitted_at)
 
@@ -230,5 +294,8 @@ def record_checkpoint(store: ContinuityStore, pending: Delivery, *, profile: str
                                    "cycle_date": pending.cycle_date,
                                    "context_fingerprint": pending.fingerprint,
                                    "execution_id": pending.execution_id,
+                                   # The membership that output stood for becomes the baseline the
+                                   # next night merges its answer over.
+                                   "conversation_sessions": dict(pending.sessions or {}),
                                    "acknowledged_at": acknowledged_at},
                           run_id=pending.run_id, now=acknowledged_at)

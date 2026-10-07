@@ -1332,3 +1332,400 @@ def test_cancelling_a_parked_inbound_does_not_wedge_the_compression(live):
     assert dispatches == ["never mind"]
     assert result["counts"] == {"applied": 1}, result
     assert runner._is_session_running(entry.session_key) is False
+
+
+_ALREADY = "already_applied"
+
+
+def _answer(row):
+    """One session row as the whole gateway answer it would have arrived in."""
+    return {"ok": True, "eligible": 1, "counts": {}, "sessions": [row]}
+
+
+def _gate_poll(answer, *, checkpoint):
+    """The real no-new-context gate, driven by this answer: the client's own classification and
+    ``decide_poll``. Canonical records are held fixed, so only the conversation can move."""
+    from dream_cycle_v3.context_gate import decide_poll
+    from dream_cycle_v3.conversation_compression import classify_conversation_compression
+
+    conversation = classify_conversation_compression(answer, profile=PROFILE, cycle_id=CYCLE)
+    return decide_poll(conversation, "canonical-records-unchanged", new_sources=0,
+                       checkpoint=checkpoint, pending=None, pending_state=None)
+
+
+def test_a_manual_compression_alone_leaves_the_gate_silent_but_a_real_turn_does_not(live):
+    """A rewrite nobody added a turn to is not an exchange. ``/compress`` does not stamp the cycle
+    marker, so without the carry its handoff reads as new talk: the conversation is compressed again
+    AND the gate emits a brief for the rewrite alone. Proven through the real gate, not the helper:
+    the digest the cycle compares must be byte-identical across the rewrite. Genuine activity is
+    never swallowed — a conversation that moved before the rewrite stays eligible and runs a cycle.
+    """
+    from agent.conversation_compression_manual import parse_compress_args
+
+    config, store, _home = live
+    runner = _runner(config, store)
+
+    def poll(entry):
+        return _run_cycle(runner, cycle_id="2026-10-02", dry_run=True,
+                          session_keys=[entry.session_key])
+
+    def compress_by_hand(chat_id, *, said_something_new):
+        entry = _seed(store, _source(chat_id=chat_id), _history())
+        assert _run_cycle(runner, cycle_id="2026-10-01",
+                          session_keys=[entry.session_key])["counts"] == {"applied": 1}
+        before = poll(entry)
+        if said_something_new:
+            live_id = store.lookup_by_session_key(entry.session_key).session_id
+            store.append_to_transcript(live_id, {"role": "user", "content": "One more thing"})
+        routed = store.lookup_by_session_key(entry.session_key)
+        outcome = asyncio.run(runner._run_manual_compression(
+            entry.origin, routed, store.load_transcript(routed.session_id),
+            parse_compress_args("")))
+        assert outcome.committed, outcome.status
+        return entry, before, poll(entry)
+
+    with _real_compression(runner) as llm:
+        quiet, quiet_before, quiet_after = compress_by_hand("quiet", said_something_new=False)
+        talked, talked_before, talked_after = compress_by_hand("talked", said_something_new=True)
+
+    # Nothing was said: the conversation answers "unchanged" with the digest it answered with
+    # before the rewrite, so the gate stays silent.
+    assert quiet_after["sessions"][0]["status"] == "unchanged"
+    assert (quiet_after["sessions"][0]["activity_fingerprint"]
+            == quiet_before["sessions"][0]["activity_fingerprint"])
+    checkpoint = _gate_poll(quiet_before, checkpoint=None).fingerprint
+    assert _gate_poll(quiet_after, checkpoint=checkpoint).action == "silent"
+
+    # A turn WAS said: eligible, and the gate runs a cycle for it.
+    assert talked_after["sessions"][0]["status"] == "eligible"
+    assert _gate_poll(talked_after,
+                      checkpoint=_gate_poll(talked_before, checkpoint=None).fingerprint
+                      ).action == "cycle"
+    # Four summarizer calls: two nightly, two by hand. Nothing was compressed twice.
+    assert llm.call_count == 4
+
+
+def test_a_conversation_that_ages_out_answers_unchanged_without_being_compressed(live):
+    """An absent session is not the same answer as a session with nothing new: dropping a
+    conversation the cycle reported on before changes the digest the gate compares, so a brief would
+    go out for the passage of time alone. Retention is an answer, never work — no reservation, no
+    model call, and it cannot displace or add a compression — and only a conversation whose stored
+    rows still match its marker is retained.
+    """
+    import dataclasses
+    from datetime import timedelta
+
+    from gateway.scheduled_compression import CYCLE_METADATA_KEY
+    from gateway.session_lifecycle import _now
+
+    config, store, _home = live
+    quiet = _seed(store, _source(chat_id="quiet"), _history())
+    moved = _seed(store, _source(chat_id="moved"), _history())
+    runner = _runner(config, store)
+
+    def age(entry):
+        store._entries[entry.session_key] = dataclasses.replace(
+            store.lookup_by_session_key(entry.session_key), updated_at=_now() - timedelta(days=14))
+
+    with _real_compression(runner) as llm:
+        for entry in (quiet, moved):
+            assert _run_cycle(runner, cycle_id="2026-10-01",
+                              session_keys=[entry.session_key])["counts"] == {"applied": 1}
+        before = _run_cycle(runner, cycle_id="2026-10-02", dry_run=True,
+                            session_keys=[quiet.session_key])
+        # ``moved`` was compressed, then said something more, and both then aged out.
+        store.append_to_transcript(store.lookup_by_session_key(moved.session_key).session_id,
+                                   {"role": "user", "content": "One more thing"})
+        age(quiet)
+        age(moved)
+        aged = _run_cycle(runner, cycle_id="2026-10-15", limit=1)
+
+    assert not store.list_sessions(active_minutes=7 * 24 * 60)
+    # The quiet one still answers, with the digest it had inside the window; the one that moved is
+    # not invented into the answer, and neither was compressed by this cycle.
+    rows = {row["session_key"]: row for row in aged["sessions"]}
+    assert set(rows) == {quiet.session_key}
+    assert rows[quiet.session_key]["status"] == "unchanged"
+    assert (rows[quiet.session_key]["activity_fingerprint"]
+            == before["sessions"][0]["activity_fingerprint"])
+    assert aged["counts"] == {"unchanged": 1} and aged["eligible"] == 0
+    assert llm.call_count == 2  # the two nightly compressions, nothing since
+    marker = asyncio.run(runner.async_session_store.get_session_metadata(
+        quiet.session_key, CYCLE_METADATA_KEY))
+    assert marker["cycle_id"] == "2026-10-01"  # the retained answer stamped nothing
+    assert _gate_poll(aged, checkpoint=_gate_poll(before, checkpoint=None).fingerprint
+                      ).action == "silent"
+
+
+def test_a_rewrite_after_this_cycles_own_commit_is_not_new_talk_on_the_already_applied_path(live):
+    """A retry of the SAME cycle answers ``already_applied``, and that answer's fingerprint is the
+    conversation's LOGICAL state — not the rows a ``/compress`` landing after the commit left.
+
+    Reporting the physical digest there sends a brief for the rewrite alone and then goes silent the
+    night after, which is the wrong brief on both nights. A turn really appended after the rewrite
+    is still new context: the carry refuses a transcript that moved, so the logical digest falls back
+    to the rows as they stand.
+    """
+    from agent.conversation_compression_manual import parse_compress_args
+
+    config, store, _home = live
+    runner = _runner(config, store)
+
+    def rewrite_by_hand(entry):
+        routed = store.lookup_by_session_key(entry.session_key)
+        outcome = asyncio.run(runner._run_manual_compression(
+            entry.origin, routed, store.load_transcript(routed.session_id),
+            parse_compress_args("")))
+        assert outcome.committed, outcome.status
+
+    def retry(entry):
+        return _run_cycle(runner, dry_run=True, session_keys=[entry.session_key])["sessions"][0]
+
+    with _real_compression(runner):
+        entry = _seed(store, _source(chat_id="quiet"), _history())
+        assert _run_cycle(runner, session_keys=[entry.session_key])["counts"] == {"applied": 1}
+        committed = retry(entry)
+        rewrite_by_hand(entry)
+        rewritten = retry(entry)
+        store.append_to_transcript(store.lookup_by_session_key(entry.session_key).session_id,
+                                   {"role": "user", "content": "One more thing"})
+        talked = retry(entry)
+
+    assert [row["status"] for row in (committed, rewritten, talked)] == [_ALREADY] * 3
+    assert rewritten["activity_fingerprint"] == committed["activity_fingerprint"]
+    assert talked["activity_fingerprint"] != committed["activity_fingerprint"]
+
+    checkpoint = _gate_poll(_answer(committed), checkpoint=None).fingerprint
+    assert _gate_poll(_answer(rewritten), checkpoint=checkpoint).action == "silent"
+    assert _gate_poll(_answer(talked), checkpoint=checkpoint).action == "cycle"
+
+
+def test_automatic_compression_carries_the_cycle_fingerprint_like_a_manual_one(live):
+    """Automatic (hygiene) compression stamps no cycle marker either, so the handoff it leaves
+    behind must not read as a new exchange.
+
+    It is the harder case: hygiene runs BEFORE inbound preprocessing, which may refuse the arriving
+    message without ever persisting a turn, so the rewrite can be the only thing that happened all
+    night. The carry is bound to the automatic commit itself — the pre-rewrite rows are read before
+    the compressor runs, because in-place compaction replaces them inside ``_compress_context``.
+    A turn appended before the rewrite still leaves the conversation eligible.
+    """
+    from types import SimpleNamespace
+
+    config, store, _home = live
+    runner = _runner(config, store)
+
+    async def auto_compress(entry, *, said_something_new):
+        routed = store.lookup_by_session_key(entry.session_key)
+        if said_something_new:
+            store.append_to_transcript(routed.session_id,
+                                       {"role": "user", "content": "One more thing"})
+        # Exactly where the shipped path reads it: before the compressor touches the rows.
+        rows_before = await runner.async_session_store.load_transcript(routed.session_id,
+                                                                      repair_alternation=False)
+        compacted = rows_before[-4:]
+        # What ``archive_and_compact()`` already did inside ``_compress_context``: the active rows
+        # are the compacted set by the time the adopt step runs.
+        assert store.rewrite_transcript(routed.session_id, compacted)
+        attempt = SimpleNamespace(
+            agent=SimpleNamespace(session_id=routed.session_id, _last_compaction_in_place=True),
+            history=None)
+        plan = SimpleNamespace(msg_count=len(rows_before), approx_tokens=10_000,
+                               warn_token_threshold=10 ** 9)
+        rotated, in_place, _count, _tokens = await runner._hmwa_hygiene_adopt_transcript(
+            attempt, compacted, rows_before, plan, session_entry=routed,
+            session_key=entry.session_key, source=entry.origin, _quick_key=entry.session_key,
+            run_generation=1, rows_before=rows_before)
+        assert (rotated, in_place) == (False, True)
+
+    def poll(entry):
+        return _run_cycle(runner, cycle_id="2026-10-02", dry_run=True,
+                          session_keys=[entry.session_key])["sessions"][0]
+
+    with _real_compression(runner) as llm:
+        rows = {}
+        for chat_id, talked in (("quiet", False), ("talked", True)):
+            entry = _seed(store, _source(chat_id=chat_id), _history())
+            assert _run_cycle(runner, session_keys=[entry.session_key])["counts"] == {"applied": 1}
+            rows[chat_id] = [poll(entry)]
+            asyncio.run(auto_compress(entry, said_something_new=talked))
+            rows[chat_id].append(poll(entry))
+    # Only the two nightly compressions: the automatic rewrite is not a summarizer call of ours.
+    assert llm.call_count == 2
+
+    quiet_before, quiet_after = rows["quiet"]
+    assert [quiet_before["status"], quiet_after["status"]] == ["unchanged", "unchanged"]
+    assert quiet_after["activity_fingerprint"] == quiet_before["activity_fingerprint"]
+    checkpoint = _gate_poll(_answer(quiet_before), checkpoint=None).fingerprint
+    assert _gate_poll(_answer(quiet_after), checkpoint=checkpoint).action == "silent"
+
+    # The conversation moved before the rewrite: the carry refuses it and the cycle still runs.
+    talked_before, talked_after = rows["talked"]
+    assert talked_after["status"] == "eligible"
+    assert _gate_poll(_answer(talked_after),
+                      checkpoint=_gate_poll(_answer(talked_before), checkpoint=None).fingerprint
+                      ).action == "cycle"
+
+
+def test_a_late_watermark_fenced_commit_carries_without_swallowing_concurrent_talk(live):
+    """The hygiene worker that finishes AFTER its turn hold was released commits on its own, through
+    the done-callback — not through the adopt step. That commit is an automatic rewrite like any
+    other and must carry the cycle fingerprint, or the nightly brief goes out for the rewrite alone.
+
+    It is also the one commit that can swallow real activity: a watermark-fenced commit CLONES rows
+    that arrived while it ran into the tail it keeps, so the pre-rewrite rows still match the marker
+    while the post-rewrite transcript holds a turn nobody had seen. The carry must refuse that.
+    """
+    from types import SimpleNamespace
+
+    from gateway.run import HygieneTurnHoldExceeded
+
+    config, store, _home = live
+    runner = _runner(config, store)
+    hs = SimpleNamespace(failure_cooldown_seconds=-1, total_ceiling_seconds=600)
+
+    async def late_fenced_commit(entry, *, said_something_new):
+        routed = store.lookup_by_session_key(entry.session_key)
+        rows_before = await runner.async_session_store.load_transcript(routed.session_id,
+                                                                      repair_alternation=False)
+        future = asyncio.get_running_loop().create_future()
+        attempt = SimpleNamespace(
+            agent=SimpleNamespace(session_id=routed.session_id, _last_compaction_in_place=False),
+            commit_fence=SimpleNamespace(commit_watermark_fenced=True, is_cancelled=False),
+            future=future, meta={}, cleanup_deferred=False, wait_started=time.monotonic(),
+            history=None)
+        # The real turn-hold body: it keeps the worker's commit admission and re-raises.
+        try:
+            raise HygieneTurnHoldExceeded()
+        except HygieneTurnHoldExceeded:
+            with contextlib.suppress(HygieneTurnHoldExceeded):
+                await runner._hmwa_hygiene_on_turn_hold(attempt, hs, routed, entry.session_key,
+                                                        entry.origin, rows_before)
+        # The worker finishes late and commits in place. A turn that arrived during the hold is
+        # cloned above the watermark, so it survives into the transcript the commit leaves.
+        concurrent = ([{"role": "user", "content": "One more thing"}] if said_something_new else [])
+        assert store.rewrite_transcript(routed.session_id, rows_before[-4:] + concurrent)
+        attempt.agent._last_compaction_in_place = True
+        future.set_result(([{"role": "assistant", "content": "summary"}], None))
+        # The done-callback runs on the next loop pass, and the carry it schedules after that.
+        for _ in range(100):
+            await asyncio.sleep(0)
+            carries = list(getattr(runner, "_hygiene_carry_tasks", ()))
+            if carries:
+                await asyncio.gather(*carries)
+                return
+        raise AssertionError("the late fenced commit never scheduled a fingerprint carry")
+
+    def poll(entry):
+        return _run_cycle(runner, cycle_id="2026-10-02", dry_run=True,
+                          session_keys=[entry.session_key])["sessions"][0]
+
+    with _real_compression(runner) as llm:
+        rows = {}
+        for chat_id, talked in (("quiet", False), ("talked", True)):
+            entry = _seed(store, _source(chat_id=chat_id), _history())
+            assert _run_cycle(runner, session_keys=[entry.session_key])["counts"] == {"applied": 1}
+            rows[chat_id] = [poll(entry)]
+            asyncio.run(late_fenced_commit(entry, said_something_new=talked))
+            rows[chat_id].append(poll(entry))
+    assert llm.call_count == 2  # the two nightly compressions; the late commit is not ours
+
+    # Nothing was said during the hold: the late commit carries, and the gate stays silent.
+    quiet_before, quiet_after = rows["quiet"]
+    assert [quiet_before["status"], quiet_after["status"]] == ["unchanged", "unchanged"]
+    assert quiet_after["activity_fingerprint"] == quiet_before["activity_fingerprint"]
+    checkpoint = _gate_poll(_answer(quiet_before), checkpoint=None).fingerprint
+    assert _gate_poll(_answer(quiet_after), checkpoint=checkpoint).action == "silent"
+
+    # A turn arrived during the hold and the commit cloned it: that is real talk, so the carry
+    # refuses and the conversation stays eligible instead of being silenced.
+    talked_before, talked_after = rows["talked"]
+    assert talked_after["status"] == "eligible"
+    assert _gate_poll(_answer(talked_after),
+                      checkpoint=_gate_poll(_answer(talked_before), checkpoint=None).fingerprint
+                      ).action == "cycle"
+
+
+def test_a_repeated_exchange_cloned_by_a_late_commit_is_still_new_conversation(live):
+    """The user and the assistant saying the same thing twice is two exchanges, not one.
+
+    A watermark-fenced commit that lands after its turn hold was released clones whatever arrived
+    while it ran into the tail it keeps. When that is a word-for-word REPEAT of an exchange already
+    in the transcript, every ``(role, text)`` pair the commit leaves behind was already present — so a
+    membership test that compares sets sees nothing new and carries the fingerprint, silencing a night
+    the user did talk through. ``activity_fingerprint`` hashes an ORDERED list and had already moved.
+    The carry compares ordered stored-row identities instead, and requires what the rewrite kept to be
+    a contiguous run of what was there, so the spliced repeat refuses.
+    """
+    from types import SimpleNamespace
+
+    from gateway.run import HygieneTurnHoldExceeded
+
+    config, store, _home = live
+    runner = _runner(config, store)
+    hs = SimpleNamespace(failure_cooldown_seconds=-1, total_ceiling_seconds=600)
+    exchange = [{"role": "user", "content": "Run it again."},
+                {"role": "assistant", "content": "Done."}]
+    logs = [{"role": "user", "content": "And the logs?"},
+            {"role": "assistant", "content": "Rotated."}]
+
+    async def late_fenced_commit(entry, *, retained):
+        routed = store.lookup_by_session_key(entry.session_key)
+        rows_before = await runner.async_session_store.load_transcript(routed.session_id,
+                                                                      repair_alternation=False)
+        future = asyncio.get_running_loop().create_future()
+        attempt = SimpleNamespace(
+            agent=SimpleNamespace(session_id=routed.session_id, _last_compaction_in_place=False),
+            commit_fence=SimpleNamespace(commit_watermark_fenced=True, is_cancelled=False),
+            future=future, meta={}, cleanup_deferred=False, wait_started=time.monotonic(),
+            history=None)
+        try:
+            raise HygieneTurnHoldExceeded()
+        except HygieneTurnHoldExceeded:
+            with contextlib.suppress(HygieneTurnHoldExceeded):
+                await runner._hmwa_hygiene_on_turn_hold(attempt, hs, routed, entry.session_key,
+                                                        entry.origin, rows_before)
+        assert store.rewrite_transcript(routed.session_id, retained(rows_before))
+        attempt.agent._last_compaction_in_place = True
+        future.set_result(([{"role": "assistant", "content": "summary"}], None))
+        for _ in range(100):
+            await asyncio.sleep(0)
+            carries = list(getattr(runner, "_hygiene_carry_tasks", ()))
+            if carries:
+                await asyncio.gather(*carries)
+                return
+        raise AssertionError("the late fenced commit never scheduled a fingerprint carry")
+
+    def poll(entry):
+        return _run_cycle(runner, cycle_id="2026-10-02", dry_run=True,
+                          session_keys=[entry.session_key])["sessions"][0]
+
+    # The tail the compression will keep already holds the exchange that is about to be repeated.
+    seeded = _history() + exchange + logs
+    with _real_compression(runner):
+        rows = {}
+        for chat_id, retained in (
+            # Quiet: the commit keeps a contiguous run of what was there and nothing else.
+            ("quiet", lambda before: before[-2:]),
+            # The review's reproduction: the last old exchange is retained and the repeat, said
+            # during the released hold, is cloned in after it.
+            ("repeated", lambda before: before[-2:] + exchange),
+        ):
+            entry = _seed(store, _source(chat_id=chat_id), list(seeded))
+            assert _run_cycle(runner, session_keys=[entry.session_key])["counts"] == {"applied": 1}
+            rows[chat_id] = [poll(entry)]
+            asyncio.run(late_fenced_commit(entry, retained=retained))
+            rows[chat_id].append(poll(entry))
+
+    quiet_before, quiet_after = rows["quiet"]
+    assert [quiet_before["status"], quiet_after["status"]] == ["unchanged", "unchanged"]
+    assert quiet_after["activity_fingerprint"] == quiet_before["activity_fingerprint"]
+    assert _gate_poll(_answer(quiet_after),
+                      checkpoint=_gate_poll(_answer(quiet_before), checkpoint=None).fingerprint
+                      ).action == "silent"
+
+    repeated_before, repeated_after = rows["repeated"]
+    assert repeated_after["status"] == "eligible"
+    assert _gate_poll(_answer(repeated_after),
+                      checkpoint=_gate_poll(_answer(repeated_before), checkpoint=None).fingerprint
+                      ).action == "cycle"

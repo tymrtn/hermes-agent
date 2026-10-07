@@ -57,7 +57,7 @@ import os
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +72,14 @@ DEFAULT_ACTIVE_MINUTES = 7 * 24 * 60
 DEFAULT_VERB_TIMEOUT = 240.0
 #: One conversation per cycle by default: the ongoing thread. Raising it is an explicit caller choice.
 DEFAULT_LIMIT = 1
+#: Conversations kept in the answer after they age out of the activity window (``_retained_rows``),
+#: so an aged-out conversation still carries its standing handoff into tonight's brief. It is NOT
+#: what keeps the no-new-context gate stable: this cap, ``limit`` and routing housekeeping all
+#: change which conversations an answer covers, and a conversation absent from one is not a
+#: conversation that changed. The gate carries membership forward across nights from its own
+#: delivered checkpoint instead (``dream_cycle_v3/context_gate.py::conversation_state``), so raising
+#: or lowering this number cannot make a brief go out for the passage of time.
+MAX_RETAINED_ENTRIES = 8
 
 # Bounded, derived-summary highlights for the morning receipt. Sections are read from the handoff
 # the compressor itself produced — never from the raw transcript.
@@ -317,11 +325,19 @@ def activity_fingerprint(messages: Any) -> str:
     Read it from STORED rows (``load_transcript(..., repair_alternation=False)``): the replay repair
     merges a mirrored brief into the next real user turn, and a merged row can be neither skipped
     nor kept without losing one of them. A rewrite that only replaced old turns with a handoff, or a
-    cron delivery appended to the chat, leaves it unchanged; any new exchange changes it."""
+    cron delivery appended to the chat, leaves it unchanged; any new exchange changes it.
+
+    The digest is over an ORDERED list, so saying the same thing twice, or saying two things in the
+    other order, is a different conversation."""
+    return hashlib.sha256(json.dumps(conversation_turns(messages), ensure_ascii=False,
+                                     separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _conversation_rows(messages: Any) -> Iterator[Tuple[str, str, Dict[str, Any]]]:
+    """``(role, text, row)`` for each of the conversation's own turns, in stored order."""
     from agent.context_compressor import (ContextCompressor, _synthetic_user_row,
                                           is_compaction_summary_message)
 
-    turns = []
     for message in messages if isinstance(messages, list) else ():
         role = message.get("role") if isinstance(message, dict) else None
         if role not in ("user", "assistant", "tool") or is_compaction_summary_message(message):
@@ -330,9 +346,47 @@ def activity_fingerprint(messages: Any) -> str:
         if role == "user" and (_synthetic_user_row(text)
                                or ContextCompressor._is_synthetic_compression_user_turn(message)):
             continue
-        turns.append([role, text])
-    return hashlib.sha256(json.dumps(turns, ensure_ascii=False, separators=(",", ":"))
-                          .encode("utf-8")).hexdigest()
+        yield role, text, message
+
+
+def conversation_turns(messages: Any) -> List[List[str]]:
+    """The ``[role, text]`` rows ``activity_fingerprint`` digests, in order."""
+    return [[role, text] for role, text, _row in _conversation_rows(messages)]
+
+
+def _turn_identities(messages: Any) -> List[List[str]]:
+    """Each conversation turn as the most identifying data its STORED row carries, in order:
+    ``[role, timestamp, text]``.
+
+    The timestamp is the store's own notion of row identity — ``hermes_state_messages`` keys its
+    exact-clone index on ``(timestamp, canonical content)`` — so two identical texts said minutes
+    apart are two turns here. ``[role, text]`` alone cannot say that, which is the whole reason the
+    carry guard does not reuse the fingerprint's projection."""
+    return [[role, str(row.get("timestamp") or ""), text]
+            for role, text, row in _conversation_rows(messages)]
+
+
+def _added_a_turn(before: Any, after: Any) -> bool:
+    """True unless *after*'s turns are a CONTIGUOUS RUN of *before*'s, in stored order.
+
+    A rewrite folds old turns into a handoff (filtered out here) and keeps a run of the originals
+    verbatim, so what it leaves behind is always a contiguous slice of what was there. Anything else
+    — a turn that arrived DURING the compression and survived its commit as cloned tail, a repeated
+    exchange, a reordering — is activity, and the fingerprint must not be carried over it.
+
+    Order and occurrence both have to count. The reproduced failure of the set-based check was a user
+    and assistant REPEATING an exchange word for word during a released turn hold: every pair was
+    already present, so a set saw nothing new while the ordered digest had moved. Comparing ordered
+    row identities makes the repeat two turns and the contiguity requirement rejects the splice.
+
+    Ambiguity refuses: an unreadable *before*, or an *after* longer than it, finds no run and returns
+    True. The carry is the only thing that can silence a night, so it fails towards an extra brief."""
+    kept, now = _turn_identities(before), _turn_identities(after)
+    if not now:
+        # A rewrite that left no conversation turn at all added none either.
+        return False
+    return not any(kept[start:start + len(now)] == now
+                   for start in range(len(kept) - len(now) + 1))
 
 
 def verified_codes(marker: Any) -> Optional[List[str]]:
@@ -426,6 +480,46 @@ def eligible_entries(entries: Any, *, namespace: str, session_keys: Optional[Lis
     return picked if limit is None or limit <= 0 else picked[:limit]
 
 
+async def _retained_rows(store: Any, *, namespace: str, session_keys: Optional[List[str]],
+                         taken: set, cycle_id: str, include_highlights: bool) -> List[Dict[str, Any]]:
+    """The read-only ``unchanged`` answers for conversations the activity window no longer lists.
+
+    ``list_sessions(active_minutes)`` hides a conversation nobody has touched for a week, and its
+    standing handoff — the open threads the brief groups — would go with it. So an aged-out
+    conversation the cycle has settled before keeps answering, up to ``MAX_RETAINED_ENTRIES``.
+
+    This is about CONTENT, not about the gate: the gate carries conversation membership forward from
+    its own delivered checkpoint, so a conversation this answer omits (past the cap, swept out of
+    routing, or displaced by ``limit``) keeps the state it was last known in rather than dropping
+    out of the digest.
+
+    Retention is an answer, never work: a retained conversation is never reserved, never summarized
+    and never counted against ``limit``, so it cannot displace or add a real compression. It is
+    retained only when its stored rows still match the fingerprint the last committed compression
+    stamped. One whose rows moved is left out exactly as it is today — something really did change,
+    and the cycle should run.
+    """
+    from gateway.session_transcript import TranscriptReadError
+
+    rows: List[Dict[str, Any]] = []
+    for entry in eligible_entries(await store.list_sessions(None), namespace=namespace,
+                                  session_keys=session_keys, limit=0):
+        if entry.session_key in taken or len(rows) >= MAX_RETAINED_ENTRIES:
+            continue
+        marker = await store.get_session_metadata(entry.session_key, CYCLE_METADATA_KEY)
+        if not (isinstance(marker, dict) and marker.get("activity_fingerprint")):
+            continue
+        try:
+            current = await _stored_rows(store, entry.session_id)
+        except TranscriptReadError:
+            continue
+        settled = _settled_without_compressing(_entry_row(entry), marker, cycle_id, current,
+                                               include_highlights)
+        if settled is not None:
+            rows.append(settled)
+    return rows
+
+
 def _already_done(marker: Any, cycle_id: str) -> bool:
     """True when this cycle already settled this conversation (idempotence)."""
     return (isinstance(marker, dict) and marker.get("cycle_id") == cycle_id
@@ -440,8 +534,64 @@ def _unchanged_since_compression(marker: Any, fingerprint: str) -> bool:
             and marker.get("activity_fingerprint") == fingerprint)
 
 
+def _entry_row(entry: Any) -> Dict[str, Any]:
+    """The identity every answer about one conversation carries."""
+    return {
+        "session_key": entry.session_key, "session_ref": session_ref(entry.session_key),
+        "platform": getattr(getattr(entry, "platform", None), "value", None) or "",
+        "chat_type": getattr(entry, "chat_type", "") or "",
+        "session_id": entry.session_id,
+    }
+
+
 async def _stored_rows(store: Any, session_id: str) -> List[Dict[str, Any]]:
     return await store.load_transcript(session_id, repair_alternation=False)
+
+
+async def carry_fingerprint_across_rewrite(store: Any, session_key: str, before: Any,
+                                           after: Any) -> bool:
+    """Advance the cycle marker's activity fingerprint to a rewrite nobody added a turn to.
+
+    Manual ``/compress`` and auto-compression rewrite the transcript without stamping this marker,
+    so the handoff they leave behind would read as a new exchange and run a cycle for a brief
+    nobody has anything new to be told. Genuine activity is never swallowed, on two counts: the
+    PRE-rewrite transcript must still match the marker exactly (nothing was said between the last
+    committed scheduled compression and the rewrite), AND the rewrite must have added no
+    conversation turn of its own (``_added_a_turn`` — a late commit clones concurrent turns into its
+    retained tail). A conversation that did move keeps its stale fingerprint and stays eligible.
+    """
+    marker = await store.get_session_metadata(session_key, CYCLE_METADATA_KEY)
+    if not isinstance(marker, dict) or marker.get("status") != _STATUS_APPLIED:
+        return False
+    if not marker.get("activity_fingerprint") \
+            or marker["activity_fingerprint"] != activity_fingerprint(before):
+        return False
+    if _added_a_turn(before, after):
+        # A commit that landed LATE (the watermark-fenced hygiene worker finishing after its turn
+        # hold was released) clones turns that arrived while it ran into the tail it keeps. Those are
+        # real activity even though the pre-rewrite rows still matched the marker, so the carry stops
+        # here and the conversation stays eligible.
+        return False
+    # The PHYSICAL digest follows the rewrite (it decides eligibility), while the LOGICAL one the
+    # cycle gates on stays exactly as it was: the conversation is in the state the last delivered
+    # brief described, and that is what the gate must keep comparing.
+    await store.set_session_metadata(session_key, CYCLE_METADATA_KEY, {
+        **marker,
+        "stable_fingerprint": marker.get("stable_fingerprint") or marker["activity_fingerprint"],
+        "activity_fingerprint": activity_fingerprint(after)})
+    return True
+
+
+def _reported_fingerprint(marker: Any, fingerprint: str) -> str:
+    """The conversation's LOGICAL state, which is what the no-new-context gate digests.
+
+    Normally the digest of the stored rows. After a rewrite nobody added a turn to
+    (``carry_fingerprint_across_rewrite``) the rows digest differently while the conversation says
+    the same thing, so the marker's kept value is reported instead and an unchanged night stays
+    silent. Only a marker the rows still match can speak for them."""
+    if isinstance(marker, dict) and marker.get("activity_fingerprint") == fingerprint:
+        return str(marker.get("stable_fingerprint") or fingerprint)
+    return fingerprint
 
 
 def _settled_without_compressing(row: Dict[str, Any], marker: Any, cycle_id: str,
@@ -450,14 +600,19 @@ def _settled_without_compressing(row: Dict[str, Any], marker: Any, cycle_id: str
     """The answer for a conversation this cycle must not compress, or None when it should.
 
     Already compressed in this cycle, or nothing said since the last committed compression. The
-    fingerprint is always the conversation as it stands now: anything said since this cycle's
-    compression is new context for the brief, though it is not compressed twice."""
+    fingerprint is the conversation's LOGICAL state either way: anything said since this cycle's
+    compression is new context for the brief (though it is not compressed twice), while a rewrite
+    nobody added a turn to is not — a manual or automatic ``/compress`` landing after this cycle's
+    own commit must not read as new talk on the ``already_applied`` path any more than on the
+    ``unchanged`` one (``_reported_fingerprint``)."""
     fingerprint = activity_fingerprint(current)
     if _already_done(marker, cycle_id):
-        out = {**row, "status": _STATUS_ALREADY, "activity_fingerprint": fingerprint,
+        out = {**row, "status": _STATUS_ALREADY,
+               "activity_fingerprint": _reported_fingerprint(marker, fingerprint),
                "previous": {k: marker.get(k) for k in ("status", "at", "after_tokens")}}
     elif _unchanged_since_compression(marker, fingerprint):
-        out = {**row, "status": _STATUS_UNCHANGED, "activity_fingerprint": fingerprint}
+        out = {**row, "status": _STATUS_UNCHANGED,
+               "activity_fingerprint": _reported_fingerprint(marker, fingerprint)}
     else:
         return None
     if include_highlights:
@@ -629,12 +784,7 @@ async def _compress_one_entry(runner: Any, entry: Any, *, cycle_id: str, dry_run
                               include_highlights: bool) -> Dict[str, Any]:
     session_key = entry.session_key
     store = runner.async_session_store
-    row: Dict[str, Any] = {
-        "session_key": session_key, "session_ref": session_ref(session_key),
-        "platform": getattr(getattr(entry, "platform", None), "value", None) or "",
-        "chat_type": getattr(entry, "chat_type", "") or "",
-        "session_id": entry.session_id,
-    }
+    row = _entry_row(entry)
 
     from gateway.session_transcript import TranscriptReadError
 
@@ -832,7 +982,7 @@ async def run_scheduled_compression(
         return {"ok": False, "error": f"this gateway does not serve profile {profile!r}",
                 "profile": profile, "cycle_id": cycle_id}
     entries = eligible_entries(await store.list_sessions(active_minutes), namespace=namespace,
-                              session_keys=session_keys, limit=limit)
+                               session_keys=session_keys, limit=limit)
     sessions: List[Dict[str, Any]] = []
     for entry in entries:
         try:
@@ -845,6 +995,11 @@ async def run_scheduled_compression(
             sessions.append({"session_key": entry.session_key,
                              "session_ref": session_ref(entry.session_key),
                              "status": "failed", "reason": f"{type(exc).__name__}: {exc}"})
+    if active_minutes is not None:
+        sessions += await _retained_rows(
+            store, namespace=namespace, session_keys=session_keys,
+            taken={getattr(entry, "session_key", None) for entry in entries}, cycle_id=cycle_id,
+            include_highlights=include_highlights)
     counts: Dict[str, int] = {}
     for row in sessions:
         counts[row["status"]] = counts.get(row["status"], 0) + 1
